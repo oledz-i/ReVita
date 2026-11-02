@@ -2233,3 +2233,35 @@ replace('vita3k/renderer/src/vulkan/pipeline_cache.cpp', '''    else if (nb_logi
         nb_worker_threads = 3;
 #endif''')
 print('Shaders: four background compiler threads on the console.')
+
+# A new shader wrote several debug files before it ran: the guest program
+# (.gxp), its disassembly and the SPIR-V text, each its own file on the
+# console's disk, on the thread that is waiting for the shader. Vita3KiOS
+# dropped them for the same reason (new scenes stuttered). Only what the
+# renderer reads back stays: the GLSL text OpenGL caches under the shader's
+# own extension, and the .spv Vulkan caches below.
+replace('vita3k/renderer/src/shaders.cpp', '''    fs::create_directories(shaderlog_path);
+
+    auto shader_log_path = get_shaderlog_path("gxp");
+
+    // Dump gxp binary
+    fs_utils::dump_data(shader_log_path, &program, program.size);
+    const auto write_data_with_ext = [&](const std::string &ext, const std::string &data) {
+        fs::path out_path;''', '''#ifndef VITA3K_UWP
+    fs::create_directories(shaderlog_path);
+#endif
+
+    auto shader_log_path = get_shaderlog_path("gxp");
+
+#ifndef VITA3K_UWP
+    // Dump gxp binary
+    fs_utils::dump_data(shader_log_path, &program, program.size);
+#endif
+    const auto write_data_with_ext = [&](const std::string &ext, const std::string &data) {
+#ifdef VITA3K_UWP
+        // debug dumps (disassembly, SPIR-V text) are skipped; GLSL is the OpenGL cache
+        if (target != shader::Target::GLSLOpenGL || ext != shader_type_str)
+            return true;
+#endif
+        fs::path out_path;''')
+print('Shaders: debug dumps are not written on the console (new scenes stutter less).')
