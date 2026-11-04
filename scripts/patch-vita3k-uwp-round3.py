@@ -2396,7 +2396,7 @@ replace(context_cpp, '''            state.request_queue.push(request);
         }
     }
 #ifdef VITA3K_UWP
-    else if (surface_info && surface_info->need_post_surface_sync && state.mem) {
+    else if (surface_info && surface_info->need_post_surface_sync && state.mem && fence) {
         // no wait thread without mapping: wait for this scene, then copy its
         // picture into guest memory before the game reads it
         if (state.device.waitForFences(fence, vk::True, 2'000'000'000ULL) == vk::Result::eSuccess)
