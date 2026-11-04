@@ -2265,3 +2265,403 @@ replace('vita3k/renderer/src/shaders.cpp', '''    fs::create_directories(shaderl
 #endif
         fs::path out_path;''')
 print('Shaders: debug dumps are not written on the console (new scenes stutter less).')
+
+# ── Vulkan surface sync without memory mapping ──────────────────────────────
+# Surface sync (what the GPU drew, copied back where the game reads it) only
+# ran when the renderer could map guest memory for the GPU, which needs buffer
+# device address: Dozen has none, so on the console it never ran, whatever
+# the setting said (the log said "surface sync: not running"). Games that read
+# their own pictures (Gravity Rush's bloom, Danganronpa's examine screens, the
+# reason the iOS build turns it on for them) got stale memory. Without
+# mapping, the picture now goes through a host buffer the CPU can read: the
+# copy is waited for at once and written into guest memory. Surfaces are still
+# only synced once the game touches their memory (the existing page traps), so
+# games that never read them pay nothing.
+surface_cache_cpp = 'vita3k/renderer/src/vulkan/surface_cache.cpp'
+replace(surface_cache_cpp, '''        buffer = vkutil::Buffer(required_size);
+        buffer.init_buffer(vk::BufferUsageFlagBits::eTransferDst, vkutil::vma_mapped_alloc);''', '''        buffer = vkutil::Buffer(required_size);
+#ifdef VITA3K_UWP
+        // read by the CPU after the GPU wrote it: cached memory, not write-combined
+        static constexpr vma::AllocationCreateInfo readback_alloc = {
+            .flags = vma::AllocationCreateFlagBits::eHostAccessRandom | vma::AllocationCreateFlagBits::eMapped,
+            .usage = vma::MemoryUsage::eAuto,
+            .preferredFlags = vk::MemoryPropertyFlagBits::eHostCached
+        };
+        buffer.init_buffer(vk::BufferUsageFlagBits::eTransferDst, readback_alloc);
+#else
+        buffer.init_buffer(vk::BufferUsageFlagBits::eTransferDst, vkutil::vma_mapped_alloc);
+#endif''')
+
+replace(surface_cache_cpp, '''bool VKSurfaceCache::check_for_surface(MemState &mem, Address source_address, CallbackRequestFunction &callback, Address target_address) {
+    if (!state.features.enable_memory_mapping || state.disable_surface_sync)
+        return false;
+''', '''bool VKSurfaceCache::check_for_surface(MemState &mem, Address source_address, CallbackRequestFunction &callback, Address target_address) {
+    if (state.disable_surface_sync)
+        return false;
+#ifdef VITA3K_UWP
+    if (!state.features.enable_memory_mapping) {
+        // No wait thread without mapping: copy the picture, wait for it, write
+        // it into guest memory, then let the caller run the transfer itself.
+        auto found = color_address_lookup.find(source_address);
+        if (found == color_address_lookup.end())
+            return false;
+        ColorSurfaceCacheInfo &surface = *found->second;
+        VKContext &context = *static_cast<VKContext *>(state.context);
+        if (surface.last_frame_rendered + MAX_FRAMES_RENDERING <= context.frame_timestamp)
+            return false;
+        if (!*surface.need_surface_sync) {
+            *surface.need_surface_sync = true;
+            vk::CommandBuffer prev_cmd = context.render_cmd;
+            vk::CommandBuffer surface_cmd = nullptr;
+            vk::Fence fence = state.device.createFence({});
+            ColorSurfaceCacheInfo *returned_info = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(state.multithread_pool_mutex);
+                surface_cmd = vkutil::create_single_time_command(state.device, state.multithread_command_pool);
+                context.render_cmd = surface_cmd;
+                last_written_surface = &surface;
+                returned_info = perform_surface_sync();
+                context.render_cmd = prev_cmd;
+                surface_cmd.end();
+            }
+            vk::SubmitInfo submit_info{};
+            submit_info.setCommandBuffers(surface_cmd);
+            state.locked_queue_submit(state.general_queue, submit_info, fence);
+            if (state.device.waitForFences(fence, vk::True, 2'000'000'000ULL) == vk::Result::eSuccess) {
+                if (returned_info)
+                    perform_post_surface_sync(mem, returned_info);
+            } else {
+                LOG_ERROR("Surface sync: the GPU did not finish the copy within 2 s");
+            }
+            state.device.destroyFence(fence);
+            std::lock_guard<std::mutex> lock(state.multithread_pool_mutex);
+            state.device.freeCommandBuffers(state.multithread_command_pool, surface_cmd);
+        }
+        return false;
+    }
+#else
+    if (!state.features.enable_memory_mapping)
+        return false;
+#endif
+''')
+
+replace(surface_cache_cpp, '''ColorSurfaceCacheInfo *VKSurfaceCache::perform_surface_sync() {
+    // surface sync is supported only if memory mapping is enabled
+    if (!state.features.enable_memory_mapping)
+        return nullptr;
+''', '''ColorSurfaceCacheInfo *VKSurfaceCache::perform_surface_sync() {
+#ifndef VITA3K_UWP
+    // surface sync is supported only if memory mapping is enabled
+    if (!state.features.enable_memory_mapping)
+        return nullptr;
+#endif
+''')
+
+replace(surface_cache_cpp, '''    const bool needs_copy_buffer = format_need_additional_memory(last_written_surface->format)
+        || surface_sync_needs_u4u4u4u4_repack(*last_written_surface);''', '''    bool needs_copy_buffer = format_need_additional_memory(last_written_surface->format)
+        || surface_sync_needs_u4u4u4u4_repack(*last_written_surface);
+#ifdef VITA3K_UWP
+    // without mapping there is no GPU view of guest memory: always a host buffer
+    if (!state.features.enable_memory_mapping)
+        needs_copy_buffer = true;
+#endif''')
+
+replace(surface_cache_cpp, '''    uint8_t *pixels = surface->data.cast<uint8_t>().get(mem);
+''', '''    uint8_t *pixels = surface->data.cast<uint8_t>().get(mem);
+
+#ifdef VITA3K_UWP
+    if (!state.features.enable_memory_mapping && surface->copy_buffer && surface->copy_buffer->mapped_data
+        && !surface_sync_needs_u4u4u4u4_repack(*surface) && !format_need_additional_memory(surface->format)) {
+        // the picture came through a host buffer: put it where the game reads it
+        const size_t bytes = std::min<size_t>(static_cast<size_t>(pixel_stride) * surface->original_height
+                * vk::blockSize(surface->texture.format),
+            static_cast<size_t>(surface->total_bytes));
+        memcpy(pixels, surface->copy_buffer->mapped_data, bytes);
+    }
+#endif
+''')
+
+context_cpp = 'vita3k/renderer/src/vulkan/context.cpp'
+replace(context_cpp, '''    if (state.features.enable_memory_mapping && !state.disable_surface_sync && submit)
+        surface_info = state.surface_cache.perform_surface_sync();''', '''#ifdef VITA3K_UWP
+    if (!state.disable_surface_sync && submit)
+#else
+    if (state.features.enable_memory_mapping && !state.disable_surface_sync && submit)
+#endif
+        surface_info = state.surface_cache.perform_surface_sync();''')
+replace(context_cpp, '''            state.request_queue.push(request);
+        }
+    }
+    visibility_sync_ranges.clear();''', '''            state.request_queue.push(request);
+        }
+    }
+#ifdef VITA3K_UWP
+    else if (surface_info && surface_info->need_post_surface_sync && state.mem) {
+        // no wait thread without mapping: wait for this scene, then copy its
+        // picture into guest memory before the game reads it
+        if (state.device.waitForFences(fence, vk::True, 2'000'000'000ULL) == vk::Result::eSuccess)
+            state.surface_cache.perform_post_surface_sync(*state.mem, surface_info);
+        else
+            LOG_ERROR("Surface sync: the GPU did not finish the scene within 2 s");
+    }
+#endif
+    visibility_sync_ranges.clear();''')
+
+replace('vita3k/renderer/src/transfer.cpp', '''    if (renderer.current_backend == Backend::Vulkan && renderer.features.enable_memory_mapping && !renderer.disable_surface_sync) {''', '''    if (renderer.current_backend == Backend::Vulkan
+#ifndef VITA3K_UWP
+        && renderer.features.enable_memory_mapping
+#endif
+        && !renderer.disable_surface_sync) {''', count=2)
+
+replace('vita3k/libretro/libretro_vita3k.cpp', '''            (mapping && !libretro.emuenv->renderer->disable_surface_sync) ? "working" : "not running");''', '''            !libretro.emuenv->renderer->disable_surface_sync ? (mapping ? "working" : "working (read back through a host buffer)") : "off");''')
+print('Vulkan: surface sync works without memory mapping (read back through a host buffer).')
+
+# ── New settings: texture cache, hashless texture cache, shader cache and
+# compiler threads; FSR gone ────────────────────────────────────────────────
+# FSR never worked on the console (the frame it writes is a storage image the
+# D3D12 swap path does not take); the menu no longer offers it and a saved FSR
+# runs as Bilinear. The compiler thread count was fixed at four; it is now a
+# setting (default four).
+pipeline_cache_cpp = 'vita3k/renderer/src/vulkan/pipeline_cache.cpp'
+replace(pipeline_cache_cpp, '''namespace renderer::vulkan {''', '''#ifdef VITA3K_UWP
+// Shader compiler threads, from the "Shader Compiler Threads" setting.
+int vita3k_uwp_shader_threads = 4;
+#endif
+
+namespace renderer::vulkan {''')
+replace(pipeline_cache_cpp, '''    if (use_async_compilation) {
+        // we could not initialize the worker threads previously''', '''#ifdef VITA3K_UWP
+    nb_worker_threads = vita3k_uwp_shader_threads < 1 ? 1 : (vita3k_uwp_shader_threads > 8 ? 8 : vita3k_uwp_shader_threads);
+    LOG_INFO("Shader compiler threads: {}", nb_worker_threads);
+#endif
+    if (use_async_compilation) {
+        // we could not initialize the worker threads previously''')
+
+libretro_cpp = 'vita3k/libretro/libretro_vita3k.cpp'
+replace(libretro_cpp, '''static std::string canonical_memory_mapping_option(const char *value) {''', '''#ifdef VITA3K_UWP
+extern int vita3k_uwp_shader_threads;
+#endif
+
+static std::string canonical_memory_mapping_option(const char *value) {''')
+replace(libretro_cpp, '''        libretro.cfg->current_config.screen_filter = value;''', '''#ifdef VITA3K_UWP
+        // FSR is not offered on the console any more; a saved FSR runs as Bilinear
+        libretro.cfg->current_config.screen_filter = std::string(value) == "FSR" ? std::string("Bilinear") : std::string(value);
+#else
+        libretro.cfg->current_config.screen_filter = value;
+#endif''')
+replace(libretro_cpp, '''        libretro.cfg->current_config.disable_surface_sync = !parse_enabled_option(value, true);
+    });''', '''        libretro.cfg->current_config.disable_surface_sync = !parse_enabled_option(value, true);
+    });
+#ifdef VITA3K_UWP
+    read_core_option("vita3k_texture_cache", "enabled", [](const char *value) {
+        libretro.cfg->current_config.texture_cache = parse_enabled_option(value, true);
+    });
+    read_core_option("vita3k_hashless_texture_cache", "disabled", [](const char *value) {
+        libretro.cfg->hashless_texture_cache = parse_enabled_option(value, false);
+    });
+    read_core_option("vita3k_shader_cache", "enabled", [](const char *value) {
+        libretro.cfg->current_config.shader_cache = parse_enabled_option(value, true);
+    });
+    read_core_option("vita3k_shader_threads", "4", [](const char *value) {
+        const int threads = static_cast<int>(std::strtol(value, nullptr, 10));
+        vita3k_uwp_shader_threads = (threads >= 1 && threads <= 8) ? threads : 4;
+    });
+#endif''')
+print('Settings: texture cache, fast texture cache, shader cache, compiler threads; FSR runs as Bilinear.')
+
+# ── Pipeline cache saved off the render thread ──────────────────────────────
+# 15 s after the last new shader, the render thread wrote the shader list,
+# asked the driver for its whole cache and wrote it to disk: a hitch in the
+# middle of play, again after every burst of new effects. The iOS build moved
+# it to a thread of its own; here too. The render thread only copies the two
+# lists; the driver call and the file run beside the game. The save at exit
+# still finishes before the renderer goes away.
+pipeline_cache_h = 'vita3k/renderer/include/renderer/vulkan/pipeline_cache.h'
+replace(pipeline_cache_h, '''    uint64_t next_pipeline_cache_save = std::numeric_limits<uint64_t>::max();''', '''    uint64_t next_pipeline_cache_save = std::numeric_limits<uint64_t>::max();
+#ifdef VITA3K_UWP
+    // the periodic save runs here, beside the game (joined before the next
+    // save and at cleanup)
+    std::jthread uwp_save_thread;
+    bool uwp_save_in_background = false;
+#endif''')
+replace(pipeline_cache_cpp, '''void PipelineCache::save_pipeline_cache() {
+    // first save the shader hashes''', '''void PipelineCache::save_pipeline_cache() {
+#ifdef VITA3K_UWP
+    if (uwp_save_thread.joinable())
+        uwp_save_thread.join();
+    if (uwp_save_in_background) {
+        std::vector<ShadersHash> shaders_copy;
+        {
+            std::lock_guard<std::mutex> guard(shaders_mutex);
+            shaders_copy = state.shaders_cache_hashs;
+        }
+        std::vector<uint64_t> hashes;
+        hashes.reserve(pipelines.size());
+        for (auto &[hash, _] : pipelines)
+            hashes.push_back(hash);
+        uwp_save_thread = std::jthread([this, shaders_copy = std::move(shaders_copy), hashes = std::move(hashes)]() mutable {
+            renderer::save_shaders_cache_hashs(state, shaders_copy);
+            const std::vector<uint8_t> pipeline_data = state.device.getPipelineCacheData(pipeline_cache);
+            if (pipeline_data.empty())
+                return;
+            const fs::path path = state.shaders_path / fmt::format("pipeline-cache-vk{}.dat", shader::CURRENT_VERSION);
+            fs::path temp_path = path;
+            temp_path += ".tmp";
+            std::ofstream file(temp_path, std::ios::out | std::ios::binary | std::ios::trunc);
+            if (!file.is_open())
+                return;
+            const auto write_integer = [&]<typename T>(T val) {
+                file.write(reinterpret_cast<const char *>(&val), sizeof(T));
+            };
+            write_integer(pipeline_cache_magic);
+            write_integer(hashes.size());
+            for (const uint64_t hash : hashes)
+                write_integer(hash);
+            file.write(reinterpret_cast<const char *>(pipeline_data.data()), pipeline_data.size());
+            file.close();
+            // a half-written cache (the app closed mid-save) must not replace a good one
+            std::error_code rename_error;
+            fs::rename(temp_path, path, rename_error);
+            if (rename_error)
+                return;
+            LOG_INFO("Pipeline cache saved in the background ({} pipelines, {} KiB)", hashes.size(), pipeline_data.size() / 1024);
+        });
+        return;
+    }
+#endif
+    // first save the shader hashes''')
+replace(pipeline_cache_cpp, '''void PipelineCache::cleanup() {''', '''void PipelineCache::cleanup() {
+#ifdef VITA3K_UWP
+    if (uwp_save_thread.joinable())
+        uwp_save_thread.join();
+#endif''')
+replace('vita3k/renderer/src/vulkan/renderer.cpp', '''    if (time_s >= pipeline_cache.next_pipeline_cache_save) {
+        pipeline_cache.save_pipeline_cache();
+''', '''    if (time_s >= pipeline_cache.next_pipeline_cache_save) {
+#ifdef VITA3K_UWP
+        pipeline_cache.uwp_save_in_background = true;
+        pipeline_cache.save_pipeline_cache();
+        pipeline_cache.uwp_save_in_background = false;
+#else
+        pipeline_cache.save_pipeline_cache();
+#endif
+''')
+print('Vulkan: the periodic pipeline cache save runs beside the game.')
+
+# ── Texture cache: 2048 entries (iOS build's value) ─────────────────────────
+# A full cache of 1024 textures evicts and re-decodes in texture-heavy scenes.
+# The console has the memory for twice as many.
+replace('vita3k/renderer/include/renderer/texture_cache.h', '''static constexpr size_t TextureCacheSize = 1024;''', '''#ifdef VITA3K_UWP
+static constexpr size_t TextureCacheSize = 2048;
+#else
+static constexpr size_t TextureCacheSize = 1024;
+#endif''')
+print('Texture cache holds 2048 textures.')
+
+# ── Pipeline cache: written whole or not at all, read without crashing ──────
+# (Both from the iOS build's lessons.) A cache cut short by the app closing
+# mid-save made createPipelineCache throw at the next boot, and the game never
+# started again until the file was deleted by hand. The exit save now writes
+# a temporary file and renames it; a cache the driver refuses is replaced by
+# an empty one.
+replace(pipeline_cache_cpp, '''    std::ofstream pipeline_cache_file(path, std::ios::out | std::ios::binary | std::ios::trunc);
+    if (!pipeline_cache_file.is_open())
+        return;
+
+    LOG_INFO("Saving pipeline cache...");''', '''#ifdef VITA3K_UWP
+    fs::path temp_path = path;
+    temp_path += ".tmp";
+    std::ofstream pipeline_cache_file(temp_path, std::ios::out | std::ios::binary | std::ios::trunc);
+#else
+    std::ofstream pipeline_cache_file(path, std::ios::out | std::ios::binary | std::ios::trunc);
+#endif
+    if (!pipeline_cache_file.is_open())
+        return;
+
+    LOG_INFO("Saving pipeline cache...");''')
+replace(pipeline_cache_cpp, '''    pipeline_cache_file.write(reinterpret_cast<const char *>(pipeline_data.data()), pipeline_data.size());
+    pipeline_cache_file.close();
+    LOG_INFO("Pipeline cache saved");''', '''    pipeline_cache_file.write(reinterpret_cast<const char *>(pipeline_data.data()), pipeline_data.size());
+    pipeline_cache_file.close();
+#ifdef VITA3K_UWP
+    {
+        std::error_code rename_error;
+        fs::rename(temp_path, path, rename_error);
+        if (rename_error) {
+            LOG_WARN("Pipeline cache: could not replace the old file ({})", rename_error.message());
+            return;
+        }
+    }
+#endif
+    LOG_INFO("Pipeline cache saved");''')
+replace(pipeline_cache_cpp, '''    state.device.destroyPipelineCache(pipeline_cache);
+    pipeline_cache = state.device.createPipelineCache(cache_info);
+    LOG_INFO("Pipeline cache read and loaded");''', '''    state.device.destroyPipelineCache(pipeline_cache);
+#ifdef VITA3K_UWP
+    try {
+        pipeline_cache = state.device.createPipelineCache(cache_info);
+    } catch (const std::exception &e) {
+        LOG_WARN("Pipeline cache refused by the driver ({}); starting an empty one", e.what());
+        pipeline_cache = state.device.createPipelineCache(vk::PipelineCacheCreateInfo{});
+        return;
+    }
+#else
+    pipeline_cache = state.device.createPipelineCache(cache_info);
+#endif
+    LOG_INFO("Pipeline cache read and loaded");''')
+print('Pipeline cache: atomic saves, a refused cache starts empty.')
+
+# ── Frame fence waits in one-second steps ───────────────────────────────────
+# Without memory mapping (the console) the render thread waited for the GPU
+# forever at each new frame; a hung GPU left Quit stuck there. It now waits a
+# second at a time and gives up when the game is closing.
+replace('vita3k/renderer/src/vulkan/context.cpp', '''            auto result = device.waitForFences(frame.rendered_fences, VK_TRUE, std::numeric_limits<uint64_t>::max());
+            if (result != vk::Result::eSuccess) {''', '''#ifdef VITA3K_UWP
+            auto result = device.waitForFences(frame.rendered_fences, VK_TRUE, 1'000'000'000ULL);
+            while (result == vk::Result::eTimeout && !context.state.render_abort.load(std::memory_order_relaxed))
+                result = device.waitForFences(frame.rendered_fences, VK_TRUE, 1'000'000'000ULL);
+#else
+            auto result = device.waitForFences(frame.rendered_fences, VK_TRUE, std::numeric_limits<uint64_t>::max());
+#endif
+            if (result != vk::Result::eSuccess) {''')
+print('Vulkan: frame fence waits give up when the game closes.')
+
+# ── Fios overlays resolved for games that use the kernel call ───────────────
+# Games with their own libfios2 (Danganronpa, Gravity Rush, Minecraft) resolve
+# paths through _sceFiosKernelOverlayResolveWithRangeSync, which only copied
+# the path back. The overlays they registered were never applied, so
+# Danganronpa looked for "/Dr1/data/us/flash/fla_*.pak" with no device and
+# found nothing (49 times in one log; those are the flash animations of its
+# examine and talk screens). It now resolves through the same overlay table
+# as the user-mode call; a rooted path no overlay claims is taken as the
+# game's own (app0:), where those files are.
+fios_kernel = 'vita3k/modules/SceFios2Kernel/SceFios2Kernel.cpp'
+replace(fios_kernel, '''#include <module/module.h>''', '''#include <module/module.h>
+
+#ifdef VITA3K_UWP
+#include <io/functions.h>
+#endif''')
+replace(fios_kernel, '''    STUBBED("Using strncpy");
+    strncpy(opt->pOutPath.get(emuenv.mem), pInPath, opt->maxPath);
+
+    return 0;''', '''#ifdef VITA3K_UWP
+    uint32_t lo = static_cast<uint8_t>(opt->loOrderFilter);
+    uint32_t hi = static_cast<uint8_t>(opt->hiOrderFilter);
+    if (hi == 0 || hi < lo) {
+        lo = 0;
+        hi = 0xFF;
+    }
+    std::string resolved = resolve_path(emuenv.io, pInPath, lo, hi);
+    if (resolved == pInPath && resolved.size() > 1 && resolved[0] == '/' && resolved.find(':') == std::string::npos) {
+        LOG_INFO_ONCE("Fios: rooted path with no overlay, read from the game's folder ({})", resolved);
+        resolved = "app0:" + resolved;
+    }
+    strncpy(opt->pOutPath.get(emuenv.mem), resolved.c_str(), opt->maxPath);
+    return 0;
+#else
+    STUBBED("Using strncpy");
+    strncpy(opt->pOutPath.get(emuenv.mem), pInPath, opt->maxPath);
+
+    return 0;
+#endif''')
+print('Fios: the kernel overlay resolve applies overlays (Danganronpa examine screens).')

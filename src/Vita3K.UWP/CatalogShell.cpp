@@ -2846,6 +2846,11 @@ const TitleOverride kTitleOverrides[] = {
     // always gets the pair.
     { L"PCSE00261", "vita3k_backend_renderer", "OpenGL", nullptr, true },
     { L"PCSE00261", "vita3k_surface_sync", "enabled", nullptr, true },
+    // Gravity Rush: its bloom reads the game's own picture back; without
+    // surface sync it comes out over-bright (Vita3K/compatibility#177, the
+    // fix the iOS build ships). On even with OpenGL, unless the player chose.
+    { L"PCSA00011", "vita3k_surface_sync", "enabled", nullptr, false },
+    { L"PCSF00024", "vita3k_surface_sync", "enabled", nullptr, false },
 };
 // The title ID (four letters, five digits) in a game's folder or file name.
 std::wstring TitleIdIn(const std::wstring& path) {
@@ -2876,6 +2881,11 @@ void CatalogShell::ApplyCoreOptions(const std::wstring& contentPath) {
         const auto& option = vita3k_uwp::kCoreOptions[i];
         std::string value = SavedCoreOption(option);
         const bool chosen = Pref(CoreOptionPrefKey(option), L"")->Length() != 0;
+        // Surface sync is on by default: on Vulkan it costs nothing until a
+        // game reads its own picture. OpenGL reads every scene back, which is
+        // slow, so there it stays off unless the player turned it on.
+        if (!chosen && renderer == "OpenGL" && std::strcmp(option.key, "vita3k_surface_sync") == 0)
+            value = "disabled";
         if (!titleId.empty()) {
             for (const auto& o : kTitleOverrides) {
                 if ((!chosen || o.always) && titleId == o.titleId && std::strcmp(option.key, o.key) == 0 && (!o.renderer || renderer == o.renderer)) {
