@@ -2665,3 +2665,45 @@ replace(fios_kernel, '''    STUBBED("Using strncpy");
     return 0;
 #endif''')
 print('Fios: the kernel overlay resolve applies overlays (Danganronpa examine screens).')
+
+# ── Texture viewport off by default (Vulkan lettering) ──────────────────────
+# Vulkan-only: every 2D texture lookup is rewritten as
+# coord * viewport_ratio[i] + viewport_offset[i], read from a uniform array
+# (upstream: "faster but not entirely accurate"; high accuracy turns it off).
+# Those arrays rely on uniformBufferStandardLayout; on Dozen a lookup that
+# reads the wrong ratio or offset samples the wrong part of the texture,
+# which is what broken, sliced and garbled letters look like (Persona 4
+# Golden, Minecraft, and many Vulkan games in a review of this port, while
+# OpenGL showed the same text correctly). Off by default on the console: a
+# surface sampled at another size is copied instead. A setting turns it on.
+renderer_cpp = 'vita3k/renderer/src/vulkan/renderer.cpp'
+replace(renderer_cpp, '''    // texture viewport is faster but not entirely accurate
+    if (support_standard_layout && !use_high_accuracy) {''', '''    // texture viewport is faster but not entirely accurate
+#ifdef VITA3K_UWP
+    if (!vita3k_uwp_texture_viewport)
+        LOG_INFO("Vulkan texture viewport: off (setting); surfaces sampled at another size are copied");
+    if (support_standard_layout && !use_high_accuracy && vita3k_uwp_texture_viewport) {
+#else
+    if (support_standard_layout && !use_high_accuracy) {
+#endif''')
+replace(renderer_cpp, '''#include <unordered_set>
+#include <vector>
+''', '''#include <unordered_set>
+#include <vector>
+
+#ifdef VITA3K_UWP
+// "Texture Viewport (Vulkan)" setting; off by default on the console.
+bool vita3k_uwp_texture_viewport = false;
+#endif
+''')
+replace(libretro_cpp, '''#ifdef VITA3K_UWP
+extern int vita3k_uwp_shader_threads;
+#endif''', '''#ifdef VITA3K_UWP
+extern int vita3k_uwp_shader_threads;
+extern bool vita3k_uwp_texture_viewport;
+#endif''')
+replace(libretro_cpp, '''    read_core_option("vita3k_shader_threads", "4", [](const char *value) {''', '''    read_core_option("vita3k_texture_viewport", "disabled", [](const char *value) {
+        vita3k_uwp_texture_viewport = parse_enabled_option(value, false);
+    });
+    read_core_option("vita3k_shader_threads", "4", [](const char *value) {''')
+print('Vulkan: texture viewport off by default (setting), for broken lettering.')

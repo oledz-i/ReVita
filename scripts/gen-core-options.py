@@ -18,7 +18,7 @@ shown = [
     'vita3k_backend_renderer',
     'vita3k_resolution_multiplier', 'vita3k_screen_filter', 'vita3k_anisotropic_filtering',
     'vita3k_v_sync', 'vita3k_async_pipeline', 'vita3k_compile_overlay', 'vita3k_surface_sync',
-    'vita3k_texture_cache', 'vita3k_hashless_texture_cache', 'vita3k_shader_threads', 'vita3k_shader_cache',
+    'vita3k_texture_cache', 'vita3k_hashless_texture_cache', 'vita3k_shader_threads', 'vita3k_shader_cache', 'vita3k_texture_viewport',
     'vita3k_memory_mapping', 'vita3k_high_accuracy',
     'vita3k_cpu_opt',
     'vita3k_pkg_mode',
