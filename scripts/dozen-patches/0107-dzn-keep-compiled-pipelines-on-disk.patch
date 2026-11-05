@@ -5,15 +5,13 @@ Subject: [PATCH] dzn: keep each compiled pipeline on disk (cached PSO blobs)
 
 ---
 diff --git a/src/microsoft/vulkan/dzn_pipeline.c b/src/microsoft/vulkan/dzn_pipeline.c
-index 174c246..92c27f5 100644
+index 174c246..e2dfeac 100644
 --- a/src/microsoft/vulkan/dzn_pipeline.c
 +++ b/src/microsoft/vulkan/dzn_pipeline.c
-@@ -2735,12 +2735,213 @@ vita3k_create_pso_guarded(struct dzn_device *device, const D3D12_PIPELINE_STATE_
+@@ -2735,12 +2735,211 @@ vita3k_create_pso_guarded(struct dzn_device *device, const D3D12_PIPELINE_STATE_
  
  /* CreatePipelineState through the library: load when known, compile and keep when not. */
  static HRESULT
-+#include <wchar.h>
-+
 +/* VITA3K: compiled pipelines kept on disk, one file each.
 + *
 + * The Xbox's driver takes 30-750 ms to compile each pipeline state (about
