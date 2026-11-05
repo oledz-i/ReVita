@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: oledz-i <x@x>
+Date: Thu, 5 Nov 2026 09:00:00 -0500
+Subject: [PATCH] dzn: suballocate sampled-only images instead of a heap each
+
+---
+diff --git a/src/microsoft/vulkan/dzn_image.c b/src/microsoft/vulkan/dzn_image.c
+index 712e9d1..4f20ab1 100644
+--- a/src/microsoft/vulkan/dzn_image.c
++++ b/src/microsoft/vulkan/dzn_image.c
+@@ -905,8 +905,17 @@ dzn_GetImageMemoryRequirements2(VkDevice _device,
+           * without (placed resources in shared heaps): reused heap memory showed
+           * old render-target contents on screen (placed render targets need a
+           * clear or discard after aliasing, which nothing issues). */
++         /* VITA3K: only attachments (and storage images) keep their own heap.
++          * Sampled-only textures are written whole by copies before they are
++          * read, so a placed resource in a shared heap is safe for them, and
++          * each dedicated allocation cost a heap creation on the console
++          * (0.5-15 ms, 60 of them in 5 s in Gravity Rush): a hitch every
++          * time new textures streamed in. */
++         const VkImageUsageFlags own_heap_usage =
++            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
++            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+          requirements->prefersDedicatedAllocation = requirements->requiresDedicatedAllocation ||
+-            image->vk.tiling == VK_IMAGE_TILING_OPTIMAL;
++            (image->vk.tiling == VK_IMAGE_TILING_OPTIMAL && (image->vk.usage & own_heap_usage) != 0);
+          break;
+       }
+ 
