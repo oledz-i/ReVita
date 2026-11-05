@@ -141,6 +141,11 @@ const XmbTheme kXmbThemes[] = {
     { L"Sunset", { 36, 10, 46 }, { 226, 104, 58 }, false },
     { L"Silver", { 46, 48, 56 }, { 164, 168, 180 }, false },
     { L"Midnight", { 2, 2, 6 }, { 24, 26, 36 }, false },
+    { L"Sakura", { 46, 14, 34 }, { 232, 140, 178 }, false },
+    { L"Synthwave", { 20, 4, 44 }, { 236, 64, 180 }, false },
+    { L"Forest", { 4, 24, 12 }, { 84, 170, 92 }, false },
+    { L"Gold", { 30, 20, 4 }, { 214, 166, 64 }, false },
+    { L"Ice", { 12, 30, 48 }, { 164, 214, 246 }, false },
 };
 constexpr int kXmbThemeCount = static_cast<int>(sizeof(kXmbThemes) / sizeof(kXmbThemes[0]));
 Platform::String^ StringOf(const std::wstring& value) {
@@ -186,6 +191,10 @@ Color CatalogShell::Bg() const {
     case 2: return RgbColor(18, 12, 11);      // Ember: dark theater
     case 3: return RgbColor(10, 17, 25);      // Glacier: midnight blue
     case 4: return RgbColor(13, 10, 23);      // Orbit: deep cosmic
+    case 5: return RgbColor(22, 12, 18);      // Sakura: plum night
+    case 6: return RgbColor(14, 6, 24);       // Synthwave: neon dusk
+    case 7: return RgbColor(7, 17, 12);       // Verdant: forest floor
+    case 8: return RgbColor(16, 13, 8);       // Gilded: black and gold
     default: return RgbColor(9, 10, 13);      // Onyx: charcoal
     }
 }
@@ -196,6 +205,10 @@ Color CatalogShell::Card() const {
     case 2: return Alpha(206, 35, 24, 22);
     case 3: return Alpha(206, 22, 33, 46);
     case 4: return Alpha(206, 27, 22, 41);
+    case 5: return Alpha(206, 40, 24, 33);
+    case 6: return Alpha(206, 30, 16, 46);
+    case 7: return Alpha(206, 17, 34, 25);
+    case 8: return Alpha(206, 33, 28, 18);
     default: return Alpha(206, 24, 25, 30);
     }
 }
@@ -205,6 +218,10 @@ Color CatalogShell::Accent() const {
     case 2: return RgbColor(246, 163, 100);
     case 3: return RgbColor(118, 179, 246);
     case 4: return RgbColor(178, 149, 255);
+    case 5: return RgbColor(255, 158, 196);
+    case 6: return RgbColor(255, 92, 205);
+    case 7: return RgbColor(146, 222, 120);
+    case 8: return RgbColor(232, 190, 104);
     default: return RgbColor(239, 69, 105);
     }
 }
@@ -214,6 +231,10 @@ Color CatalogShell::Glow() const {
     case 2: return RgbColor(103, 46, 32);
     case 3: return RgbColor(28, 71, 109);
     case 4: return RgbColor(75, 40, 105);
+    case 5: return RgbColor(112, 46, 78);
+    case 6: return RgbColor(92, 26, 120);
+    case 7: return RgbColor(28, 82, 46);
+    case 8: return RgbColor(104, 72, 22);
     default: return RgbColor(99, 24, 49);
     }
 }
@@ -399,15 +420,15 @@ void CatalogShell::SetStatus(Platform::String^ message) {
 }
 CatalogShell::CatalogShell() {
     const auto saved = Pref(L"theme", L"0");
-    theme_ = saved->Equals(L"1") ? 1 : saved->Equals(L"2") ? 2 :
-             saved->Equals(L"3") ? 3 : saved->Equals(L"4") ? 4 : 0;
+    theme_ = _wtoi(saved->Data());
+    if (theme_ < 0 || theme_ > 8) theme_ = 0;
     xmbMode_ = Pref(L"ui.layout", L"cinematic")->Equals(L"xmb");
     xmbTheme_ = _wtoi(Pref(L"xmb.theme", L"1")->Data());
     if (xmbTheme_ < 0 || xmbTheme_ >= kXmbThemeCount) xmbTheme_ = 0;
     const auto savedTrack = Pref(L"music.track", L"1");
-    track_ = savedTrack->Equals(L"0") ? 0 : savedTrack->Equals(L"2") ? 2 :
-             savedTrack->Equals(L"3") ? 3 : savedTrack->Equals(L"4") ? 4 :
-             savedTrack->Equals(L"5") ? 5 : 1;
+    // 0 off, 1-4 and 6-8 bundled tracks, 5 the player's own
+    track_ = _wtoi(savedTrack->Data());
+    if (track_ < 0 || track_ > 8 || (track_ == 0 && !savedTrack->Equals(L"0"))) track_ = 1;
     try {
         musicVolume_ = std::stod(Pref(L"music.volume", L"0.45")->Data());
     } catch (...) { musicVolume_ = 0.45; }
@@ -967,6 +988,8 @@ void CatalogShell::Home() {
         auto left = Vertical();
         auto mood = Text(theme_ == 1 ? L"AURORA  \u2022  ELECTRIC TEAL" : theme_ == 2 ? L"EMBER  \u2022  WARM CINEMA" :
                          theme_ == 3 ? L"GLACIER  \u2022  ARCTIC BLUE" : theme_ == 4 ? L"ORBIT  \u2022  COSMIC VIOLET" :
+                         theme_ == 5 ? L"SAKURA  \u2022  BLOSSOM NIGHT" : theme_ == 6 ? L"SYNTHWAVE  \u2022  NEON HORIZON" :
+                         theme_ == 7 ? L"VERDANT  \u2022  FIREFLY FOREST" : theme_ == 8 ? L"GILDED  \u2022  BLACK & GOLD" :
                          L"ONYX  \u2022  MIDNIGHT & ROSE", 10, true);
         mood->CharacterSpacing = 220;
         mood->Foreground = Solid(Accent());
@@ -1593,22 +1616,26 @@ void CatalogShell::Settings() {
     FirmwareSettings();
     StorageSettings();
     EmulationSettings();
-    Section(L"Appearance", L"Five moods. One beautifully simple library.");
+    Section(L"Appearance", L"Nine moods, each with its own living scene. One beautifully simple library.");
     const wchar_t* styles[] = {
-        L"Onyx", L"Aurora", L"Ember", L"Glacier", L"Orbit"
+        L"Onyx", L"Aurora", L"Ember", L"Glacier", L"Orbit",
+        L"Sakura", L"Synthwave", L"Verdant", L"Gilded"
     };
     const wchar_t* captions[] = {
         L"Midnight & rose", L"Electric teal", L"Warm cinema",
-        L"Arctic blue", L"Cosmic violet"
+        L"Arctic blue", L"Cosmic violet",
+        L"Falling blossoms", L"Neon horizon", L"Firefly forest", L"Black & gold"
     };
     const Color samples[] = {
         RgbColor(111, 34, 56), RgbColor(23, 95, 94),
         RgbColor(127, 65, 37), RgbColor(48, 95, 145),
-        RgbColor(83, 55, 131)
+        RgbColor(83, 55, 131),
+        RgbColor(150, 70, 110), RgbColor(130, 36, 150),
+        RgbColor(40, 110, 62), RgbColor(150, 112, 40)
     };
     auto palettes = ref new StackPanel();
     palettes->Orientation = Orientation::Horizontal;
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 9; ++i) {
         const bool active = theme_ == i;
         auto choice = ref new Windows::UI::Xaml::Controls::Button();
         choice->Width = 148;
@@ -1698,12 +1725,16 @@ void CatalogShell::Settings() {
     content_->Children->Append(xmbColours);
 
     Section(L"Home menu soundtrack", L"Original loopable music, your own audio, or silence.");
+    // shown in this order; the number is the saved track
     const wchar_t* names[] = {
-        L"Off", L"Afterglow", L"Neon Arcade", L"Stardust", L"Tidal", L"Your own track"
+        L"Off", L"Afterglow", L"Neon Arcade", L"Stardust", L"Tidal",
+        L"Sakura", L"Night Drive", L"Golden Hour", L"Your own track"
     };
+    const int trackOf[] = { 0, 1, 2, 3, 4, 6, 7, 8, 5 };
     auto music = ActionRow(142);
-    for (int i = 0; i < 6; ++i) {
-        auto b = Button(ref new Platform::String(names[i]), track_ == i);
+    for (int slot = 0; slot < 9; ++slot) {
+        const int i = trackOf[slot];
+        auto b = Button(ref new Platform::String(names[slot]), track_ == i);
         b->Click += ref new RoutedEventHandler([this,i](Platform::Object^, RoutedEventArgs^) {
             if (i == 5) PickCustomMusic();
             else SetMusic(i);
@@ -2011,7 +2042,7 @@ void CatalogShell::UpdateClock() {
     }
 }
 void CatalogShell::SaveTheme(int theme) {
-    if (theme < 0 || theme > 4) return;
+    if (theme < 0 || theme > 8) return;
     theme_ = theme;
     PutPref(L"theme", StringOf(std::to_wstring(theme)));
     PlayCue(5);
@@ -2027,25 +2058,27 @@ void CatalogShell::SetVolume(double value) {
     PutPref(L"music.volume", StringOf(std::to_wstring(musicVolume_)));
 }
 void CatalogShell::SetMusic(int track) {
-    if (track < 0 || track > 5) return;
+    if (track < 0 || track > 8) return;
     track_ = track;
     PutPref(L"music.track", StringOf(std::to_wstring(track)));
     musicPlayer_->Stop();
     musicPlayer_->Source = nullptr;
     customMusicStream_ = nullptr;
-    if (track > 0 && track < 5) PlayBundledMusic(track);
+    if (track > 0 && track != 5) PlayBundledMusic(track);
     else if (track == 5) PlayCustomMusic();
     else playbackStatus_ = L"Music off";
     Render();
     if (musicStatus_ != nullptr) musicStatus_->Text = playbackStatus_;
 }
 void CatalogShell::PlayBundledMusic(int track) {
-    if (track < 1 || track > 4) return;
+    if (track < 1 || track > 8 || track == 5) return;
     // Original tracks shipped in the package (scripts/music/compose.py).
-    static const wchar_t* files[4] = { L"afterglow", L"neon-arcade", L"stardust", L"tidal" };
+    // 5 is the player's own track, so the second set starts at 6.
+    static const wchar_t* files[9] = { nullptr, L"afterglow", L"neon-arcade", L"stardust", L"tidal",
+                                       nullptr, L"sakura", L"night-drive", L"golden-hour" };
     musicPlayer_->IsLooping = true;
     musicPlayer_->Source = ref new Uri(ref new Platform::String(
-        (std::wstring(L"ms-appx:///Assets/Music/") + files[track - 1] + L".wav").c_str()));
+        (std::wstring(L"ms-appx:///Assets/Music/") + files[track] + L".wav").c_str()));
     playbackStatus_ = L"Playing";
     if (musicStatus_ != nullptr) musicStatus_->Text = playbackStatus_;
     musicPlayer_->Play(); // MediaOpened also starts it once ready.
@@ -3767,6 +3800,7 @@ void CatalogShell::EnterGameView(Platform::String^ title) {
     if (xmb_ != nullptr) {
         xmb_->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
         if (xmbTimer_) xmbTimer_->Stop();
+        xmbRibbons_.SetActive(false); // nothing animates behind a game
     }
     gameTitle_ = title;
     quickMenu_ = nullptr;
@@ -5257,11 +5291,16 @@ std::vector<XmbCategory> CatalogShell::XmbCategories() {
         XmbCategory c;
         c.name = L"Music";
         c.glyph = L"\uE8D6";
-        const wchar_t* names[] = { L"No Music", L"Afterglow", L"Neon Arcade", L"Stardust", L"Tidal" };
-        for (int i = 0; i < 5; ++i)
-            c.items.push_back(XmbEntry{ names[i], track_ == i ? L"Now playing" : L"Home menu music", L"\uE8D6", -1,
+        const wchar_t* names[] = { L"No Music", L"Afterglow", L"Neon Arcade", L"Stardust", L"Tidal",
+                                   L"Sakura", L"Night Drive", L"Golden Hour" };
+        const int trackOf[] = { 0, 1, 2, 3, 4, 6, 7, 8 };
+        c.initial = 0;
+        for (int slot = 0; slot < 8; ++slot) {
+            const int i = trackOf[slot];
+            if (track_ == i) c.initial = slot;
+            c.items.push_back(XmbEntry{ names[slot], track_ == i ? L"Now playing" : L"Home menu music", L"\uE8D6", -1,
                 [this, i]() { SetMusic(i); Render(); }, nullptr });
-        c.initial = track_ >= 0 && track_ < 5 ? track_ : 0;
+        }
         cats.push_back(std::move(c));
     }
     {
@@ -5321,18 +5360,10 @@ void CatalogShell::ShowXmb() {
         xmbWaves_ = ref new Canvas();
         xmbWaves_->IsHitTestVisible = false;
         xmb_->Children->Append(xmbWaves_);
-        // three bands and two bright edges, moved by XmbWaves
-        for (int b = 0; b < 3; ++b) {
-            auto band = ref new Polygon();
-            band->Fill = Solid(Alpha(static_cast<unsigned>(30 - b * 7), 255, 255, 255));
-            xmbWaves_->Children->Append(band);
-        }
-        for (int l = 0; l < 2; ++l) {
-            auto edge = ref new Polyline();
-            edge->Stroke = Solid(Alpha(l == 0 ? 90 : 55, 255, 255, 255));
-            edge->StrokeThickness = l == 0 ? 1.4 : 1.0;
-            xmbWaves_->Children->Append(edge);
-        }
+        // the flowing waves, run by the system compositor (no frame work on
+        // the UI thread: the old point-by-point waves were redrawn here 30
+        // times a second and hitched the menu)
+        xmbRibbons_.Attach(xmbWaves_);
         // a game's own picture, behind the menu while it is chosen
         auto picture = ref new Image();
         picture->Stretch = Stretch::UniformToFill;
@@ -5359,7 +5390,7 @@ void CatalogShell::ShowXmb() {
     }
     ApplyXmbSky();
     xmb_->Visibility = Windows::UI::Xaml::Visibility::Visible;
-    xmbTimer_->Start();
+    xmbRibbons_.SetActive(true);
     UpdateClock();
     LayoutXmb(0, 0);
 }
@@ -5368,6 +5399,7 @@ void CatalogShell::HideXmb() {
     if (xmb_ == nullptr) return;
     xmb_->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
     if (xmbTimer_) xmbTimer_->Stop();
+    xmbRibbons_.SetActive(false);
     if (!inGame_) {
         navigation_->Visibility = Windows::UI::Xaml::Visibility::Visible;
         if (contentScroll_) contentScroll_->Visibility = Windows::UI::Xaml::Visibility::Visible;

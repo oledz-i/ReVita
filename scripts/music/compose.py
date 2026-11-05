@@ -2,7 +2,8 @@
 
     python3 scripts/music/compose.py src/Vita3K.UWP/Assets/Music
 
-Writes afterglow.wav, neon-arcade.wav, stardust.wav and tidal.wav. Each loop
+Writes afterglow.wav, neon-arcade.wav, stardust.wav, tidal.wav, and the
+second set: sakura.wav, night-drive.wav and golden-hour.wav. Each loop
 wraps its reverb and note tails back onto its start, so it repeats without a
 seam. Needs numpy, scipy and ffmpeg.
 """
@@ -283,7 +284,119 @@ def tidal():
     master(mix, "tidal", peak=0.78)
 
 
+# ---- Sakura: a calm pentatonic garden in D, 74 BPM ---------------------------------------
+
+def sakura():
+    tr = Track(bpm=74, bars=16, swing=0.05)
+    prog = [["D3", "F#3", "A3", "E4"], ["B2", "D3", "F#3", "A3"],
+            ["G2", "B2", "D3", "F#3", "A3"], ["A2", "D3", "E3", "G3"]]
+    roots = ["D2", "B1", "G1", "A1"]
+    for bar in range(16):
+        chord = chord_notes(prog[bar % 4])
+        tr.put(pad(chord, tr.beat * 4.3, 0.45), tr.when(bar, 0), pan=0.0, gain=0.34)
+        tr.put(bass(hz(roots[bar % 4]), tr.beat * 3.2, 0.7), tr.when(bar, 0), gain=0.38)
+        # plucked strings rolling up the chord, like a koto
+        for i, f in enumerate(chord):
+            tr.put(pluck(f * 2, tr.beat * 1.4, 0.4, 2600), tr.when(bar, 0.5 + i * 0.25), pan=-0.3 + 0.15 * i, gain=0.12)
+        for e in range(4):
+            tr.put(shaker(0.014), tr.when(bar, e + 0.5), pan=0.35)
+        if bar >= 4:
+            tr.put(rim(0.07), tr.when(bar, 1), pan=0.15)
+            tr.put(rim(0.06), tr.when(bar, 3), pan=0.15)
+    tune = [(0, 0, "A4", 1.5), (0, 1.5, "F#4", 0.5), (0, 2, "E4", 2),
+            (1, 0, "D4", 1), (1, 1, "E4", 1), (1, 2, "F#4", 2),
+            (2, 0, "B4", 1.5), (2, 1.5, "A4", 0.5), (2, 2, "F#4", 1), (2, 3, "E4", 1),
+            (3, 0, "D4", 1), (3, 1, "E4", 0.5), (3, 1.5, "D4", 2.5)]
+    for start, gain in ((4, 0.24), (8, 0.24), (12, 0.2)):
+        for bar, beat, name, length in tune:
+            n = name if start != 12 else name[:-1] + str(int(name[-1]) + 1)
+            tr.put(bell(hz(n), max(1.0, length * tr.beat * 2), 0.45), tr.when(start + bar, beat), pan=0.2, gain=gain)
+    mix = tr.render()
+    mix = reverb(mix, mix=0.34, size=1.5)
+    mix = soften(mix, 8000)
+    master(mix, "sakura", peak=0.74)
+
+
+# ---- Night Drive: dark synthwave in F# minor, 92 BPM -------------------------------------
+
+def night_drive():
+    tr = Track(bpm=92, bars=24)
+    prog = [["F#3", "A3", "C#4"], ["D3", "F#3", "A3"], ["A3", "C#4", "E4"], ["E3", "G#3", "B3"]]
+    roots = ["F#1", "D1", "A1", "E1"]
+    for bar in range(24):
+        chord = chord_notes(prog[bar % 4])
+        tr.put(warm_pad(chord, tr.beat * 4.1, 0.38, 1100), tr.when(bar, 0), gain=0.4)
+        root = hz(roots[bar % 4])
+        for e in range(16):
+            tr.put(sub(root * (2 if e % 4 == 2 else 1), tr.beat * 0.22, 0.75), tr.when(bar, e / 4), gain=0.32)
+        arp = chord + [chord[0] * 2]
+        for s in range(8):
+            f = arp[[0, 2, 1, 3, 2, 1, 3, 2][s]] * 2
+            tr.put(pluck(f, tr.beat * 0.6, 0.4, 1200 + 600 * ((bar // 4) % 3)), tr.when(bar, s / 2 + 0.25),
+                   pan=0.4 if s % 2 else -0.4, gain=0.11)
+        if bar >= 4:
+            for beat in range(4):
+                tr.put(kick(0.5), tr.when(bar, beat))
+            tr.put(snare(0.4, 200), tr.when(bar, 1))
+            tr.put(snare(0.4, 200), tr.when(bar, 3))
+            for e in range(8):
+                tr.put(hat(0.03 if e % 2 else 0.02, open_=e % 4 == 3), tr.when(bar, e / 2 + 0.25), pan=0.25)
+    hook = [(0, 0, "C#5", 2), (0, 2, "A4", 1), (0, 3, "B4", 1),
+            (1, 0, "A4", 1.5), (1, 1.5, "F#4", 2.5),
+            (2, 0, "E5", 1.5), (2, 1.5, "C#5", 0.5), (2, 2, "B4", 1), (2, 3, "C#5", 1),
+            (3, 0, "G#4", 3), (3, 3, "B4", 1)]
+    for start in (8, 12, 16, 20):
+        for bar, beat, name, length in hook:
+            tr.put(lead(hz(name), length * tr.beat * 1.05, 0.5), tr.when(start + bar, beat), pan=-0.05, gain=0.27)
+    mix = tr.render()
+    mix = mix * sidechain(tr, 24 * 4, 0.5)[:mix.shape[1]]
+    mix = reverb(mix, mix=0.24, size=1.4)
+    mix = soften(mix, 8500)
+    master(mix, "night-drive", peak=0.8)
+
+
+# ---- Golden Hour: neo-soul in Eb, 86 BPM -------------------------------------------------
+
+def golden_hour():
+    tr = Track(bpm=86, bars=16, swing=0.14)
+    prog = [["Eb3", "G3", "Bb3", "D4"], ["C3", "Eb3", "G3", "Bb3", "D4"],
+            ["Ab2", "C3", "Eb3", "G3"], ["Bb2", "D3", "F3", "Ab3", "C4"]]
+    roots = ["Eb2", "C2", "Ab1", "Bb1"]
+    for bar in range(16):
+        chord = chord_notes(prog[bar % 4])
+        for beat in ((0, 1.75, 3) if bar % 2 == 0 else (0.5, 2, 3.5)):
+            at = tr.when(bar, beat)
+            for i, f in enumerate(chord):
+                tr.put(epiano(f, tr.beat * 1.9, 0.5 + 0.12 * rng.random()), at + i * 0.01, pan=-0.15, gain=0.19)
+        root = hz(roots[bar % 4])
+        tr.put(bass(root, tr.beat * 1.4, 0.85), tr.when(bar, 0), gain=0.55)
+        tr.put(bass(root * 1.5, tr.beat * 0.6, 0.6), tr.when(bar, 1.75), gain=0.4)
+        tr.put(bass(root * 2, tr.beat * 0.6, 0.6), tr.when(bar, 2.5), gain=0.38)
+        tr.put(lofi_kick(0.5), tr.when(bar, 0))
+        tr.put(lofi_kick(0.38), tr.when(bar, 2.25))
+        tr.put(snare(0.3, 170), tr.when(bar, 1), pan=0.05)
+        tr.put(snare(0.3, 170), tr.when(bar, 3), pan=0.05)
+        for e in range(8):
+            tr.put(hat(0.06 if e % 2 else 0.09), tr.when(bar, e / 2), pan=0.3)
+        if bar % 4 == 3:
+            for i, f in enumerate(chord[1:]):
+                tr.put(guitar(f * 2, tr.beat * 1.2, 0.35), tr.when(bar, 3.5) + i * 0.02, pan=0.35, gain=0.14)
+    hook = [(0, 0.5, "Bb4", 1), (0, 1.5, "G4", 0.5), (0, 2, "F4", 1), (0, 3, "Eb4", 1),
+            (1, 0.5, "G4", 0.5), (1, 1, "Bb4", 1), (1, 2, "C5", 1.5),
+            (2, 0.5, "Eb5", 1), (2, 1.5, "C5", 0.5), (2, 2, "Bb4", 1), (2, 3, "G4", 1),
+            (3, 0, "F4", 1), (3, 1, "G4", 0.5), (3, 1.5, "Eb4", 2.5)]
+    for start, gain in ((4, 0.26), (8, 0.26), (12, 0.22)):
+        for bar, beat, name, length in hook:
+            tr.put(mallet(hz(name), max(0.4, length * tr.beat * 1.6), 0.8), tr.when(start + bar, beat), pan=0.22, gain=gain)
+    mix = tr.render()
+    mix = reverb(mix, mix=0.22, size=1.1)
+    warmth = crackle(mix.shape[1] / SR, density=4.0, velocity=0.03)
+    mix = mix + np.stack([warmth, np.roll(warmth, 613)])
+    mix = soften(mix, 7800)
+    master(mix, "golden-hour", peak=0.78)
+
+
 if __name__ == "__main__":
-    which = sys.argv[2:] or ["afterglow", "neon_arcade", "stardust", "tidal"]
+    which = sys.argv[2:] or ["afterglow", "neon_arcade", "stardust", "tidal", "sakura", "night_drive", "golden_hour"]
     for name in which:
         globals()[name]()

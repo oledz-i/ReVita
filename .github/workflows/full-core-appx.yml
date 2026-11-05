@@ -285,7 +285,7 @@ jobs:
               # The menu music plays from ms-appx:///Assets/Music: missing, the menu is
               # silent. Reported (with what the package holds), not fatal.
               $all = @($archive.Entries | ForEach-Object FullName)
-              $missing = @('afterglow','neon-arcade','stardust','tidal' | Where-Object { $t = $_; !($all | Where-Object { $_ -ieq "Assets/Music/$t.wav" }) })
+              $missing = @('afterglow','neon-arcade','stardust','tidal','sakura','night-drive','golden-hour' | Where-Object { $t = $_; !($all | Where-Object { $_ -ieq "Assets/Music/$t.wav" }) })
               if ($missing.Count) {
                 $seen = ($all | Where-Object { $_ -match '(?i)wav|music|^assets' }) -join ', '
                 Write-Host "::error title=Menu music not packaged::Missing Assets/Music/: $($missing -join ', '). Package has: $seen"

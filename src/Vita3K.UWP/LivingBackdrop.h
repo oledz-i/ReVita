@@ -29,4 +29,21 @@ private:
     float width_ = 0;
     float height_ = 0;
 };
+
+// The XMB's flowing waves, drawn by the system compositor (no UI-thread
+// frames). Attach to an element stretched where the waves go.
+class XmbRibbons {
+public:
+    void Attach(Windows::UI::Xaml::FrameworkElement^ host);
+    void SetActive(bool active);
+
+private:
+    void Build();
+    Windows::UI::Xaml::FrameworkElement^ host_ = nullptr;
+    Windows::UI::Composition::Compositor^ compositor_ = nullptr;
+    Windows::UI::Composition::ContainerVisual^ scene_ = nullptr;
+    bool active_ = true;
+    float width_ = 0;
+    float height_ = 0;
+};
 }

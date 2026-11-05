@@ -166,6 +166,9 @@
     <Media Include="Assets\Music\neon-arcade.wav"><DeploymentContent>true</DeploymentContent></Media>
     <Media Include="Assets\Music\stardust.wav"><DeploymentContent>true</DeploymentContent></Media>
     <Media Include="Assets\Music\tidal.wav"><DeploymentContent>true</DeploymentContent></Media>
+    <Media Include="Assets\Music\sakura.wav"><DeploymentContent>true</DeploymentContent></Media>
+    <Media Include="Assets\Music\night-drive.wav"><DeploymentContent>true</DeploymentContent></Media>
+    <Media Include="Assets\Music\golden-hour.wav"><DeploymentContent>true</DeploymentContent></Media>
   </ItemGroup>
   <ItemGroup>
     <Content Include="*.dll" Exclude="vulkan_dzn.dll;dxil.dll;vita3k_libretro.dll;vita_guest_cpu_probe.dll">

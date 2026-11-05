@@ -102,6 +102,7 @@ private:
     Windows::UI::Xaml::Controls::TextBlock^ status_;
     // The moving scene behind the menus, and the clock on Home.
     vita3k_uwp::LivingBackdrop backdrop_;
+    vita3k_uwp::XmbRibbons xmbRibbons_;
     Windows::UI::Xaml::Controls::Grid^ backdropHost_ = nullptr;
     Windows::UI::Xaml::Controls::TextBlock^ clock_ = nullptr;
     Windows::UI::Xaml::Controls::TextBlock^ greeting_ = nullptr;
