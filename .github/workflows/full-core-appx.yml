@@ -74,6 +74,9 @@ jobs:
             $lock = Get-Content core-candidates.lock.json -Raw | ConvertFrom-Json
             git clone --branch $lock.libretro_candidate.branch --depth 25 $lock.libretro_candidate.repository upstream-core
             if ($LASTEXITCODE -ne 0) { throw 'Git clone failed' }
+            # the branch moves on: fetch the pinned commit itself, not just the newest 25
+            git -C upstream-core fetch --depth 25 origin $lock.libretro_candidate.commit
+            if ($LASTEXITCODE -ne 0) { throw 'Pinned libretro fetch failed' }
             git -C upstream-core checkout --detach $lock.libretro_candidate.commit
             if ($LASTEXITCODE -ne 0) { throw 'Pinned libretro checkout failed' }
             git -C upstream-core submodule update --init --recursive --depth 1
