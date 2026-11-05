@@ -4131,27 +4131,76 @@ void CatalogShell::EnterGameView(Platform::String^ title) {
     });
     gameLayer_->Children->Append(renderSurface_);
 
-    // Loading screen, over the game until it shows its first picture.
+    // Loading screen, over the game until it shows its first picture: the
+    // game's own picture across the screen, its cover and name at the lower
+    // left, the progress under them.
+    int gameIndex = -1;
+    for (size_t i = 0; i < games_.size(); ++i)
+        if (title != nullptr && games_[i].name == title) { gameIndex = static_cast<int>(i); break; }
     loadingLayer_ = ref new Grid();
     loadingLayer_->Background = Gradient(Bg(), Glow());
+    if (gameIndex >= 0) {
+        Platform::String^ wide = BackdropUri(static_cast<size_t>(gameIndex));
+        if (wide->IsEmpty()) wide = ArtworkUri(static_cast<size_t>(gameIndex));
+        if (!wide->IsEmpty()) {
+            try {
+                auto art = ref new Image();
+                art->Source = CachedBitmap(wide, 1600);
+                art->Stretch = Stretch::UniformToFill;
+                art->Opacity = 0.55;
+                loadingLayer_->Children->Append(art);
+            } catch (Platform::Exception^) {}
+        }
+    }
+    {
+        auto shade = ref new LinearGradientBrush();
+        shade->StartPoint = Point(0.5, 0);
+        shade->EndPoint = Point(0.5, 1);
+        const Color page = Bg();
+        const double stops[][2] = { { 0.0, 120 }, { 0.45, 150 }, { 1.0, 250 } };
+        for (const auto& s : stops) {
+            auto stop = ref new GradientStop();
+            stop->Offset = s[0];
+            stop->Color = Alpha(static_cast<unsigned>(s[1]), page.R, page.G, page.B);
+            shade->GradientStops->Append(stop);
+        }
+        auto veil = ref new Border();
+        veil->Background = shade;
+        loadingLayer_->Children->Append(veil);
+    }
+    auto block = ref new StackPanel();
+    block->Orientation = Orientation::Horizontal;
+    block->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Left;
+    block->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Bottom;
+    block->Margin = Thickness(80, 0, 80, 84);
+    if (gameIndex >= 0) {
+        auto cover = ref new Border();
+        cover->Width = 132;
+        cover->Height = 176;
+        cover->CornerRadius = Windows::UI::Xaml::CornerRadius(12);
+        cover->BorderBrush = Solid(Alpha(46, 255, 255, 255));
+        cover->BorderThickness = Thickness(1);
+        cover->Margin = Thickness(0, 0, 30, 0);
+        cover->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Bottom;
+        ConfigureCover(cover, static_cast<size_t>(gameIndex));
+        block->Children->Append(cover);
+    }
     auto column = Vertical();
-    column->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Center;
-    column->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
-    column->MaxWidth = 560;
-    auto kicker = Text(L"NOW LOADING", 10, true);
+    column->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Bottom;
+    column->MaxWidth = 720;
+    auto kicker = Text(L"NOW LOADING", 11, true);
     kicker->CharacterSpacing = 300;
     kicker->Foreground = Solid(Accent());
-    kicker->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Center;
     column->Children->Append(kicker);
-    auto name = Text(title, 30, false);
+    auto name = Text(title, 42, false);
     name->FontWeight = FontWeights::Light;
-    name->TextAlignment = TextAlignment::Center;
-    name->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Center;
-    name->Margin = Thickness(0, 10, 0, 22);
+    name->MaxLines = 2;
+    name->Margin = Thickness(0, 8, 0, 20);
     column->Children->Append(name);
     loadingBar_ = ref new ProgressBar();
-    loadingBar_->Width = 420;
+    loadingBar_->Width = 520;
     loadingBar_->Height = 4;
+    loadingBar_->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Left;
     loadingBar_->Minimum = 0;
     loadingBar_->Maximum = 100;
     loadingBar_->IsIndeterminate = true;
@@ -4159,17 +4208,19 @@ void CatalogShell::EnterGameView(Platform::String^ title) {
     loadingBar_->Background = Solid(Alpha(40, 255, 255, 255));
     column->Children->Append(loadingBar_);
     loadingStage_ = Text(L"Getting ready", 14, false, true);
-    loadingStage_->TextAlignment = TextAlignment::Center;
-    loadingStage_->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Center;
-    loadingStage_->Margin = Thickness(0, 14, 0, 0);
+    loadingStage_->Margin = Thickness(0, 12, 0, 0);
     column->Children->Append(loadingStage_);
-    loadingHint_ = Text(L"Press View + Menu together for the quick menu.", 11, false, true);
-    loadingHint_->Opacity = 0.7;
-    loadingHint_->TextAlignment = TextAlignment::Center;
-    loadingHint_->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Center;
-    loadingHint_->Margin = Thickness(0, 40, 0, 0);
-    column->Children->Append(loadingHint_);
-    loadingLayer_->Children->Append(column);
+    block->Children->Append(column);
+    loadingLayer_->Children->Append(block);
+    loadingHint_ = Text(L"View + Menu together: quick menu", 11, false, true);
+    loadingHint_->Opacity = 0.75;
+    loadingHint_->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Right;
+    loadingHint_->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Bottom;
+    loadingHint_->Margin = Thickness(0, 0, 80, 40);
+    loadingHint_->MaxWidth = 640;
+    loadingHint_->TextWrapping = TextWrapping::Wrap;
+    loadingHint_->TextAlignment = TextAlignment::Right;
+    loadingLayer_->Children->Append(loadingHint_);
     gameLayer_->Children->Append(loadingLayer_);
     // The performance overlay: a small, quiet pill in the top-left corner.
     perfOverlay_ = ref new Border();
@@ -4365,30 +4416,69 @@ void CatalogShell::ShowQuickMenu() {
     PlayCue(1);
 
     quickMenu_ = ref new Grid();
-    quickMenu_->Background = Solid(Alpha(190, 6, 6, 10));
+    // the paused game stays visible on the right, dimmed
+    {
+        auto dim = ref new LinearGradientBrush();
+        dim->StartPoint = Point(0, 0.5);
+        dim->EndPoint = Point(1, 0.5);
+        auto s0 = ref new GradientStop(); s0->Offset = 0.0; s0->Color = Alpha(235, 4, 4, 8);
+        auto s1 = ref new GradientStop(); s1->Offset = 0.45; s1->Color = Alpha(150, 4, 4, 8);
+        auto s2 = ref new GradientStop(); s2->Offset = 1.0; s2->Color = Alpha(70, 4, 4, 8);
+        dim->GradientStops->Append(s0);
+        dim->GradientStops->Append(s1);
+        dim->GradientStops->Append(s2);
+        quickMenu_->Background = dim;
+    }
     quickMenu_->Opacity = 0;
 
+    // A sheet down the left side of the screen.
     auto card = ref new Border();
-    card->Width = 440;
-    card->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Center;
-    card->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
-    card->CornerRadius = Windows::UI::Xaml::CornerRadius(22);
-    card->Padding = Thickness(34, 30, 34, 26);
-    card->Background = Gradient(Card(), Glow());
-    card->BorderBrush = Solid(Alpha(34, 255, 255, 255));
-    card->BorderThickness = Thickness(1);
+    card->Width = 460;
+    card->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Left;
+    card->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Stretch;
+    card->Padding = Thickness(56, 64, 40, 40);
+    card->Background = Gradient(Card(), Alpha(235, Bg().R, Bg().G, Bg().B));
+    card->BorderBrush = Solid(Alpha(28, 255, 255, 255));
+    card->BorderThickness = Thickness(0, 0, 1, 0);
 
     auto column = Vertical(0);
+    column->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
+    {
+        int shown = -1;
+        for (size_t i = 0; i < games_.size(); ++i)
+            if (gameTitle_ != nullptr && games_[i].name == gameTitle_) { shown = static_cast<int>(i); break; }
+        if (shown >= 0) {
+            auto cover = ref new Border();
+            cover->Width = 96;
+            cover->Height = 128;
+            cover->CornerRadius = Windows::UI::Xaml::CornerRadius(10);
+            cover->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Left;
+            cover->Margin = Thickness(0, 0, 0, 18);
+            ConfigureCover(cover, static_cast<size_t>(shown));
+            column->Children->Append(cover);
+        }
+    }
     auto kicker = Text(L"PAUSED", 10, true);
     kicker->CharacterSpacing = 300;
     kicker->Foreground = Solid(Accent());
     column->Children->Append(kicker);
-    auto name = Text(gameTitle_ ? gameTitle_ : ref new Platform::String(L"Your game"), 26, false);
+    auto name = Text(gameTitle_ ? gameTitle_ : ref new Platform::String(L"Your game"), 30, false);
     name->FontWeight = FontWeights::Light;
     name->TextWrapping = TextWrapping::Wrap;
     name->MaxLines = 2;
-    name->Margin = Thickness(0, 2, 0, 14);
+    name->Margin = Thickness(0, 4, 0, 6);
     column->Children->Append(name);
+    if (gameRunningSince_) {
+        const auto minutes = (GetTickCount64() - gameRunningSince_) / 60000ull;
+        wchar_t played[64] = {};
+        if (minutes < 1) swprintf_s(played, L"Playing for under a minute");
+        else swprintf_s(played, L"Playing for %llu min", minutes);
+        auto session = Text(ref new Platform::String(played), 12, false, true);
+        session->Margin = Thickness(0, 0, 0, 22);
+        column->Children->Append(session);
+    } else {
+        name->Margin = Thickness(0, 4, 0, 22);
+    }
 
     auto add = [this,column](Platform::String^ label, bool highlighted) {
         auto button = Button(label, highlighted);
