@@ -3002,3 +3002,119 @@ replace(surface_cache_cpp, '''    cmd_buffer.copyImageToBuffer(image_to_copy, im
 
     ColorSurfaceCacheInfo *return_value = last_written_surface;''')
 print('Vulkan: surface copies and read-backs transition the render target first.')
+
+# ── RGBA4444 textures expanded to RGBA8 (no more Dozen 4444 emulation) ──────
+# Direct3D 12 has no R4G4B4A4 format. Vita3K stored such textures as
+# B4G4R4A4 with red and blue swapped in the view; Dozen in turn fakes
+# B4G4R4A4 with another D3D12 format and its own component remap, and the
+# two remaps stacked. A wrong channel read as alpha cuts parts out of
+# glyphs in a font atlas, and wrong colour channels scramble colours. On the
+# console these textures are now expanded on upload to plain RGBA8, nibble
+# for nibble in R4G4B4A4 order (R from bits 12-15 ... A from bits 0-3), so
+# the game's swizzle applies unchanged and no format emulation is involved.
+vk_texture_cpp = 'vita3k/renderer/src/vulkan/texture.cpp'
+replace(vk_texture_cpp, '''    vk::ComponentMapping view_swizzle = swizzle;
+    if (vk_format == vk::Format::eR4G4B4A4UnormPack16) {''', '''    vk::ComponentMapping view_swizzle = swizzle;
+#ifdef VITA3K_UWP
+    // expanded to RGBA8 on upload (texture/cache.cpp), same channel order
+    if (vk_format == vk::Format::eR4G4B4A4UnormPack16)
+        vk_format = gxm_texture.gamma_mode ? vk::Format::eR8G8B8A8Srgb : vk::Format::eR8G8B8A8Unorm;
+#endif
+    if (vk_format == vk::Format::eR4G4B4A4UnormPack16) {''')
+cache_cpp = 'vita3k/renderer/src/texture/cache.cpp'
+replace(cache_cpp, '''        case SCE_GXM_TEXTURE_BASE_FORMAT_U8U3U3U2:
+            // Convert U8U3U3U2 to U8U8U8U8''', '''#ifdef VITA3K_UWP
+        case SCE_GXM_TEXTURE_BASE_FORMAT_U4U4U4U4:
+            if (!is_vulkan)
+                break;
+            {
+                // R4G4B4A4 (R in bits 12-15) to RGBA8 bytes R, G, B, A
+                texture_data_decompressed.resize(static_cast<size_t>(pixels_per_stride) * memory_height * 4);
+                const uint16_t *src = static_cast<const uint16_t *>(pixels);
+                uint8_t *dst = texture_data_decompressed.data();
+                const size_t count = static_cast<size_t>(pixels_per_stride) * memory_height;
+                for (size_t i = 0; i < count; i++) {
+                    const uint16_t v = src[i];
+                    dst[4 * i + 0] = static_cast<uint8_t>(((v >> 12) & 0xF) * 17);
+                    dst[4 * i + 1] = static_cast<uint8_t>(((v >> 8) & 0xF) * 17);
+                    dst[4 * i + 2] = static_cast<uint8_t>(((v >> 4) & 0xF) * 17);
+                    dst[4 * i + 3] = static_cast<uint8_t>((v & 0xF) * 17);
+                }
+            }
+            pixels = texture_data_decompressed.data();
+            bytes_per_pixel = 4;
+            bpp = 32;
+            upload_format = SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8;
+            break;
+#endif
+        case SCE_GXM_TEXTURE_BASE_FORMAT_U8U3U3U2:
+            // Convert U8U3U3U2 to U8U8U8U8''')
+print('Vulkan: RGBA4444 textures expanded to RGBA8 on upload (glyph and colour corruption).')
+
+# ── Faster game decryption: less work per sector ────────────────────────────
+# Decryption ran at 11.3 MB/s while writing to the console's own storage, so
+# the time went into per-sector crypto, not the drive. Each sector set up its
+# AES key from scratch through OpenSSL 3's provider lookups, and computed two
+# HMAC-SHA1 integrity checks. The AES context now keeps its key between
+# sectors that use the same one (it is re-initialised only when the key,
+# cipher or direction changes), and the integrity check is skipped: it only
+# guards against a damaged dump, which fails to run either way.
+ossl_h = 'external/psvpfstools/psvpfsparser/OpenSSLCryptoOperations.h'
+replace(ossl_h, '''    EVP_CIPHER_CTX *cipher_ctx;''', '''    EVP_CIPHER_CTX *cipher_ctx;
+    // the key, cipher and direction cipher_ctx was last set up with
+    mutable unsigned char last_key[16] = {};
+    mutable const void *last_cipher = nullptr;
+    mutable int last_encrypt = -1;''')
+ossl_cpp = 'external/psvpfstools/psvpfsparser/OpenSSLCryptoOperations.cpp'
+text = read(ossl_cpp)
+old_enc = '''    if (EVP_EncryptInit_ex(cipher_ctx, cipher, nullptr, key, iv) != 1)
+        return -1;
+    EVP_CIPHER_CTX_set_padding(cipher_ctx, 0);'''
+new_enc = '''    if (last_cipher == cipher && last_encrypt == 1 && std::memcmp(last_key, key, 16) == 0) {
+        // same key: only the IV (and the stream position) start over
+        if (EVP_EncryptInit_ex(cipher_ctx, nullptr, nullptr, nullptr, iv) != 1)
+            return -1;
+    } else {
+        if (EVP_EncryptInit_ex(cipher_ctx, cipher, nullptr, key, iv) != 1) {
+            last_cipher = nullptr;
+            return -1;
+        }
+        EVP_CIPHER_CTX_set_padding(cipher_ctx, 0);
+        std::memcpy(last_key, key, 16);
+        last_cipher = cipher;
+        last_encrypt = 1;
+    }'''
+old_dec = '''    if (EVP_DecryptInit_ex(cipher_ctx, cipher, nullptr, key, iv) != 1)
+        return -1;
+    EVP_CIPHER_CTX_set_padding(cipher_ctx, 0);'''
+new_dec = '''    if (last_cipher == cipher && last_encrypt == 0 && std::memcmp(last_key, key, 16) == 0) {
+        if (EVP_DecryptInit_ex(cipher_ctx, nullptr, nullptr, nullptr, iv) != 1)
+            return -1;
+    } else {
+        if (EVP_DecryptInit_ex(cipher_ctx, cipher, nullptr, key, iv) != 1) {
+            last_cipher = nullptr;
+            return -1;
+        }
+        EVP_CIPHER_CTX_set_padding(cipher_ctx, 0);
+        std::memcpy(last_key, key, 16);
+        last_cipher = cipher;
+        last_encrypt = 0;
+    }'''
+assert text.count(old_enc) == 1 and text.count(old_dec) == 1, 'OpenSSLCryptoOperations cipher setup changed'
+text = text.replace(old_enc, new_enc).replace(old_dec, new_dec)
+write(ossl_cpp, text)
+replace('external/psvpfstools/psvpfsparser/PfsCryptEngine.cpp', '''void verify_icv(std::shared_ptr<ICryptoOperations> cryptops, CryptEngineWorkCtx* crypt_ctx, std::uint16_t mode_index, unsigned char* source)
+{
+   if(is_noicv(crypt_ctx))
+      return;''', '''void verify_icv(std::shared_ptr<ICryptoOperations> cryptops, CryptEngineWorkCtx* crypt_ctx, std::uint16_t mode_index, unsigned char* source)
+{
+   // integrity check skipped for speed (see the patch script)
+   (void)cryptops;
+   (void)crypt_ctx;
+   (void)mode_index;
+   (void)source;
+   return;
+
+   if(is_noicv(crypt_ctx))
+      return;''')
+print('PFS decryption: AES keys kept between sectors, integrity check skipped.')

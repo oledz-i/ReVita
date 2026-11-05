@@ -49,6 +49,9 @@ void VitaVulkanBridge::SetDriverLog(std::function<void(int, const char*)> log) {
 void VitaVulkanBridge::SetPipelineCachePath(const std::wstring& path) {
     SetDriverVariable(L"ONYX_PSO_CACHE", path);
 }
+void VitaVulkanBridge::SetPipelineBlobDir(const std::wstring& path) {
+    SetDriverVariable(L"VITA3K_PSO_DIR", path);
+}
 bool VitaVulkanBridge::Accept(retro_hw_render_callback* cb) {
     if (!cb || cb->context_type != RETRO_HW_CONTEXT_VULKAN) return false;
     callback_ = *cb;

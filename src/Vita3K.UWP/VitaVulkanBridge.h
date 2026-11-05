@@ -28,6 +28,8 @@ public:
     // Where Dozen keeps compiled D3D12 pipelines for this game (empty: none).
     // Set before Initialize; Dozen reads it when the device is made.
     static void SetPipelineCachePath(const std::wstring& path);
+    // Folder Dozen keeps each compiled pipeline in (empty: none)
+    static void SetPipelineBlobDir(const std::wstring& path);
 private:
     template<class T> T InstanceProc(const char* name) const;
     template<class T> T DeviceProc(const char* name) const;
