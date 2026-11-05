@@ -17,9 +17,12 @@ cats = {c[0]: c[1] for c in data['cats']}
 shown = [
     'vita3k_backend_renderer',
     'vita3k_resolution_multiplier', 'vita3k_screen_filter', 'vita3k_anisotropic_filtering',
-    'vita3k_v_sync', 'vita3k_async_pipeline', 'vita3k_compile_overlay', 'vita3k_surface_sync',
+    # V-Sync and Memory Mapping are not shown: the app paces frames itself (the
+    # core's V-Sync does nothing here), and the console's Vulkan layer cannot
+    # map guest memory, so every Memory Mapping choice ran unmapped anyway.
+    'vita3k_async_pipeline', 'vita3k_compile_overlay', 'vita3k_surface_sync',
     'vita3k_texture_cache', 'vita3k_hashless_texture_cache', 'vita3k_shader_threads', 'vita3k_shader_cache', 'vita3k_texture_viewport',
-    'vita3k_memory_mapping', 'vita3k_high_accuracy',
+    'vita3k_high_accuracy',
     'vita3k_cpu_opt',
     'vita3k_pkg_mode',
     'vita3k_sys_lang', 'vita3k_sys_button', 'vita3k_sys_date_format', 'vita3k_sys_time_format',

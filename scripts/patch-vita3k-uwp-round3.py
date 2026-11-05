@@ -2633,8 +2633,8 @@ print('Vulkan: frame fence waits give up when the game closes.')
 # Danganronpa looked for "/Dr1/data/us/flash/fla_*.pak" with no device and
 # found nothing (49 times in one log; those are the flash animations of its
 # examine and talk screens). It now resolves through the same overlay table
-# as the user-mode call; a rooted path no overlay claims is taken as the
-# game's own (app0:), where those files are.
+# as the user-mode call. A path no overlay claims is returned unchanged:
+# rewriting those to app0: made Minecraft abort at boot (build 99).
 fios_kernel = 'vita3k/modules/SceFios2Kernel/SceFios2Kernel.cpp'
 replace(fios_kernel, '''#include <module/module.h>''', '''#include <module/module.h>
 
@@ -2645,18 +2645,28 @@ replace(fios_kernel, '''    STUBBED("Using strncpy");
     strncpy(opt->pOutPath.get(emuenv.mem), pInPath, opt->maxPath);
 
     return 0;''', '''#ifdef VITA3K_UWP
-    uint32_t lo = static_cast<uint8_t>(opt->loOrderFilter);
-    uint32_t hi = static_cast<uint8_t>(opt->hiOrderFilter);
-    if (hi == 0 || hi < lo) {
-        lo = 0;
-        hi = 0xFF;
+    // Only an overlay the game registered changes the path; anything else is
+    // returned as given (Minecraft aborted at boot when unmatched rooted
+    // paths were rewritten to app0:). Never throws into the guest call.
+    char *out = opt ? opt->pOutPath.get(emuenv.mem) : nullptr;
+    if (!out || !pInPath)
+        return 0;
+    std::string resolved;
+    try {
+        uint32_t lo = static_cast<uint8_t>(opt->loOrderFilter);
+        uint32_t hi = static_cast<uint8_t>(opt->hiOrderFilter);
+        if (hi == 0 || hi < lo) {
+            lo = 0;
+            hi = 0xFF;
+        }
+        resolved = resolve_path(emuenv.io, pInPath, lo, hi);
+    } catch (...) {
+        resolved.clear();
     }
-    std::string resolved = resolve_path(emuenv.io, pInPath, lo, hi);
-    if (resolved == pInPath && resolved.size() > 1 && resolved[0] == '/' && resolved.find(':') == std::string::npos) {
-        LOG_INFO_ONCE("Fios: rooted path with no overlay, read from the game's folder ({})", resolved);
-        resolved = "app0:" + resolved;
-    }
-    strncpy(opt->pOutPath.get(emuenv.mem), resolved.c_str(), opt->maxPath);
+    if (resolved.empty() || resolved.size() >= opt->maxPath)
+        strncpy(out, pInPath, opt->maxPath);
+    else
+        strncpy(out, resolved.c_str(), opt->maxPath);
     return 0;
 #else
     STUBBED("Using strncpy");
@@ -2707,3 +2717,225 @@ replace(libretro_cpp, '''    read_core_option("vita3k_shader_threads", "4", [](c
     });
     read_core_option("vita3k_shader_threads", "4", [](const char *value) {''')
 print('Vulkan: texture viewport off by default (setting), for broken lettering.')
+
+# ── Faster game decryption: writes run beside the decryption ────────────────
+# Decrypting a NoNpDrm game ran at about 11 MB/s on the console (one run hit
+# 54): each block was read from the drive, decrypted, then written back, one
+# after the other, so the drive sat idle while the CPU worked and the CPU sat
+# idle while the drive wrote. Decrypted blocks now go to a writer thread (in
+# order, per file; up to 192 MB queued) while the next block is read and
+# decrypted, across files too. Any failed write fails the whole decryption,
+# as before.
+pfs_file_h = 'external/psvpfstools/psvpfsparser/PfsFile.h'
+text = read(pfs_file_h)
+text = text.rstrip() + '''
+
+// Decrypted data is written by a thread of its own while the next block is
+// read and decrypted. One Scope per decryption run; finish() waits for every
+// write and says whether all succeeded.
+namespace pfs_async_writer {
+class Scope {
+public:
+   Scope();
+   ~Scope();
+   bool finish();
+   Scope(const Scope &) = delete;
+   Scope &operator=(const Scope &) = delete;
+};
+}
+'''
+write(pfs_file_h, text)
+
+pfs_file_cpp = 'external/psvpfstools/psvpfsparser/PfsFile.cpp'
+replace(pfs_file_cpp, '''#include "MerkleTree.hpp"
+#include "PfsKeyGenerator.h"
+''', '''#include "MerkleTree.hpp"
+#include "PfsKeyGenerator.h"
+
+#include <condition_variable>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <vector>
+
+namespace pfs_async_writer {
+namespace {
+struct Job {
+   std::shared_ptr<std::ofstream> out;
+   std::vector<std::uint8_t> data;
+   std::size_t size = 0;
+   bool close = false;
+};
+
+class Writer {
+public:
+   Writer() : m_thread([this] { run(); }) {}
+   ~Writer() {
+      {
+         std::lock_guard<std::mutex> lock(m_mutex);
+         m_stop = true;
+      }
+      m_has_work.notify_all();
+      m_thread.join();
+   }
+   void push(Job job) {
+      std::unique_lock<std::mutex> lock(m_mutex);
+      m_has_room.wait(lock, [&] { return m_queued < max_queued || m_jobs.empty(); });
+      m_queued += job.data.size();
+      m_jobs.push_back(std::move(job));
+      lock.unlock();
+      m_has_work.notify_one();
+   }
+   bool drain() {
+      std::unique_lock<std::mutex> lock(m_mutex);
+      m_idle.wait(lock, [&] { return m_jobs.empty() && !m_busy; });
+      return !m_failed;
+   }
+
+private:
+   static constexpr std::size_t max_queued = std::size_t(192) << 20;
+   void run() {
+      for (;;) {
+         Job job;
+         {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            m_has_work.wait(lock, [&] { return m_stop || !m_jobs.empty(); });
+            if (m_jobs.empty())
+               return;
+            job = std::move(m_jobs.front());
+            m_jobs.pop_front();
+            m_busy = true;
+         }
+         bool ok = true;
+         if (job.close) {
+            job.out->close();
+            ok = !job.out->fail();
+         } else if (job.size) {
+            job.out->write(reinterpret_cast<const char *>(job.data.data()), static_cast<std::streamsize>(job.size));
+            ok = static_cast<bool>(*job.out);
+         }
+         {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_queued -= job.data.size();
+            m_busy = false;
+            if (!ok)
+               m_failed = true;
+         }
+         m_has_room.notify_all();
+         m_idle.notify_all();
+      }
+   }
+
+   std::mutex m_mutex;
+   std::condition_variable m_has_work, m_has_room, m_idle;
+   std::deque<Job> m_jobs;
+   std::size_t m_queued = 0;
+   bool m_stop = false;
+   bool m_busy = false;
+   bool m_failed = false;
+   std::thread m_thread;
+};
+
+Writer *g_active = nullptr;
+
+void write(const std::shared_ptr<std::ofstream> &out, std::vector<std::uint8_t> &buffer, std::uintmax_t size) {
+   if (!g_active) {
+      out->write(reinterpret_cast<const char *>(buffer.data()), static_cast<std::streamsize>(size));
+      return;
+   }
+   Job job;
+   job.out = out;
+   job.size = static_cast<std::size_t>(size);
+   job.data = std::move(buffer);
+   g_active->push(std::move(job));
+}
+
+void close(const std::shared_ptr<std::ofstream> &out) {
+   if (!g_active) {
+      out->close();
+      return;
+   }
+   Job job;
+   job.out = out;
+   job.close = true;
+   g_active->push(std::move(job));
+}
+} // namespace
+
+Scope::Scope() {
+   if (!g_active)
+      g_active = new Writer();
+}
+
+Scope::~Scope() {
+   finish();
+}
+
+bool Scope::finish() {
+   if (!g_active)
+      return true;
+   const bool ok = g_active->drain();
+   delete g_active;
+   g_active = nullptr;
+   return ok;
+}
+} // namespace pfs_async_writer
+''')
+# both decrypt functions: the output stream is shared with the writer thread
+text = read(pfs_file_cpp)
+old_open = '''   std::ofstream outputStream;
+   if(!m_filepath.create_empty_file(m_titleIdPath, destination_root, outputStream))
+      return -1;'''
+new_open = '''   auto outputStreamPtr = std::make_shared<std::ofstream>();
+   std::ofstream& outputStream = *outputStreamPtr;
+   if(!m_filepath.create_empty_file(m_titleIdPath, destination_root, outputStream))
+      return -1;'''
+assert text.count(old_open) == 2, 'PfsFile.cpp output stream setup changed'
+text = text.replace(old_open, new_open)
+import re
+writes = re.findall(r'outputStream\.write\(\(char\*\)buffer\.data\(\), (\w+)\);', text)
+assert len(writes) == 5, f'PfsFile.cpp: expected 5 block writes, found {len(writes)}'
+text = re.sub(r'outputStream\.write\(\(char\*\)buffer\.data\(\), (\w+)\);',
+              r'pfs_async_writer::write(outputStreamPtr, buffer, \1);', text)
+assert text.count('''   outputStream.close();
+
+   return 0;
+}''') == 2, 'PfsFile.cpp file end changed'
+text = text.replace('''   outputStream.close();
+
+   return 0;
+}''', '''   pfs_async_writer::close(outputStreamPtr);
+
+   return 0;
+}''')
+write(pfs_file_cpp, text)
+
+pfs_fs_cpp = 'external/psvpfstools/psvpfsparser/PfsFilesystem.cpp'
+replace(pfs_fs_cpp, '''   const std::unique_ptr<sce_idb_base_t>& unicv = m_unicvDbParser->get_idatabase();
+
+   const std::map<std::uint32_t, sce_junction>& pageMap = m_pageMapper->get_pageMap();''', '''   const std::unique_ptr<sce_idb_base_t>& unicv = m_unicvDbParser->get_idatabase();
+
+   // decrypted blocks are written beside the decryption; every write is
+   // finished (and checked) before this returns
+   pfs_async_writer::Scope writer_scope;
+
+   const std::map<std::uint32_t, sce_junction>& pageMap = m_pageMapper->get_pageMap();''')
+replace(pfs_fs_cpp, '''      if (progress)
+        progress(processed_bytes, total_bytes, filepath.get_value().string());
+   }
+
+   return 0;
+}''', '''      if (progress)
+        progress(processed_bytes, total_bytes, filepath.get_value().string());
+   }
+
+   if (!writer_scope.finish())
+   {
+      m_output << "Failed to write the decrypted files" << std::endl;
+      return -1;
+   }
+
+   return 0;
+}''')
+print('PFS decryption: writes run on their own thread beside reading and decrypting.')
