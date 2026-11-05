@@ -1174,7 +1174,9 @@ void CatalogShell::UpdateSpotlight(int index) {
     }
     spotIndex_ = valid ? index : -1;
 
-    // The veils are rebuilt for the theme's page colour every time.
+    // The veils follow the theme's page colour; built again only when it changed.
+    if (spotlight_->Children->Size == 1 || spotVeilTheme_ != theme_) {
+    spotVeilTheme_ = theme_;
     while (spotlight_->Children->Size > 1) spotlight_->Children->RemoveAt(spotlight_->Children->Size - 1);
     const Color page = Bg();
     auto across = ref new LinearGradientBrush();
@@ -1203,6 +1205,7 @@ void CatalogShell::UpdateSpotlight(int index) {
     auto bottom = ref new Border();
     bottom->Background = down;
     spotlight_->Children->Append(bottom);
+    }
     spotlight_->Visibility = Windows::UI::Xaml::Visibility::Visible;
 
     Platform::String^ uri = valid ? BackdropUri(static_cast<size_t>(index)) : ref new Platform::String(L"");

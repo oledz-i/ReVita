@@ -153,6 +153,7 @@ private:
     Windows::UI::Xaml::Controls::TextBlock^ spotTitle_ = nullptr;
     Windows::UI::Xaml::Controls::TextBlock^ spotMeta_ = nullptr;
     int spotIndex_ = -1;
+    int spotVeilTheme_ = -1;
     std::wstring spotArtUri_;
     int librarySort_ = 0;    // 0 A-Z, 1 recently played
     int libraryFilter_ = 0;  // 0 all, 1 folders, 2 archives and packages
