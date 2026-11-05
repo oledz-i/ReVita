@@ -2136,8 +2136,11 @@ replace(dyn, '''    config.optimizations = cpu_opt ? Dynarmic::all_safe_optimiza
         // games with several busy threads (Minecraft's server, chunk and
         // render threads all take locks). If a game hangs or misbehaves,
         // the CPU setting "fast" is no longer needed to turn this off: tell me.
-        config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor;
-        (void)uwp_profile::fast_atomics;
+        // Back to opt-in (CPU setting "fast"): with it on for every game,
+        // Minecraft's threads lost lock updates to each other and the game
+        // spun at a full core without drawing (black screen, build 107).
+        if (uwp_profile::fast_atomics.load(std::memory_order_relaxed))
+            config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor;
         if (config.fastmem_pointer) {
             config.fastmem_exclusive_access = true;
             config.recompile_on_exclusive_fastmem_failure = true;
