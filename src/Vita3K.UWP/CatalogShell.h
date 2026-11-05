@@ -142,6 +142,29 @@ private:
     bool bootstrapped_ = false;
     unsigned libraryRevision_ = 0;
     Platform::String^ search_ = L"";
+    // The dashboard (cinematic layout): a top bar instead of the old rail,
+    // and the focused game's picture across the whole screen behind Home and
+    // a game's page (the "spotlight").
+    Windows::UI::Xaml::Controls::Grid^ spotlight_ = nullptr;
+    Windows::UI::Xaml::Controls::Image^ spotlightArt_ = nullptr;
+    Windows::UI::Xaml::Controls::TextBlock^ topClock_ = nullptr;
+    Windows::UI::Xaml::Controls::TextBlock^ topDate_ = nullptr;
+    Windows::UI::Xaml::Controls::TextBlock^ spotKicker_ = nullptr;
+    Windows::UI::Xaml::Controls::TextBlock^ spotTitle_ = nullptr;
+    Windows::UI::Xaml::Controls::TextBlock^ spotMeta_ = nullptr;
+    int spotIndex_ = -1;
+    std::wstring spotArtUri_;
+    int librarySort_ = 0;    // 0 A-Z, 1 recently played
+    int libraryFilter_ = 0;  // 0 all, 1 folders, 2 archives and packages
+    int settingsTab_ = 0;
+    void UpdateSpotlight(int index);
+    void HideSpotlight();
+    std::vector<size_t> RecentGames();
+    void NoteRecent(size_t index);
+    Platform::String^ GameMeta(size_t index);
+    Windows::UI::Xaml::Controls::Button^ Chip(Platform::String^ label, bool active);
+    void MakeGrid(const std::vector<size_t>& items, Windows::UI::Xaml::Controls::StackPanel^ target);
+    void SwitchTab(int delta);
 
     Windows::UI::Color Bg() const;
     Windows::UI::Color Card() const;

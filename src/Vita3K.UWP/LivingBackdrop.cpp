@@ -488,6 +488,28 @@ void LivingBackdrop::Build() {
         s.Sweep(Mix(accent_, white, 0.4), 11);
         break;
     }
+    case 9: { // Abyss: light falling through deep water, bubbles rising, drifting plankton
+        s.Wanderers(glow_, Mix(glow_, accent_, 0.3), 3, 160);
+        s.Beams(Mix(accent_, white, 0.5), 4);
+        s.Stream(s.Ring(Mix(accent_, white, 0.4), 160), 22, 8, 30, true, 50, 14, 28, 0.75f);
+        s.Fireflies(Mix(accent_, white, 0.3), 26);
+        break;
+    }
+    case 10: { // Crimson: black and red, a slow red tide and ash drifting down
+        s.Wanderers(glow_, Mix(glow_, accent_, 0.55), 3, 175);
+        auto tide = s.Sprite(s.Glow(accent_, 110, 0.4f), width_ * 1.5f, height_ * 0.8f, -width_ * 0.25f, height_ * 0.6f);
+        s.LoopScalar(tide, L"Opacity", { 0.4f, 0.85f, 0.4f }, 11);
+        s.Stream(s.Glow(Mix(accent_, white, 0.2), 230, 0.3f), 34, 2, 7, false, 120, 16, 30, 0.8f);
+        s.Sweep(Mix(accent_, white, 0.3), 13);
+        break;
+    }
+    case 11: { // Prism: graphite glass, light sweeping across and soft glints
+        s.Wanderers(glow_, Mix(glow_, accent_, 0.4), 3, 150);
+        s.Sweep(Mix(accent_, white, 0.6), 9);
+        s.Stars(Mix(accent_, white, 0.7), 46);
+        s.Stream(s.Ring(Mix(accent_, white, 0.5), 120), 12, 30, 110, true, 90, 30, 52, 0.6f);
+        break;
+    }
     default: { // Onyx: rose light and the Vita's home-screen bubbles floating up
         s.Wanderers(glow_, Mix(glow_, accent_, 0.45), 3, 165);
         s.Stream(s.Ring(Mix(accent_, white, 0.35), 150), 18, 40, 140, true, 120, 26, 48, 0.7f);
