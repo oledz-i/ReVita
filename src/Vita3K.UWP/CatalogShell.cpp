@@ -3174,6 +3174,11 @@ const TitleOverride kTitleOverrides[] = {
     // fix the iOS build ships). On even with OpenGL, unless the player chose.
     { L"PCSA00011", "vita3k_surface_sync", "enabled", nullptr, false },
     { L"PCSF00024", "vita3k_surface_sync", "enabled", nullptr, false },
+    // Minecraft: with surface sync the picture stays black on Vulkan (build
+    // 107 log: every presented frame empty while the game ran at 35 fps).
+    { L"PCSE00491", "vita3k_surface_sync", "disabled", nullptr, false },
+    { L"PCSB00560", "vita3k_surface_sync", "disabled", nullptr, false },
+    { L"PCSG00302", "vita3k_surface_sync", "disabled", nullptr, false },
 };
 // The title ID (four letters, five digits) in a game's folder or file name.
 std::wstring TitleIdIn(const std::wstring& path) {
@@ -3204,10 +3209,10 @@ void CatalogShell::ApplyCoreOptions(const std::wstring& contentPath) {
         const auto& option = vita3k_uwp::kCoreOptions[i];
         std::string value = SavedCoreOption(option);
         const bool chosen = Pref(CoreOptionPrefKey(option), L"")->Length() != 0;
-        // Surface sync is on by default: on Vulkan it costs nothing until a
-        // game reads its own picture. OpenGL reads every scene back, which is
-        // slow, so there it stays off unless the player turned it on.
-        if (!chosen && renderer == "OpenGL" && std::strcmp(option.key, "vita3k_surface_sync") == 0)
+        // Surface sync is off by default (the iOS build learned the same:
+        // on for everyone it broke games); the games that need it get it
+        // from the table above.
+        if (!chosen && std::strcmp(option.key, "vita3k_surface_sync") == 0)
             value = "disabled";
         if (!titleId.empty()) {
             for (const auto& o : kTitleOverrides) {
