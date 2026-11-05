@@ -3503,7 +3503,18 @@ std::wstring InstallPendingAddons(VitaLibretroHost& host, const std::string& sys
         const std::wstring name = item.filename().wstring();
         if (!titleId.empty() && item.wstring().find(titleId) == std::wstring::npos) continue;
         const auto key = L"addon.done." + StableKey(ref new Platform::String(AddonSignature(item).c_str()));
-        if (!Pref(key, L"")->IsEmpty()) continue;
+        if (!Pref(key, L"")->IsEmpty()) {
+            // The marker is a setting, and settings come back from the drive
+            // backup after a reinstall while Vita3K's data folder (where the
+            // update or DLC actually lives) starts empty. Trust the marker
+            // only when the content is still there.
+            const std::wstring itemTitle = TitleIdIn(name);
+            const bool present = itemTitle.empty()
+                || HasFiles(FirmwareRoot() + L"\\ux0\\patch\\" + itemTitle)
+                || HasFiles(FirmwareRoot() + L"\\ux0\\addcont\\" + itemTitle);
+            if (present) continue;
+            host.LogLine("Updates and DLC: " + NarrowUtf8(name) + " was marked installed but its files are gone (app data was reset); installing again");
+        }
         ProvideUpdateLicense(host, item, gameDirs);
         std::string id, category;
         std::wstring detail;
