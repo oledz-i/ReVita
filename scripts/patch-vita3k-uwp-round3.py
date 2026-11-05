@@ -3203,7 +3203,7 @@ replace(pipeline_cache_cpp, '''        pipeline_compile_queue.enqueue(pipeline_c
         }
 #endif
         return nullptr;''')
-replace(pipeline_cache_cpp, 'int vita3k_uwp_shader_threads = 4;', 'int vita3k_uwp_shader_threads = 4;\n// 0 = quads compile on the render thread as upstream does\nint vita3k_uwp_quad_wait_ms = 16;')
+replace(pipeline_cache_cpp, 'int vita3k_uwp_shader_threads = 4;', 'int vita3k_uwp_shader_threads = 4;\n// 0 = quads compile on the render thread as upstream does\nint vita3k_uwp_quad_wait_ms = 0;')
 print('Vulkan: quad pipelines compile in the background with a 16 ms wait budget (no multi-second 2D hitches).')
 replace(libretro_cpp, '''extern int vita3k_uwp_shader_threads;
 ''', '''extern int vita3k_uwp_shader_threads;
@@ -3212,9 +3212,9 @@ extern int vita3k_uwp_quad_wait_ms;
 replace(libretro_cpp, '''        vita3k_uwp_shader_threads = (threads >= 1 && threads <= 8) ? threads : 4;
     });''', '''        vita3k_uwp_shader_threads = (threads >= 1 && threads <= 8) ? threads : 4;
     });
-    read_core_option("vita3k_quad_wait", "16", [](const char *value) {
+    read_core_option("vita3k_quad_wait", "0", [](const char *value) {
         const int ms = static_cast<int>(std::strtol(value, nullptr, 10));
-        vita3k_uwp_quad_wait_ms = (ms >= 0 && ms <= 100) ? ms : 16;
+        vita3k_uwp_quad_wait_ms = (ms >= 0 && ms <= 100) ? ms : 0;
     });''')
 
 # ── The console's cores: game first, compiling in the gaps ──────────────────
