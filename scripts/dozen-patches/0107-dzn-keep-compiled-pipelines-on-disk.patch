@@ -5,13 +5,13 @@ Subject: [PATCH] dzn: keep each compiled pipeline on disk (cached PSO blobs)
 
 ---
 diff --git a/src/microsoft/vulkan/dzn_pipeline.c b/src/microsoft/vulkan/dzn_pipeline.c
-index 174c246..e2dfeac 100644
+index 174c246..37b67b5 100644
 --- a/src/microsoft/vulkan/dzn_pipeline.c
 +++ b/src/microsoft/vulkan/dzn_pipeline.c
-@@ -2735,12 +2735,211 @@ vita3k_create_pso_guarded(struct dzn_device *device, const D3D12_PIPELINE_STATE_
+@@ -2734,6 +2734,195 @@ vita3k_create_pso_guarded(struct dzn_device *device, const D3D12_PIPELINE_STATE_
+ }
  
  /* CreatePipelineState through the library: load when known, compile and keep when not. */
- static HRESULT
 +/* VITA3K: compiled pipelines kept on disk, one file each.
 + *
 + * The Xbox's driver takes 30-750 ms to compile each pipeline state (about
@@ -201,9 +201,10 @@ index 174c246..e2dfeac 100644
 +   return hres;
 +}
 +
+ static HRESULT
  onyx_create_pso(struct dzn_device *device, const D3D12_PIPELINE_STATE_STREAM_DESC *sd,
                  ID3D12PipelineState **out)
- {
+@@ -2741,6 +2930,16 @@ onyx_create_pso(struct dzn_device *device, const D3D12_PIPELINE_STATE_STREAM_DES
     ID3D12PipelineLibrary1 *lib = onyx_pso_library(device);
     WCHAR name[40];
     const bool keyed = lib && onyx_pso_name(sd, name);
