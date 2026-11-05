@@ -2702,8 +2702,9 @@ replace(renderer_cpp, '''#include <unordered_set>
 #include <vector>
 
 #ifdef VITA3K_UWP
-// "Texture Viewport (Vulkan)" setting; off by default on the console.
-bool vita3k_uwp_texture_viewport = false;
+// "Texture Viewport (Vulkan)" setting; on by default (off sent resized
+// surfaces through a copy path that scrambled Gravity Rush's colours).
+bool vita3k_uwp_texture_viewport = true;
 #endif
 ''')
 replace(libretro_cpp, '''#ifdef VITA3K_UWP
@@ -2712,8 +2713,8 @@ extern int vita3k_uwp_shader_threads;
 extern int vita3k_uwp_shader_threads;
 extern bool vita3k_uwp_texture_viewport;
 #endif''')
-replace(libretro_cpp, '''    read_core_option("vita3k_shader_threads", "4", [](const char *value) {''', '''    read_core_option("vita3k_texture_viewport", "disabled", [](const char *value) {
-        vita3k_uwp_texture_viewport = parse_enabled_option(value, false);
+replace(libretro_cpp, '''    read_core_option("vita3k_shader_threads", "4", [](const char *value) {''', '''    read_core_option("vita3k_texture_viewport", "enabled", [](const char *value) {
+        vita3k_uwp_texture_viewport = parse_enabled_option(value, true);
     });
     read_core_option("vita3k_shader_threads", "4", [](const char *value) {''')
 print('Vulkan: texture viewport off by default (setting), for broken lettering.')
@@ -3118,3 +3119,40 @@ replace('external/psvpfstools/psvpfsparser/PfsCryptEngine.cpp', '''void verify_i
    if(is_noicv(crypt_ctx))
       return;''')
 print('PFS decryption: AES keys kept between sectors, integrity check skipped.')
+
+# ── Vertex streams with odd strides restrided to multiples of 4 ─────────────
+# Persona 4 Golden draws text (and more) from vertex streams whose stride is
+# not a multiple of 4 (the iOS build found the same: Metal refuses them).
+# Vulkan allows that, but the console's GPU reads vertex elements from the
+# address the stride gives, and every other vertex then starts misaligned:
+# glyph quads got wrong corners and letters came out sliced. Vita3K already
+# copies such streams to a stride rounded up to 4 for Metal; without memory
+# mapping the console copies every stream each draw anyway, so it does the
+# same. Attribute offsets inside a vertex are unchanged (Dozen 0105 handles
+# a misaligned one).
+scene_cpp = 'vita3k/renderer/src/vulkan/scene.cpp'
+text = read(scene_cpp)
+assert text.count('#ifdef __APPLE__\n// restride vertex attribute binding strides to multiple of 4') == 1
+text = text.replace('#ifdef __APPLE__\n// restride vertex attribute binding strides to multiple of 4', '#if defined(__APPLE__) || defined(VITA3K_UWP)\n// restride vertex attribute binding strides to multiple of 4', 1)
+old_use = '''#ifdef __APPLE__
+                // Vulkan allows any stride, but Metal only allows multiples of 4.'''
+assert text.count(old_use) == 1
+text = text.replace(old_use, '''#if defined(__APPLE__) || defined(VITA3K_UWP)
+                // Vulkan allows any stride, but Metal only allows multiples of 4
+                // (and the console's GPU reads misaligned vertices wrongly).''')
+old_free = '''#ifdef __APPLE__
+                if (restride) {
+                    delete[] stream;
+                }
+#endif'''
+assert text.count(old_free) == 1
+text = text.replace(old_free, '''#if defined(__APPLE__) || defined(VITA3K_UWP)
+                if (restride) {
+                    delete[] stream;
+                }
+#endif''')
+write(scene_cpp, text)
+replace(pipeline_cache_cpp, '''#ifdef __APPLE__
+        const uint32_t stride = align(stream.stride, 4);''', '''#if defined(__APPLE__) || defined(VITA3K_UWP)
+        const uint32_t stride = align(stream.stride, 4);''')
+print('Vulkan: odd vertex strides restrided to multiples of 4 (Persona 4 Golden text).')
