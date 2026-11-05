@@ -3156,3 +3156,63 @@ replace(pipeline_cache_cpp, '''#ifdef __APPLE__
         const uint32_t stride = align(stream.stride, 4);''', '''#if defined(__APPLE__) || defined(VITA3K_UWP)
         const uint32_t stride = align(stream.stride, 4);''')
 print('Vulkan: odd vertex strides restrided to multiples of 4 (Persona 4 Golden text).')
+
+# ── Full-screen quads no longer freeze the game while their pipeline compiles ─
+# Draws of 6 vertices or fewer (text boxes, sprites, 2D menus, full-screen
+# passes) were always compiled on the render thread, even with asynchronous
+# compilation on, so a new one could not be skipped. On the console one
+# compile is 30-2000 ms, so 2D games (Danganronpa above all) froze for
+# seconds in the first minute. Now they are queued like every other draw and
+# the render thread waits for them only within a budget (16 ms in each 33 ms
+# window, so at most about half a frame): a quad whose pipeline is still not
+# ready is skipped for a frame or two instead of stopping the game.
+replace(pipeline_cache_cpp, '''#ifdef VITA3K_UWP
+    const bool compile_pipeline_async = !maskupdate && !context.shader_hints.masked_framebuffer_fetch && consider_for_async && use_async_compilation;
+#else''', '''#ifdef VITA3K_UWP
+    const bool uwp_quad_waits = !consider_for_async && vita3k_uwp_quad_wait_ms > 0;
+    const bool compile_pipeline_async = !maskupdate && !context.shader_hints.masked_framebuffer_fetch && (consider_for_async || uwp_quad_waits) && use_async_compilation;
+#else''')
+replace(pipeline_cache_cpp, '''        pipeline_compile_queue.enqueue(pipeline_compile_queue_token, request);
+
+        return nullptr;''', '''        pipeline_compile_queue.enqueue(pipeline_compile_queue_token, request);
+
+#ifdef VITA3K_UWP
+        if (uwp_quad_waits) {
+            // a quad: wait for it, but only within this window's budget
+            using uwp_clock = std::chrono::steady_clock;
+            static uwp_clock::time_point window_start{};
+            static double spent_ms = 0.0;
+            const auto now = uwp_clock::now();
+            if (now - window_start > std::chrono::milliseconds(33)) {
+                window_start = now;
+                spent_ms = 0.0;
+            }
+            const double left_ms = vita3k_uwp_quad_wait_ms - spent_ms;
+            if (left_ms > 0.0) {
+                // the worker writes it->second; read the raw handle each time
+                volatile VkPipeline *slot = reinterpret_cast<volatile VkPipeline *>(&it->second);
+                const VkPipeline compiling_raw = static_cast<VkPipeline>(pipeline_compiling);
+                const auto until = now + std::chrono::microseconds(static_cast<int64_t>(left_ms * 1000.0));
+                while (*slot == compiling_raw && uwp_clock::now() < until)
+                    std::this_thread::yield();
+                spent_ms += std::chrono::duration<double, std::milli>(uwp_clock::now() - now).count();
+                const vk::Pipeline ready = vk::Pipeline(static_cast<VkPipeline>(*slot));
+                if (ready != pipeline_compiling && ready != std::bit_cast<vk::Pipeline, uint64_t>(~1ULL))
+                    return ready;
+            }
+        }
+#endif
+        return nullptr;''')
+replace(pipeline_cache_cpp, 'int vita3k_uwp_shader_threads = 4;', 'int vita3k_uwp_shader_threads = 4;\n// 0 = quads compile on the render thread as upstream does\nint vita3k_uwp_quad_wait_ms = 16;')
+print('Vulkan: quad pipelines compile in the background with a 16 ms wait budget (no multi-second 2D hitches).')
+replace(libretro_cpp, '''extern int vita3k_uwp_shader_threads;
+''', '''extern int vita3k_uwp_shader_threads;
+extern int vita3k_uwp_quad_wait_ms;
+''')
+replace(libretro_cpp, '''        vita3k_uwp_shader_threads = (threads >= 1 && threads <= 8) ? threads : 4;
+    });''', '''        vita3k_uwp_shader_threads = (threads >= 1 && threads <= 8) ? threads : 4;
+    });
+    read_core_option("vita3k_quad_wait", "16", [](const char *value) {
+        const int ms = static_cast<int>(std::strtol(value, nullptr, 10));
+        vita3k_uwp_quad_wait_ms = (ms >= 0 && ms <= 100) ? ms : 16;
+    });''')
