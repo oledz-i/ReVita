@@ -396,7 +396,76 @@ def golden_hour():
     master(mix, "golden-hour", peak=0.78)
 
 
+# ---- Abyss: deep-water ambient in D minor, 68 BPM ----------------------------------------
+
+def abyss():
+    tr = Track(bpm=68, bars=16, swing=0.0)
+    prog = [["D3", "F3", "A3", "E4"], ["Bb2", "D3", "F3", "A3"],
+            ["G2", "Bb2", "D3", "F3"], ["A2", "C#3", "E3", "G3"]]
+    roots = ["D1", "Bb0", "G1", "A1"]
+    for bar in range(16):
+        chord = chord_notes(prog[bar % 4])
+        tr.put(warm_pad(chord, tr.beat * 4.4, 0.42, 900), tr.when(bar, 0), gain=0.42)
+        tr.put(sub(hz(roots[bar % 4]) * 2, tr.beat * 3.6, 0.7), tr.when(bar, 0), gain=0.34)
+        # bubbles: soft high plucks drifting up the chord
+        for i, f in enumerate(chord):
+            if (bar + i) % 3 == 0:
+                tr.put(pluck(f * 4, tr.beat * 0.9, 0.3, 1800), tr.when(bar, 0.75 + i * 0.75), pan=-0.4 + 0.25 * i, gain=0.08)
+        if bar >= 4:
+            tr.put(lofi_kick(0.32), tr.when(bar, 0))
+            tr.put(rim(0.05), tr.when(bar, 2.5), pan=0.2)
+    tune = [(0, 0, "A4", 2), (0, 2, "F4", 1), (0, 3, "E4", 1),
+            (1, 0, "D4", 3), (1, 3, "F4", 1),
+            (2, 0, "G4", 1.5), (2, 1.5, "F4", 0.5), (2, 2, "D4", 2),
+            (3, 0, "E4", 2), (3, 2, "C#4", 2)]
+    for start, gain in ((4, 0.22), (8, 0.22), (12, 0.18)):
+        for bar, beat, name, length in tune:
+            tr.put(bell(hz(name), max(1.2, length * tr.beat * 2.2), 0.4), tr.when(start + bar, beat), pan=0.15, gain=gain)
+    mix = tr.render()
+    mix = reverb(mix, mix=0.42, size=1.8)
+    mix = soften(mix, 6500)
+    master(mix, "abyss", peak=0.74)
+
+
+# ---- Crimson: driving dark electro in E minor, 104 BPM -----------------------------------
+
+def crimson():
+    tr = Track(bpm=104, bars=24)
+    prog = [["E3", "G3", "B3"], ["C3", "E3", "G3"], ["A2", "C3", "E3"], ["B2", "D#3", "F#3"]]
+    roots = ["E1", "C1", "A1", "B1"]
+    for bar in range(24):
+        chord = chord_notes(prog[bar % 4])
+        tr.put(warm_pad(chord, tr.beat * 4.1, 0.32, 1400), tr.when(bar, 0), gain=0.3)
+        root = hz(roots[bar % 4])
+        for e in range(8):
+            tr.put(sub(root * (2 if e % 2 else 1), tr.beat * 0.4, 0.8), tr.when(bar, e / 2), gain=0.34)
+        arp = chord + [chord[0] * 2, chord[1] * 2]
+        for s in range(16):
+            f = arp[[0, 1, 2, 3, 4, 3, 2, 1][s % 8]] * 2
+            tr.put(pluck(f, tr.beat * 0.35, 0.45, 1600 + 400 * ((bar // 4) % 3)), tr.when(bar, s / 4),
+                   pan=0.35 if s % 2 else -0.35, gain=0.09)
+        if bar >= 4:
+            for beat in range(4):
+                tr.put(kick(0.55), tr.when(bar, beat))
+            tr.put(snare(0.42, 210), tr.when(bar, 1))
+            tr.put(snare(0.42, 210), tr.when(bar, 3))
+            for e in range(8):
+                tr.put(hat(0.035 if e % 2 else 0.022, open_=e % 4 == 3), tr.when(bar, e / 2 + 0.25), pan=0.25)
+    hook = [(0, 0, "B4", 1.5), (0, 1.5, "G4", 0.5), (0, 2, "E4", 2),
+            (1, 0, "G4", 1), (1, 1, "A4", 1), (1, 2, "E4", 2),
+            (2, 0, "C5", 1.5), (2, 1.5, "B4", 0.5), (2, 2, "A4", 1), (2, 3, "G4", 1),
+            (3, 0, "F#4", 3), (3, 3, "D#4", 1)]
+    for start in (8, 12, 16, 20):
+        for bar, beat, name, length in hook:
+            tr.put(lead(hz(name), length * tr.beat * 1.05, 0.5), tr.when(start + bar, beat), pan=0.05, gain=0.25)
+    mix = tr.render()
+    mix = mix * sidechain(tr, 24 * 4, 0.5)[:mix.shape[1]]
+    mix = reverb(mix, mix=0.2, size=1.2)
+    mix = soften(mix, 8800)
+    master(mix, "crimson", peak=0.8)
+
+
 if __name__ == "__main__":
-    which = sys.argv[2:] or ["afterglow", "neon_arcade", "stardust", "tidal", "sakura", "night_drive", "golden_hour"]
+    which = sys.argv[2:] or ["afterglow", "neon_arcade", "stardust", "tidal", "sakura", "night_drive", "golden_hour", "abyss", "crimson"]
     for name in which:
         globals()[name]()

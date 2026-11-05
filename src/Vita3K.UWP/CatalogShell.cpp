@@ -440,7 +440,7 @@ CatalogShell::CatalogShell() {
     const auto savedTrack = Pref(L"music.track", L"1");
     // 0 off, 1-4 and 6-8 bundled tracks, 5 the player's own
     track_ = _wtoi(savedTrack->Data());
-    if (track_ < 0 || track_ > 8 || (track_ == 0 && !savedTrack->Equals(L"0"))) track_ = 1;
+    if (track_ < 0 || track_ > 10 || (track_ == 0 && !savedTrack->Equals(L"0"))) track_ = 1;
     try {
         musicVolume_ = std::stod(Pref(L"music.volume", L"0.45")->Data());
     } catch (...) { musicVolume_ = 0.45; }
@@ -1982,11 +1982,11 @@ void CatalogShell::Settings() {
     // shown in this order; the number is the saved track
     const wchar_t* names[] = {
         L"Off", L"Afterglow", L"Neon Arcade", L"Stardust", L"Tidal",
-        L"Sakura", L"Night Drive", L"Golden Hour", L"Your own track"
+        L"Sakura", L"Night Drive", L"Golden Hour", L"Abyss", L"Crimson", L"Your own track"
     };
-    const int trackOf[] = { 0, 1, 2, 3, 4, 6, 7, 8, 5 };
+    const int trackOf[] = { 0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 5 };
     auto music = ActionRow(142);
-    for (int slot = 0; slot < 9; ++slot) {
+    for (int slot = 0; slot < 11; ++slot) {
         const int i = trackOf[slot];
         auto b = Button(ref new Platform::String(names[slot]), track_ == i);
         b->Click += ref new RoutedEventHandler([this,i](Platform::Object^, RoutedEventArgs^) {
@@ -2344,7 +2344,7 @@ void CatalogShell::SetVolume(double value) {
     PutPref(L"music.volume", StringOf(std::to_wstring(musicVolume_)));
 }
 void CatalogShell::SetMusic(int track) {
-    if (track < 0 || track > 8) return;
+    if (track < 0 || track > 10) return;
     track_ = track;
     PutPref(L"music.track", StringOf(std::to_wstring(track)));
     musicPlayer_->Stop();
@@ -2357,11 +2357,12 @@ void CatalogShell::SetMusic(int track) {
     if (musicStatus_ != nullptr) musicStatus_->Text = playbackStatus_;
 }
 void CatalogShell::PlayBundledMusic(int track) {
-    if (track < 1 || track > 8 || track == 5) return;
+    if (track < 1 || track > 10 || track == 5) return;
     // Original tracks shipped in the package (scripts/music/compose.py).
     // 5 is the player's own track, so the second set starts at 6.
-    static const wchar_t* files[9] = { nullptr, L"afterglow", L"neon-arcade", L"stardust", L"tidal",
-                                       nullptr, L"sakura", L"night-drive", L"golden-hour" };
+    static const wchar_t* files[11] = { nullptr, L"afterglow", L"neon-arcade", L"stardust", L"tidal",
+                                        nullptr, L"sakura", L"night-drive", L"golden-hour",
+                                        L"abyss", L"crimson" };
     musicPlayer_->IsLooping = true;
     musicPlayer_->Source = ref new Uri(ref new Platform::String(
         (std::wstring(L"ms-appx:///Assets/Music/") + files[track] + L".wav").c_str()));
@@ -5560,10 +5561,10 @@ std::vector<XmbCategory> CatalogShell::XmbCategories() {
         c.name = L"Music";
         c.glyph = L"\uE8D6";
         const wchar_t* names[] = { L"No Music", L"Afterglow", L"Neon Arcade", L"Stardust", L"Tidal",
-                                   L"Sakura", L"Night Drive", L"Golden Hour" };
-        const int trackOf[] = { 0, 1, 2, 3, 4, 6, 7, 8 };
+                                   L"Sakura", L"Night Drive", L"Golden Hour", L"Abyss", L"Crimson" };
+        const int trackOf[] = { 0, 1, 2, 3, 4, 6, 7, 8, 9, 10 };
         c.initial = 0;
-        for (int slot = 0; slot < 8; ++slot) {
+        for (int slot = 0; slot < 10; ++slot) {
             const int i = trackOf[slot];
             if (track_ == i) c.initial = slot;
             c.items.push_back(XmbEntry{ names[slot], track_ == i ? L"Now playing" : L"Home menu music", L"\uE8D6", -1,
