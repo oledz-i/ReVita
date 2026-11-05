@@ -3216,3 +3216,28 @@ replace(libretro_cpp, '''        vita3k_uwp_shader_threads = (threads >= 1 && th
         const int ms = static_cast<int>(std::strtol(value, nullptr, 10));
         vita3k_uwp_quad_wait_ms = (ms >= 0 && ms <= 100) ? ms : 16;
     });''')
+
+# ── The console's cores: game first, compiling in the gaps ──────────────────
+# All host threads ran at the same priority, so a burst of shader compiles
+# took cores from the game's own threads exactly when it was busiest (a new
+# area). Now the compilers run below normal and the renderer above it: the
+# game and the thread feeding the GPU always come first, and compiles use the
+# cores they leave idle. With that, more compilers cost the game nothing:
+# 6 by default (the Series consoles give a game 6 or more cores).
+replace(lr, '''void register_thread(const char *name) {
+    HANDLE handle = nullptr;''', '''void register_thread(const char *name) {
+    if (name != nullptr) {
+        const std::string_view who(name);
+        if (who == "shader compiler")
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        else if (who == "renderer")
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+    HANDLE handle = nullptr;''')
+replace(pipeline_cache_cpp, 'int vita3k_uwp_shader_threads = 4;', 'int vita3k_uwp_shader_threads = 6;')
+replace(libretro_cpp, '''    read_core_option("vita3k_shader_threads", "4", [](const char *value) {
+        const int threads = static_cast<int>(std::strtol(value, nullptr, 10));
+        vita3k_uwp_shader_threads = (threads >= 1 && threads <= 8) ? threads : 4;''', '''    read_core_option("vita3k_shader_threads", "6", [](const char *value) {
+        const int threads = static_cast<int>(std::strtol(value, nullptr, 10));
+        vita3k_uwp_shader_threads = (threads >= 1 && threads <= 8) ? threads : 6;''')
+print('Threads: shader compilers below normal priority (6 by default), renderer above normal.')
