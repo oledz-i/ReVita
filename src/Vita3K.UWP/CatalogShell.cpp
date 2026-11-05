@@ -4392,28 +4392,9 @@ void CatalogShell::StartCore(Platform::String^ contentPath) {
     // (ONYX_PSO_CACHE) came back with the GPU device removed, at the game's
     // first pipeline, and every later game then failed to start.
     VitaVulkanBridge::SetPipelineCachePath(L"");
-    // Each compiled pipeline is kept on disk per game instead (Dozen patch
-    // 0107): a second visit to a scene loads them in milliseconds instead of
-    // compiling for 30-750 ms each. Internal storage: Dozen opens the files
-    // itself, without the app's access to the USB drive.
-    {
-        std::wstring psoDir;
-        const std::wstring psoTitle = TitleIdIn(contentPath->Data());
-        if (!psoTitle.empty()) {
-            try {
-                psoDir = std::wstring(Windows::Storage::ApplicationData::Current->LocalFolder->Path->Data()) + L"\\pipelines\\" + psoTitle;
-            } catch (...) {
-                psoDir.clear();
-            }
-            std::error_code ec;
-            if (!psoDir.empty())
-                std::filesystem::create_directories(psoDir, ec);
-            if (ec)
-                psoDir.clear();
-        }
-        VitaVulkanBridge::SetPipelineBlobDir(psoDir);
-        libretro_.LogLine(psoDir.empty() ? std::string("Pipeline disk cache: off (no title ID)") : std::string("Pipeline disk cache: on"));
-    }
+    // No driver-side pipeline saving: the console's D3D12 driver removes the
+    // GPU when a compiled pipeline is serialized (library or GetCachedBlob).
+    VitaVulkanBridge::SetPipelineBlobDir(L"");
     const std::wstring addonsRoot = Pref(L"storage.addons", L"")->Data();
     const std::wstring titleId = TitleIdIn(contentPath->Data());
     create_task([this,system,content,addonsRoot,titleId]() {
