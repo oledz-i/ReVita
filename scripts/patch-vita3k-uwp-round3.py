@@ -2939,3 +2939,66 @@ replace(pfs_fs_cpp, '''      if (progress)
    return 0;
 }''')
 print('PFS decryption: writes run on their own thread beside reading and decrypting.')
+
+# ── Render targets read back only after a real barrier ──────────────────────
+# A drawn surface was copied (into a texture of another size, or back to the
+# game's memory for surface sync) straight from its General layout, with no
+# barrier after the render pass that wrote it. Desktop drivers let that pass;
+# on Direct3D 12 (Dozen) a render target read without a transition to a copy
+# state can come back black or stale. Gravity Rush's whole scene went black
+# with surface sync on (its bloom is read back), and the same copies run for
+# every surface sampled at another size now that texture viewport is off.
+# Each such copy now transitions the surface to a transfer source and back,
+# and a read-back for the CPU ends with a transfer-to-host barrier.
+replace(surface_cache_cpp, '''            cmd_buffer.copyImage(info.texture.image, vk::ImageLayout::eGeneral, casted->texture.image, vk::ImageLayout::eTransferDstOptimal, image_copy);''', '''#ifdef VITA3K_UWP
+            {
+                const vkutil::ImageLayout prev_layout = info.texture.layout == vkutil::ImageLayout::Undefined ? vkutil::ImageLayout::ColorAttachmentReadWrite : info.texture.layout;
+                info.texture.transition_to(cmd_buffer, vkutil::ImageLayout::TransferSrc);
+                cmd_buffer.copyImage(info.texture.image, vk::ImageLayout::eTransferSrcOptimal, casted->texture.image, vk::ImageLayout::eTransferDstOptimal, image_copy);
+                info.texture.transition_to(cmd_buffer, prev_layout);
+            }
+#else
+            cmd_buffer.copyImage(info.texture.image, vk::ImageLayout::eGeneral, casted->texture.image, vk::ImageLayout::eTransferDstOptimal, image_copy);
+#endif''')
+replace(surface_cache_cpp, '''            cmd_buffer.copyImageToBuffer(info.texture.image, vk::ImageLayout::eGeneral, casted->transition_buffer.buffer, copy_image_buffer);''', '''#ifdef VITA3K_UWP
+            {
+                const vkutil::ImageLayout prev_layout = info.texture.layout == vkutil::ImageLayout::Undefined ? vkutil::ImageLayout::ColorAttachmentReadWrite : info.texture.layout;
+                info.texture.transition_to(cmd_buffer, vkutil::ImageLayout::TransferSrc);
+                cmd_buffer.copyImageToBuffer(info.texture.image, vk::ImageLayout::eTransferSrcOptimal, casted->transition_buffer.buffer, copy_image_buffer);
+                info.texture.transition_to(cmd_buffer, prev_layout);
+                const vk::MemoryBarrier to_buffer_read{
+                    .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+                    .dstAccessMask = vk::AccessFlagBits::eTransferRead
+                };
+                cmd_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer, {}, to_buffer_read, {}, {});
+            }
+#else
+            cmd_buffer.copyImageToBuffer(info.texture.image, vk::ImageLayout::eGeneral, casted->transition_buffer.buffer, copy_image_buffer);
+#endif''')
+replace(surface_cache_cpp, '''    vk::Image image_to_copy = last_written_surface->texture.image;
+    vk::ImageLayout image_layout = vk::ImageLayout::eGeneral;
+''', '''    vk::Image image_to_copy = last_written_surface->texture.image;
+    vk::ImageLayout image_layout = vk::ImageLayout::eGeneral;
+#ifdef VITA3K_UWP
+    const vkutil::ImageLayout sync_prev_layout = last_written_surface->texture.layout == vkutil::ImageLayout::Undefined ? vkutil::ImageLayout::ColorAttachmentReadWrite : last_written_surface->texture.layout;
+    last_written_surface->texture.transition_to(cmd_buffer, vkutil::ImageLayout::TransferSrc);
+    image_layout = vk::ImageLayout::eTransferSrcOptimal;
+#endif
+''')
+replace(surface_cache_cpp, '''    cmd_buffer.copyImageToBuffer(image_to_copy, image_layout, buffer, copy);
+
+    ColorSurfaceCacheInfo *return_value = last_written_surface;''', '''    cmd_buffer.copyImageToBuffer(image_to_copy, image_layout, buffer, copy);
+#ifdef VITA3K_UWP
+    last_written_surface->texture.transition_to(cmd_buffer, sync_prev_layout);
+    {
+        // what the copy wrote is read by the CPU after the fence
+        const vk::MemoryBarrier to_host{
+            .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+            .dstAccessMask = vk::AccessFlagBits::eHostRead
+        };
+        cmd_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, to_host, {}, {});
+    }
+#endif
+
+    ColorSurfaceCacheInfo *return_value = last_written_surface;''')
+print('Vulkan: surface copies and read-backs transition the render target first.')
