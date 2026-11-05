@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: oledz-i <x@x>
+Date: Thu, 5 Nov 2026 09:10:00 -0500
+Subject: [PATCH] dzn: bigger shader-visible view heaps per command buffer
+
+---
+diff --git a/src/microsoft/vulkan/dzn_descriptor_set.c b/src/microsoft/vulkan/dzn_descriptor_set.c
+index 4b1ad58..dcbacfa 100644
+--- a/src/microsoft/vulkan/dzn_descriptor_set.c
++++ b/src/microsoft/vulkan/dzn_descriptor_set.c
+@@ -2050,6 +2050,13 @@ dzn_descriptor_heap_pool_alloc_slots(struct dzn_descriptor_heap_pool *pool,
+          (pool->type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ||
+           pool->type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) ?
+          64 * 1024 : 4 * 1024;
++      /* VITA3K: a command buffer's shader-visible view heap grows in 1 MB
++       * steps (32768 views) instead of 64 KB. Each new heap was a D3D12 heap
++       * creation (up to 6 ms on the console, ~20 a second in Gravity Rush)
++       * plus a SetDescriptorHeaps that flushes the GPU's descriptor state;
++       * freed heaps are reused when the command buffer is reset. */
++      if (pool->shader_visible && pool->type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
++         granularity = 1024 * 1024;
+       uint32_t alloc_step = ALIGN_POT(desc_count * pool->desc_sz, granularity);
+       uint32_t heap_desc_count = MAX2(alloc_step / pool->desc_sz, 16);
+ 
