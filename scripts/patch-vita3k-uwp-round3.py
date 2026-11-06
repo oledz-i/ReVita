@@ -3316,3 +3316,325 @@ replace(libretro_cpp, '''    if (libretro.active_context != RETRO_HW_CONTEXT_VUL
         renderer::process_batches(*emuenv.renderer, emuenv.renderer->features, emuenv.mem, emuenv.cfg);
     }''')
 print('OpenGL: saved shader programs compiled before the first frame, as upstream does.')
+
+# ══ Pipeline warm-up: last session's pipelines compile before they are drawn ══
+# The console's driver takes 30-750 ms to turn a pipeline into GPU code, and
+# it cannot hand that code back to be kept (asking removed the GPU, build
+# 103). PC, Switch and iPhone drivers keep it on disk, which is why games
+# there hitch only the first time ever. So instead the emulator keeps what it
+# needs to build each pipeline again - its fixed state, which programs, which
+# render pass - and in the next session, as soon as the game has created the
+# two programs a remembered pipeline uses (games create theirs while loading),
+# that pipeline is compiled on the background compiler threads. By the time
+# the game draws with it, it is usually ready: no compile in play.
+#  - every pipeline the game makes is noted (pipeline-replay file, saved with
+#    the pipeline cache);
+#  - the GXM module tells the renderer about each program it creates and
+#    releases (released ones are never used: the release waits for any
+#    compile using them, as for asynchronous compiles);
+#  - a draw that cannot be skipped (quads, or with asynchronous compiling
+#    off) and finds its pipeline still warming waits for it rather than
+#    being dropped (the lesson of Minecraft's black screen).
+
+state_h = 'vita3k/renderer/include/renderer/state.h'
+replace(state_h, '''struct State {
+    fs::path cache_path;''', '''struct State {
+#ifdef VITA3K_UWP
+    // programs the game has created and not released (pipeline warm-up)
+    std::mutex uwp_programs_mutex;
+    std::vector<SceGxmVertexProgram *> uwp_vertex_programs;
+    std::vector<SceGxmFragmentProgram *> uwp_fragment_programs;
+    std::atomic<bool> uwp_programs_changed{ false };
+#endif
+    fs::path cache_path;''')
+
+gxm = 'vita3k/modules/SceGxm/SceGxm.cpp'
+replace(gxm, '''    shaderPatcher->vertex_program_cache.emplace(key, *vertexProgram);
+
+    return 0;''', '''    shaderPatcher->vertex_program_cache.emplace(key, *vertexProgram);
+#ifdef VITA3K_UWP
+    {
+        std::lock_guard<std::mutex> guard(emuenv.renderer->uwp_programs_mutex);
+        emuenv.renderer->uwp_vertex_programs.push_back(vp);
+        emuenv.renderer->uwp_programs_changed.store(true, std::memory_order_release);
+    }
+#endif
+
+    return 0;''')
+replace(gxm, '''    shaderPatcher->fragment_program_cache.emplace(key, *fragmentProgram);
+
+    return 0;
+}''', '''    shaderPatcher->fragment_program_cache.emplace(key, *fragmentProgram);
+#ifdef VITA3K_UWP
+    if (!fp->is_maskupdate) {
+        std::lock_guard<std::mutex> guard(emuenv.renderer->uwp_programs_mutex);
+        emuenv.renderer->uwp_fragment_programs.push_back(fp);
+        emuenv.renderer->uwp_programs_changed.store(true, std::memory_order_release);
+    }
+#endif
+
+    return 0;
+}''')
+replace(gxm, '''    SceGxmFragmentProgram *const fp = fragmentProgram.get(emuenv.mem);
+    --fp->reference_count;
+    if (fp->reference_count == 0) {''', '''    SceGxmFragmentProgram *const fp = fragmentProgram.get(emuenv.mem);
+    --fp->reference_count;
+    if (fp->reference_count == 0) {
+#ifdef VITA3K_UWP
+        {
+            std::lock_guard<std::mutex> guard(emuenv.renderer->uwp_programs_mutex);
+            auto &list = emuenv.renderer->uwp_fragment_programs;
+            list.erase(std::remove(list.begin(), list.end(), fp), list.end());
+        }
+#endif''')
+replace(gxm, '''    SceGxmVertexProgram *const vp = vertexProgram.get(emuenv.mem);
+    --vp->reference_count;
+    if (vp->reference_count == 0) {''', '''    SceGxmVertexProgram *const vp = vertexProgram.get(emuenv.mem);
+    --vp->reference_count;
+    if (vp->reference_count == 0) {
+#ifdef VITA3K_UWP
+        {
+            std::lock_guard<std::mutex> guard(emuenv.renderer->uwp_programs_mutex);
+            auto &list = emuenv.renderer->uwp_vertex_programs;
+            list.erase(std::remove(list.begin(), list.end(), vp), list.end());
+        }
+#endif''')
+
+pch = 'vita3k/renderer/include/renderer/vulkan/pipeline_cache.h'
+replace(pch, '''    std::jthread uwp_save_thread;
+    bool uwp_save_in_background = false;
+#endif''', '''    std::jthread uwp_save_thread;
+    bool uwp_save_in_background = false;
+    // pipeline warm-up (pipeline_cache.cpp): one serialized record per key
+    std::mutex uwp_replay_mutex;
+    std::map<uint64_t, std::vector<uint8_t>> uwp_replay_records;
+    std::vector<uint64_t> uwp_replay_pending;
+    void uwp_replay_load();
+    void uwp_replay_save();
+    void uwp_replay_warm();
+#endif''')
+replace(pch, '#include <limits>\n', '#include <limits>\n#include <mutex>\n')
+
+pcc = pipeline_cache_cpp
+replace(pcc, '''PipelineCache::PipelineCache(VKState &state)''', '''#ifdef VITA3K_UWP
+// What a pipeline needs to be built again in a later session.
+struct UwpReplayRecord {
+    uint64_t key;
+    uint64_t vertex_key_hash;
+    uint64_t blending_hash;
+    uint32_t type;
+    uint32_t format;
+    uint32_t color_format;
+    uint8_t transient;
+    uint8_t masked_fetch;
+    uint8_t pad[2];
+    SceGxmTextureFormat vertex_textures[SCE_GXM_MAX_TEXTURE_UNITS];
+    SceGxmTextureFormat fragment_textures[SCE_GXM_MAX_TEXTURE_UNITS];
+    alignas(8) uint8_t record_data[record_pipeline_len];
+};
+static_assert(std::is_trivially_copyable_v<UwpReplayRecord>);
+constexpr uint32_t uwp_replay_magic = 0x57524D31; // "WRM1"
+
+static uint64_t uwp_program_key(const Sha256Hash &hash, uint64_t extra) {
+    return XXH3_64bits(hash.data(), hash.size()) ^ (extra * 0x9E3779B97F4A7C15ULL);
+}
+
+void PipelineCache::uwp_replay_load() {
+    std::lock_guard<std::mutex> guard(uwp_replay_mutex);
+    uwp_replay_records.clear();
+    uwp_replay_pending.clear();
+    const fs::path path = state.shaders_path / fmt::format("pipeline-replay-vk{}.bin", shader::CURRENT_VERSION);
+    std::ifstream file(path, std::ios::in | std::ios::binary);
+    if (!file.is_open())
+        return;
+    uint32_t magic = 0, size = 0;
+    uint64_t count = 0;
+    file.read(reinterpret_cast<char *>(&magic), sizeof(magic));
+    file.read(reinterpret_cast<char *>(&size), sizeof(size));
+    file.read(reinterpret_cast<char *>(&count), sizeof(count));
+    if (!file || magic != uwp_replay_magic || size != sizeof(UwpReplayRecord) || count > 100000) {
+        LOG_WARN("Pipeline warm-up: saved list from another build, starting a new one");
+        return;
+    }
+    for (uint64_t i = 0; i < count; ++i) {
+        std::vector<uint8_t> bytes(sizeof(UwpReplayRecord));
+        file.read(reinterpret_cast<char *>(bytes.data()), bytes.size());
+        if (!file)
+            break;
+        UwpReplayRecord rec;
+        memcpy(&rec, bytes.data(), sizeof(rec));
+        uwp_replay_pending.push_back(rec.key);
+        uwp_replay_records.emplace(rec.key, std::move(bytes));
+    }
+    LOG_INFO("Pipeline warm-up: {} pipelines from earlier sessions will compile as soon as the game creates their programs", uwp_replay_pending.size());
+}
+
+void PipelineCache::uwp_replay_save() {
+    std::vector<uint8_t> out;
+    {
+        std::lock_guard<std::mutex> guard(uwp_replay_mutex);
+        if (uwp_replay_records.empty())
+            return;
+        const uint32_t magic = uwp_replay_magic, size = sizeof(UwpReplayRecord);
+        const uint64_t count = uwp_replay_records.size();
+        out.resize(sizeof(magic) + sizeof(size) + sizeof(count));
+        memcpy(out.data(), &magic, sizeof(magic));
+        memcpy(out.data() + 4, &size, sizeof(size));
+        memcpy(out.data() + 8, &count, sizeof(count));
+        for (const auto &[key, bytes] : uwp_replay_records)
+            out.insert(out.end(), bytes.begin(), bytes.end());
+    }
+    const fs::path path = state.shaders_path / fmt::format("pipeline-replay-vk{}.bin", shader::CURRENT_VERSION);
+    fs::path temp = path;
+    temp += ".tmp";
+    {
+        std::ofstream file(temp, std::ios::out | std::ios::binary | std::ios::trunc);
+        if (!file.is_open())
+            return;
+        file.write(reinterpret_cast<const char *>(out.data()), out.size());
+    }
+    std::error_code error;
+    fs::rename(temp, path, error);
+}
+
+// Render thread: start every remembered pipeline whose programs now exist.
+void PipelineCache::uwp_replay_warm() {
+    const vk::Pipeline pipeline_compiling = std::bit_cast<vk::Pipeline, uint64_t>(~0ULL);
+    std::lock_guard<std::mutex> programs_guard(state.uwp_programs_mutex);
+    std::unordered_map<uint64_t, SceGxmVertexProgram *> vertex_programs;
+    for (SceGxmVertexProgram *vp : state.uwp_vertex_programs)
+        if (vp && vp->renderer_data)
+            vertex_programs[uwp_program_key(vp->renderer_data->hash, vp->key_hash)] = vp;
+    std::unordered_map<uint64_t, SceGxmFragmentProgram *> fragment_programs;
+    for (SceGxmFragmentProgram *fp : state.uwp_fragment_programs)
+        if (fp && fp->renderer_data && !fp->is_maskupdate)
+            fragment_programs[uwp_program_key(fp->renderer_data->hash,
+                reinterpret_cast<const VKFragmentProgram *>(fp->renderer_data.get())->blending_hash)] = fp;
+
+    std::vector<uint64_t> still_waiting;
+    size_t queued = 0;
+    std::lock_guard<std::mutex> replay_guard(uwp_replay_mutex);
+    for (const uint64_t key : uwp_replay_pending) {
+        auto found = uwp_replay_records.find(key);
+        if (found == uwp_replay_records.end())
+            continue;
+        UwpReplayRecord rec;
+        memcpy(&rec, found->second.data(), sizeof(rec));
+        const GxmRecordState *record = reinterpret_cast<const GxmRecordState *>(rec.record_data);
+        const auto vertex = vertex_programs.find(uwp_program_key(record->vertex_program_hash, rec.vertex_key_hash));
+        const auto fragment = fragment_programs.find(uwp_program_key(record->fragment_program_hash, rec.blending_hash));
+        if (vertex == vertex_programs.end() || fragment == fragment_programs.end()) {
+            still_waiting.push_back(key);
+            continue;
+        }
+        auto it = pipelines.find(key);
+        if (it != pipelines.end() && it->second != nullptr)
+            continue; // already made or being made this session
+        if (it == pipelines.end())
+            it = pipelines.insert({ key, nullptr }).first;
+
+        SceGxmVertexProgram *vp = vertex->second;
+        SceGxmFragmentProgram *fp = fragment->second;
+        shader::Hints hints{};
+        hints.attributes = &vp->attributes;
+        hints.color_format = static_cast<SceGxmColorFormat>(rec.color_format);
+        hints.masked_framebuffer_fetch = rec.masked_fetch != 0;
+        memcpy(hints.vertex_textures, rec.vertex_textures, sizeof(hints.vertex_textures));
+        memcpy(hints.fragment_textures, rec.fragment_textures, sizeof(hints.fragment_textures));
+
+        CompileRequest *request = new CompileRequest;
+        *request = {
+            .pipeline = &it->second,
+            .type = static_cast<SceGxmPrimitiveType>(rec.type),
+            .render_pass = retrieve_render_pass(static_cast<vk::Format>(rec.format), true, true, rec.transient != 0),
+            .vertex_program_gxm = vp,
+            .fragment_program_gxm = fp,
+            .hints = hints
+        };
+        memcpy(request->record_data, rec.record_data, record_pipeline_len);
+        it->second = pipeline_compiling;
+        vp->compile_threads_on.fetch_add(1, std::memory_order_relaxed);
+        fp->compile_threads_on.fetch_add(1, std::memory_order_relaxed);
+        pipeline_compile_queue.enqueue(pipeline_compile_queue_token, request);
+        ++queued;
+    }
+    uwp_replay_pending = std::move(still_waiting);
+    if (queued)
+        LOG_INFO("Pipeline warm-up: {} remembered pipelines compiling in the background ({} waiting for programs not created yet)", queued, uwp_replay_pending.size());
+}
+#endif
+
+PipelineCache::PipelineCache(VKState &state)''')
+
+# load with the pipeline cache (also when there is no cache file yet)
+replace(pcc, '''void PipelineCache::read_pipeline_cache() {
+    const std::string pipeline_cache_name''', '''void PipelineCache::read_pipeline_cache() {
+#ifdef VITA3K_UWP
+    uwp_replay_load();
+#endif
+    const std::string pipeline_cache_name''')
+# save with it
+replace(pcc, '''void PipelineCache::save_pipeline_cache() {
+#ifdef VITA3K_UWP
+    if (uwp_save_thread.joinable())
+        uwp_save_thread.join();''', '''void PipelineCache::save_pipeline_cache() {
+#ifdef VITA3K_UWP
+    if (uwp_save_thread.joinable())
+        uwp_save_thread.join();
+    uwp_replay_save();''')
+
+# warm at the start of each pipeline lookup when the game created programs
+replace(pcc, '''vk::Pipeline PipelineCache::retrieve_pipeline(VKContext &context, SceGxmPrimitiveType &type, bool consider_for_async, MemState &mem) {
+    const GxmRecordState &record = context.record;''', '''vk::Pipeline PipelineCache::retrieve_pipeline(VKContext &context, SceGxmPrimitiveType &type, bool consider_for_async, MemState &mem) {
+#ifdef VITA3K_UWP
+    if (use_async_compilation && state.uwp_programs_changed.exchange(false, std::memory_order_acq_rel) && !uwp_replay_pending.empty())
+        uwp_replay_warm();
+#endif
+    const GxmRecordState &record = context.record;''')
+
+# a draw that cannot be skipped waits for its warming pipeline
+replace(pcc, '''            if (it->second == pipeline_compiling)
+                // pipeline is still compiling
+                return nullptr;''', '''            if (it->second == pipeline_compiling) {
+#ifdef VITA3K_UWP
+                if (!consider_for_async || !use_async_compilation) {
+                    // warming in the background: this draw cannot be dropped
+                    volatile VkPipeline *slot = reinterpret_cast<volatile VkPipeline *>(&it->second);
+                    const VkPipeline compiling_raw = static_cast<VkPipeline>(pipeline_compiling);
+                    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+                    while (*slot == compiling_raw && std::chrono::steady_clock::now() < until)
+                        std::this_thread::yield();
+                    const vk::Pipeline ready = vk::Pipeline(static_cast<VkPipeline>(*slot));
+                    if (ready != pipeline_compiling && ready != std::bit_cast<vk::Pipeline, uint64_t>(~1ULL))
+                        return ready;
+                }
+#endif
+                // pipeline is still compiling
+                return nullptr;
+            }''')
+
+# note every new pipeline
+replace(pcc, '''    // note: the flag can_use_deferred_compilation is not considered here because it causes way too many false positives
+#ifdef VITA3K_UWP''', '''    // note: the flag can_use_deferred_compilation is not considered here because it causes way too many false positives
+#ifdef VITA3K_UWP
+    if (!maskupdate && !context.shader_hints.masked_framebuffer_fetch && !fragment_program_gxm.is_maskupdate && render_pass == context.current_render_pass) {
+        UwpReplayRecord rec{};
+        rec.key = key;
+        rec.vertex_key_hash = vertex_program_gxm.key_hash;
+        rec.blending_hash = fragment_program.blending_hash;
+        rec.type = static_cast<uint32_t>(type);
+        rec.format = static_cast<uint32_t>(context.current_color_format);
+        rec.color_format = static_cast<uint32_t>(context.shader_hints.color_format);
+        rec.transient = record.color_surface.data ? 0 : 1;
+        rec.masked_fetch = 0;
+        memcpy(rec.vertex_textures, context.shader_hints.vertex_textures, sizeof(rec.vertex_textures));
+        memcpy(rec.fragment_textures, context.shader_hints.fragment_textures, sizeof(rec.fragment_textures));
+        memcpy(rec.record_data, &record, record_pipeline_len);
+        std::vector<uint8_t> bytes(sizeof(rec));
+        memcpy(bytes.data(), &rec, sizeof(rec));
+        std::lock_guard<std::mutex> guard(uwp_replay_mutex);
+        uwp_replay_records.emplace(key, std::move(bytes));
+    }
+#endif
+#ifdef VITA3K_UWP''')
+print('Vulkan: pipeline warm-up - pipelines from earlier sessions compile in the background once their programs exist.')
