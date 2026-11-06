@@ -3238,6 +3238,75 @@ void CatalogShell::ChooseFirmwareFolder() {
     }, task_continuation_context::use_current());
 }
 
+void CatalogShell::DownloadFirmware() {
+    if (firmwareBusy_ || firmwareDownloading_) {
+        SetStatus(L"Firmware is already being downloaded or installed.");
+        return;
+    }
+    if (libretro_.GameLoaded() || booting_) {
+        SetStatus(L"Stop the game before installing firmware.");
+        return;
+    }
+    firmwareDownloading_ = true;
+    ShowFirmwareProgress(-2, L"Contacting PlayStation's update server...");
+    // The PS Vita system software, as linked from playstation.com's PS Vita
+    // system software page. Nothing of Sony's is shipped with ReVita.
+    auto uri = ref new Uri(L"http://dus01.psv.update.playstation.net/update/psv/image/2022_0209/"
+                           L"rel_f2c7b12fe85496ec88a0391b514d6e3b/PSVUPDAT.PUP");
+    auto client = ref new Windows::Web::Http::HttpClient();
+    auto request = client->GetAsync(uri, Windows::Web::Http::HttpCompletionOption::ResponseContentRead);
+    auto dispatcher = Dispatcher;
+    auto lastPercent = std::make_shared<int>(-1);
+    request->Progress = ref new AsyncOperationProgressHandler<Windows::Web::Http::HttpResponseMessage^, Windows::Web::Http::HttpProgress>(
+        [this,dispatcher,lastPercent](IAsyncOperationWithProgress<Windows::Web::Http::HttpResponseMessage^, Windows::Web::Http::HttpProgress>^,
+                                      Windows::Web::Http::HttpProgress progress) {
+            if (progress.TotalBytesToReceive == nullptr || progress.TotalBytesToReceive->Value == 0) return;
+            const unsigned long long total = progress.TotalBytesToReceive->Value;
+            const int percent = static_cast<int>(100.0 * progress.BytesReceived / total);
+            if (percent == *lastPercent) return;
+            *lastPercent = percent;
+            const unsigned long long receivedMb = progress.BytesReceived >> 20, totalMb = total >> 20;
+            dispatcher->RunAsync(Windows::UI::Core::CoreDispatcherPriority::Low,
+                ref new Windows::UI::Core::DispatchedHandler([this,percent,receivedMb,totalMb]() {
+                    wchar_t text[128] = {};
+                    swprintf_s(text, L"Downloading the PS Vita system software: %llu of %llu MB",
+                        receivedMb, totalMb);
+                    ShowFirmwareProgress(percent, ref new Platform::String(text));
+                }));
+        });
+    create_task(request).then([client](Windows::Web::Http::HttpResponseMessage^ response) {
+        response->EnsureSuccessStatusCode();
+        return create_task(ApplicationData::Current->LocalFolder->CreateFolderAsync(L"Vita3KTemp", CreationCollisionOption::OpenIfExists))
+        .then([](StorageFolder^ folder) {
+            return folder->CreateFileAsync(L"PSVUPDAT.PUP", CreationCollisionOption::ReplaceExisting);
+        }).then([response](StorageFile^ file) {
+            return create_task(file->OpenAsync(FileAccessMode::ReadWrite)).then([response,file](IRandomAccessStream^ stream) {
+                return create_task(response->Content->WriteToStreamAsync(stream)).then([stream](unsigned long long) {
+                    return stream->FlushAsync();
+                }).then([stream,file](bool) {
+                    delete stream;   // closes it, so the installer can open the file
+                    return file;
+                });
+            });
+        });
+    }).then([this](task<StorageFile^> saved) {
+        firmwareDownloading_ = false;
+        StorageFile^ file = nullptr;
+        try {
+            file = saved.get();
+        } catch (Platform::Exception^ e) {
+            ShowFirmwareProgress(-1, L"Couldn't download the firmware: " + e->Message +
+                L" Check the console's internet connection, or install .PUP files you have.");
+            return;
+        } catch (...) {
+            ShowFirmwareProgress(-1, L"Couldn't download the firmware. Check the console's internet connection.");
+            return;
+        }
+        ShowFirmwareProgress(100, L"Downloaded. Installing...");
+        InstallFirmwareFiles(std::vector<StorageFile^>{ file });
+    }, task_continuation_context::use_current());
+}
+
 void CatalogShell::ShowFirmwareProgress(double value, Platform::String^ message) {
     if (firmwareProgress_ != nullptr) {
         // -1 hides the bar, -2 shows it without a percentage.
@@ -3582,7 +3651,11 @@ void CatalogShell::FirmwareSettings() {
     auto actions = ref new StackPanel();
     actions->Orientation = Orientation::Horizontal;
     actions->Margin = Thickness(0, 16, 0, 0);
-    auto install = Button(L"Install firmware files", true);
+    auto download = Button(L"Download from PlayStation", !SystemFirmwareInstalled());
+    download->Click += ref new RoutedEventHandler([this](Platform::Object^, RoutedEventArgs^) { DownloadFirmware(); });
+    actions->Children->Append(download);
+    auto install = Button(L"Install firmware files", false);
+    install->Margin = Thickness(10, 0, 0, 0);
     install->Click += ref new RoutedEventHandler([this](Platform::Object^, RoutedEventArgs^) { ChooseFirmware(); });
     actions->Children->Append(install);
     auto fromFolder = Button(L"Install from a folder");
@@ -3605,8 +3678,9 @@ void CatalogShell::FirmwareSettings() {
                                                   : Windows::UI::Xaml::Visibility::Collapsed;
     box->Children->Append(firmwareProgress_);
     firmwareMessage_ = Text(
-        L"Pick your .PUP files, all at once, under any names. ReVita looks inside each one, "
-        L"tells the system firmware, preinstalled package and fonts apart, and installs them right away.",
+        L"Download the system software from PlayStation's own update server, or pick .PUP files you "
+        L"already have, all at once, under any names. ReVita tells the system firmware, preinstalled "
+        L"package and fonts apart and installs them right away.",
         12, false, true);
     firmwareMessage_->Margin = Thickness(0, 10, 0, 0);
     box->Children->Append(firmwareMessage_);

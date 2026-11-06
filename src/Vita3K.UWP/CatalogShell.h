@@ -272,6 +272,9 @@ private:
     void ChooseLicenseForGame(size_t index);
     void ChooseFirmware();
     void ChooseFirmwareFolder();
+    // the system software straight from PlayStation's update server, then installed
+    void DownloadFirmware();
+    bool firmwareDownloading_ = false;
     void InstallFirmwareFiles(std::vector<Windows::Storage::StorageFile^> files);
     void ShowFirmwareProgress(double value, Platform::String^ message);
     void StorageSettings();
