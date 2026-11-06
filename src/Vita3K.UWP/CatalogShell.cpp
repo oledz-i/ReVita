@@ -1034,9 +1034,10 @@ void CatalogShell::StyleSettingsRail() {
         item->Foreground = Solid(on ? Colors::White : RgbColor(176, 178, 194));
         auto inside = dynamic_cast<StackPanel^>(item->Content);
         if (inside == nullptr) continue;
-        for (auto child : inside->Children) {
-            if (auto text = dynamic_cast<TextBlock^>(child))
-                text->Foreground = Solid(on ? Colors::White : RgbColor(176, 178, 194));
+        for (unsigned k = 0; k < inside->Children->Size; ++k) {
+            auto label = dynamic_cast<TextBlock^>(inside->Children->GetAt(k));
+            if (label != nullptr)
+                label->Foreground = Solid(on ? Colors::White : RgbColor(176, 178, 194));
         }
     }
 }
