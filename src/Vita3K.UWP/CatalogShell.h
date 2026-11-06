@@ -158,6 +158,14 @@ private:
     Windows::UI::Xaml::Controls::ScrollViewer^ flowScroll_ = nullptr;
     Windows::UI::Xaml::Controls::StackPanel^ flowRow_ = nullptr;
     int flowFocus_ = -1;
+    // navigation: re-renders of the same page keep the controller where it was
+    bool focusSettingsTab_ = true;
+    // the bundled song that goes with the current theme ("Match the theme")
+    int ThemeTrack() const;
+    // Home: Play, Game page, Library (Down goes to the poster in the middle)
+    std::vector<Windows::UI::Xaml::Controls::Button^> homeActions_;
+    static void CollectFocusable(Windows::UI::Xaml::DependencyObject^ node,
+                                 std::vector<Windows::UI::Xaml::Controls::Control^>& out);
     void MakeFlow(const std::vector<size_t>& items, size_t focus);
     void FocusFlow(int position, bool animate);
     Windows::UI::Xaml::Controls::Button^ MakeFlowCard(size_t index, int position);

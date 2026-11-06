@@ -1,0 +1,306 @@
+diff --git a/vita3k/renderer/include/renderer/gl/functions.h b/vita3k/renderer/include/renderer/gl/functions.h
+index f4feb551..1d9b34d6 100644
+--- a/vita3k/renderer/include/renderer/gl/functions.h
++++ b/vita3k/renderer/include/renderer/gl/functions.h
+@@ -67,7 +67,7 @@ void sync_point_line_width(const GLState &state, const std::uint32_t size, const
+ void sync_depth_bias(const int factor, const int unit, const bool front);
+ void sync_blending(const GxmRecordState &state, const MemState &mem);
+ void sync_texture(GLState &state, GLContext &context, MemState &mem, std::size_t index, SceGxmTexture texture, const Config &config);
+-void sync_vertex_streams_and_attributes(GLContext &context, GxmRecordState &state, const MemState &mem);
++bool sync_vertex_streams_and_attributes(GLContext &context, GxmRecordState &state, const MemState &mem);
+ void bind_fundamental(GLContext &context);
+ void clear_previous_uniform_storage(GLContext &context);
+ 
+diff --git a/vita3k/renderer/include/renderer/gl/ring_buffer.h b/vita3k/renderer/include/renderer/gl/ring_buffer.h
+index f009a7f5..265c9068 100644
+--- a/vita3k/renderer/include/renderer/gl/ring_buffer.h
++++ b/vita3k/renderer/include/renderer/gl/ring_buffer.h
+@@ -20,6 +20,7 @@
+ #include <glutil/object_array.h>
+ #include <renderer/gl/fence.h>
+ 
++#include <array>
+ #include <cstdint>
+ #include <utility>
+ 
+@@ -36,6 +37,17 @@ private:
+ 
+     GLenum purpose_;
+ 
++    // One fence per quarter of the buffer, set when writing moves past that
++    // quarter and waited for before the quarter is written again. (The single
++    // fence before only covered the first quarter, and after its first wait it
++    // never waited again: Minecraft's chunk meshes wrapped the buffer and
++    // overwrote vertices and indices the GPU was still reading.)
++    static constexpr std::size_t segment_count = 4;
++    std::array<GLsync, segment_count> segment_fences_{};
++    std::size_t current_segment_ = 0;
++    bool oversize_logged_ = false;
++    void wait_segment(std::size_t segment);
++
+     void create_and_map();
+ 
+ public:
+diff --git a/vita3k/renderer/src/gl/draw.cpp b/vita3k/renderer/src/gl/draw.cpp
+index 65979730..4b82acca 100644
+--- a/vita3k/renderer/src/gl/draw.cpp
++++ b/vita3k/renderer/src/gl/draw.cpp
+@@ -77,7 +77,7 @@ static GLuint uwp_color_attachment_copy(GLuint attachment) {
+     glGetTextureLevelParameteriv(attachment, 0, GL_TEXTURE_WIDTH, &width);
+     glGetTextureLevelParameteriv(attachment, 0, GL_TEXTURE_HEIGHT, &height);
+     if (width <= 0 || height <= 0 || format == 0)
+-        return attachment;
++        return 0; // never the render target itself: sampling what is being drawn is a feedback loop
+     Copy *copy = nullptr;
+     for (auto &c : copies) {
+         if (c.texture && c.format == format && c.width == width && c.height == height) {
+@@ -178,8 +178,13 @@ void draw(GLState &renderer, GLContext &context, const FeatureState &features, S
+     }
+ 
+     if (!program_id) {
+-        assert(false && "Should never happen");
+-        glGetIntegerv(GL_CURRENT_PROGRAM, reinterpret_cast<GLint *>(&program_id));
++        // the shaders did not compile or link: drawing with another program's
++        // bindings reads the wrong resources (garbage at best, a GPU fault on
++        // the console at worst), so this draw is skipped
++        static bool logged = false;
++        LOG_ERROR_IF(!logged, "OpenGL: a draw's shader program failed; such draws are skipped");
++        logged = true;
++        return;
+     }
+ 
+     glUseProgram(program_id);
+@@ -270,7 +275,8 @@ void draw(GLState &renderer, GLContext &context, const FeatureState &features, S
+     }
+ 
+     // Upload vertex stream
+-    sync_vertex_streams_and_attributes(context, context.record, mem);
++    if (!sync_vertex_streams_and_attributes(context, context.record, mem))
++        return;
+ 
+     // Upload index data.
+     const GLsizeiptr index_size = (format == SCE_GXM_INDEX_FORMAT_U16) ? 2 : 4;
+diff --git a/vita3k/renderer/src/gl/ring_buffer.cpp b/vita3k/renderer/src/gl/ring_buffer.cpp
+index 306044b0..7d1cd491 100644
+--- a/vita3k/renderer/src/gl/ring_buffer.cpp
++++ b/vita3k/renderer/src/gl/ring_buffer.cpp
+@@ -18,6 +18,7 @@
+ // NOTE: I revised algorithm from RPCS3's GLHelpers.h. Please look at the class ring_buffer. Asked kd for advice.
+ // I (pent0) mostly rewritten to understand it, other contributors in future can see the rpcs3 code.
+ 
++#include <algorithm>
+ #include <renderer/gl/ring_buffer.h>
+ #include <util/align.h>
+ #include <util/log.h>
+@@ -33,6 +34,12 @@ RingBuffer::RingBuffer(GLenum purpose, const std::size_t capacity)
+ }
+ 
+ RingBuffer::~RingBuffer() {
++    for (GLsync &fence : segment_fences_) {
++        if (fence) {
++            glDeleteSync(fence);
++            fence = nullptr;
++        }
++    }
+     if (base_) {
+         glBindBuffer(purpose_, buffer_[0]);
+         glUnmapBuffer(purpose_);
+@@ -62,29 +69,62 @@ std::pair<std::uint8_t *, std::size_t> RingBuffer::allocate(const std::size_t da
+         }
+     }
+ 
+-    std::size_t offset = align(cursor_, 256);
+-
+-    if ((offset + data_size) >= capacity_) {
+-        if (!safe_segment_consumed_fence_.empty()) {
+-            safe_segment_consumed_fence_.wait_for_signal();
+-        } else {
+-            LOG_ERROR("Sync fence has not been inserted but the size of the ring buffer has already reached full!");
+-            glFinish();
++    const std::size_t segment_size = capacity_ / segment_count;
++    if (data_size > capacity_ - segment_size) {
++        // never fits without overwriting what the GPU is reading
++        if (!oversize_logged_) {
++            LOG_ERROR("Ring buffer request of {} bytes does not fit a {} byte ring; draw skipped", data_size, capacity_);
++            oversize_logged_ = true;
+         }
++        return std::make_pair(nullptr, static_cast<std::size_t>(-1));
++    }
++
++    std::size_t offset = align(cursor_, 256);
++    if (offset + data_size > capacity_)
++        offset = 0; // wrap
+ 
+-        offset = 0;
+-        cursor_ = 0;
++    const std::size_t first = offset / segment_size;
++    const std::size_t last = std::min((offset + (data_size ? data_size - 1 : 0)) / segment_size, segment_count - 1);
++    // Leaving the quarter being filled: fence it, so it is only written again
++    // once every draw issued so far (the ones reading it) has finished.
++    if (first != current_segment_ || last != current_segment_) {
++        GLsync &fence = segment_fences_[current_segment_];
++        if (fence)
++            glDeleteSync(fence);
++        fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+     }
++    for (std::size_t segment = first; segment <= last; ++segment) {
++        if (segment != current_segment_)
++            wait_segment(segment);
++    }
++    current_segment_ = last;
+ 
+-    cursor_ = align(offset + data_size, 256);
++    cursor_ = offset + data_size;
+     return std::make_pair(base_ + offset, offset);
+ }
+ 
+-void RingBuffer::draw_call_done() {
+-    // Insert a fence when the buffer has been consumed about 25% (same as RPCS3)
+-    if (safe_segment_consumed_fence_.empty() && (cursor_ >= (capacity_ >> 2))) {
+-        safe_segment_consumed_fence_.insert();
++void RingBuffer::wait_segment(std::size_t segment) {
++    GLsync &fence = segment_fences_[segment];
++    if (!fence)
++        return;
++    GLbitfield flags = GL_SYNC_FLUSH_COMMANDS_BIT;
++    for (;;) {
++        const GLenum result = glClientWaitSync(fence, flags, 2'000'000); // 2 ms slices
++        if (result == GL_ALREADY_SIGNALED || result == GL_CONDITION_SATISFIED)
++            break;
++        if (result == GL_WAIT_FAILED) {
++            LOG_ERROR("Ring buffer fence wait failed; finishing the GPU instead");
++            glFinish();
++            break;
++        }
++        flags = 0;
+     }
++    glDeleteSync(fence);
++    fence = nullptr;
++}
++
++void RingBuffer::draw_call_done() {
++    // fences are placed when allocation moves between quarters (allocate)
+ }
+ 
+ } // namespace renderer::gl
+diff --git a/vita3k/renderer/src/gl/sync_state.cpp b/vita3k/renderer/src/gl/sync_state.cpp
+index f2772528..21b36918 100644
+--- a/vita3k/renderer/src/gl/sync_state.cpp
++++ b/vita3k/renderer/src/gl/sync_state.cpp
+@@ -15,6 +15,7 @@
+ // with this program; if not, write to the Free Software Foundation, Inc.,
+ // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+ 
++#include <algorithm>
+ #include <renderer/functions.h>
+ #include <renderer/profile.h>
+ #include <renderer/types.h>
+@@ -450,21 +451,43 @@ void clear_previous_uniform_storage(GLContext &context) {
+     context.fragment_uniform_buffer_storage_ptr.second = 0;
+ }
+ 
+-void sync_vertex_streams_and_attributes(GLContext &context, GxmRecordState &state, const MemState &mem) {
++bool sync_vertex_streams_and_attributes(GLContext &context, GxmRecordState &state, const MemState &mem) {
+     // Vertex attributes.
+     const SceGxmVertexProgram &vertex_program = *state.vertex_program.get(mem);
+     GLVertexProgram *glvert = reinterpret_cast<GLVertexProgram *>(vertex_program.renderer_data.get());
+ 
+     // Each draw will upload the stream data. Assuming that, we can just bind buffer, upload data
+     // The GXM submit side should already submit used buffer, but we just delete all just in case
+-    std::array<std::size_t, SCE_GXM_MAX_VERTEX_STREAMS> offset_in_buffer;
++    std::array<std::size_t, SCE_GXM_MAX_VERTEX_STREAMS> offset_in_buffer{};
++    std::array<std::uint32_t, SCE_GXM_MAX_VERTEX_STREAMS> stream_stride{};
++    for (std::size_t i = 0; i < SCE_GXM_MAX_VERTEX_STREAMS; i++)
++        stream_stride[i] = i < vertex_program.streams.size() ? vertex_program.streams[i].stride : 0;
++    bool uploaded = true;
+     for (std::size_t i = 0; i < SCE_GXM_MAX_VERTEX_STREAMS; i++) {
+         if (state.vertex_streams[i].data) {
+-            std::pair<std::uint8_t *, std::size_t> result = context.vertex_stream_ring_buffer.allocate(state.vertex_streams[i].size);
++            const std::uint32_t stride = stream_stride[i];
++            const std::size_t size = state.vertex_streams[i].size;
++            // Direct3D 12 needs vertices that start on 4-byte boundaries: a
++            // stream with an odd stride is copied to one rounded up to 4
++            const bool restride = stride != 0 && (stride % 4) != 0;
++            const std::uint32_t new_stride = restride ? (stride + 3) & ~3u : stride;
++            const std::size_t vertices = restride ? (size + stride - 1) / stride : 0;
++            const std::size_t upload_size = restride ? vertices * new_stride : size;
++            std::pair<std::uint8_t *, std::size_t> result = context.vertex_stream_ring_buffer.allocate(upload_size);
+             if (!result.first) {
+                 LOG_ERROR("Failed to allocate vertex stream data from GPU!");
++                uploaded = false;
+             } else {
+-                std::memcpy(result.first, state.vertex_streams[i].data.get(mem), state.vertex_streams[i].size);
++                const std::uint8_t *source = static_cast<const std::uint8_t *>(state.vertex_streams[i].data.get(mem));
++                if (restride) {
++                    for (std::size_t v = 0; v < vertices; v++) {
++                        const std::size_t left = size - v * stride;
++                        std::memcpy(result.first + v * new_stride, source + v * stride, std::min<std::size_t>(stride, left));
++                    }
++                    stream_stride[i] = new_stride;
++                } else {
++                    std::memcpy(result.first, source, size);
++                }
+                 offset_in_buffer[i] = result.second;
+             }
+ 
+@@ -482,6 +505,7 @@ void sync_vertex_streams_and_attributes(GLContext &context, GxmRecordState &stat
+             continue;
+ 
+         const SceGxmVertexStream &stream = vertex_program.streams[attribute.streamIndex];
++        const GLsizei attribute_stride = static_cast<GLsizei>(stream_stride[attribute.streamIndex]);
+ 
+         GLenum type = attribute_format_to_gl_type(attribute.format);
+         const GLboolean normalized = attribute_format_normalized(attribute.format);
+@@ -546,9 +570,9 @@ void sync_vertex_streams_and_attributes(GLContext &context, GxmRecordState &stat
+ 
+         for (uint32_t i = 0; i < array_size; i++) {
+             if (upload_integral || (attribute.format == SCE_GXM_ATTRIBUTE_FORMAT_UNTYPED)) {
+-                glVertexAttribIPointer(attrib_location + i, component_count, type, stream.stride, reinterpret_cast<const GLvoid *>(i * array_element_size + attribute.offset + offset_in_buffer[stream_index]));
++                glVertexAttribIPointer(attrib_location + i, component_count, type, attribute_stride, reinterpret_cast<const GLvoid *>(i * array_element_size + attribute.offset + offset_in_buffer[stream_index]));
+             } else {
+-                glVertexAttribPointer(attrib_location + i, component_count, type, normalized, stream.stride, reinterpret_cast<const GLvoid *>(i * array_element_size + attribute.offset + offset_in_buffer[stream_index]));
++                glVertexAttribPointer(attrib_location + i, component_count, type, normalized, attribute_stride, reinterpret_cast<const GLvoid *>(i * array_element_size + attribute.offset + offset_in_buffer[stream_index]));
+             }
+ 
+             glEnableVertexAttribArray(attrib_location + i);
+@@ -561,5 +585,6 @@ void sync_vertex_streams_and_attributes(GLContext &context, GxmRecordState &stat
+         }
+     }
+     glBindBuffer(GL_ARRAY_BUFFER, 0);
++    return uploaded;
+ }
+ } // namespace renderer::gl
+diff --git a/vita3k/renderer/src/vulkan/scene.cpp b/vita3k/renderer/src/vulkan/scene.cpp
+index 8e072298..0c399a75 100644
+--- a/vita3k/renderer/src/vulkan/scene.cpp
++++ b/vita3k/renderer/src/vulkan/scene.cpp
+@@ -412,6 +412,29 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
+     const SceGxmFragmentProgram &gxm_fragment_program = *context.record.fragment_program.get(mem);
+ 
+     void *indices_ptr = indices.get(mem);
++#ifdef VITA3K_UWP
++    // The console's Direct3D 12 has no triangle fans: Dozen rewrote every fan
++    // draw's indices with a compute pass and a barrier on the GPU. Without
++    // memory mapping the indices are copied here anyway, so a fan becomes a
++    // triangle list on the CPU (same winding, same provoking vertex).
++    thread_local std::vector<uint8_t> uwp_fan_indices;
++    if (type == SCE_GXM_PRIMITIVE_TRIANGLE_FAN && !context.state.features.enable_memory_mapping && indices_ptr) {
++        const size_t index_size = format == SCE_GXM_INDEX_FORMAT_U16 ? 2 : 4;
++        const size_t triangles = count > 2 ? count - 2 : 0;
++        uwp_fan_indices.resize(std::max<size_t>(triangles * 3 * index_size, index_size));
++        const uint8_t *source = static_cast<const uint8_t *>(indices_ptr);
++        uint8_t *out = uwp_fan_indices.data();
++        for (size_t t = 0; t < triangles; ++t) {
++            memcpy(out, source + (t + 1) * index_size, index_size);
++            memcpy(out + index_size, source + (t + 2) * index_size, index_size);
++            memcpy(out + 2 * index_size, source, index_size);
++            out += 3 * index_size;
++        }
++        indices_ptr = uwp_fan_indices.data();
++        count = triangles * 3;
++        type = SCE_GXM_PRIMITIVE_TRIANGLES;
++    }
++#endif
+ 
+     context.check_for_macroblock_change(true);
+ 

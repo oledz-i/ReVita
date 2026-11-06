@@ -45,7 +45,7 @@ It's a **beta**. Plenty of games boot and play, some play well, and some don't w
 
 - **Two home screens.** A **cover flow** where your posters turn toward the one you're on and its artwork fills the screen, or a **PS3-style XMB** with eleven colours: pick one you like, or let it follow the month the way the PS3 did.
 - **Art from SteamGridDB.** Add your own API key and the app finds covers and wide backdrops for your games, with a picker for when you want a different one. If a game has no backdrop, the app takes a screenshot while you play and uses that.
-- **Twelve themes and original music.** Nine menu tracks written for this project, plus interface sounds, each with its own volume. You can also play your own track or turn the music off.
+- **Neon themes and an original soundtrack.** Eight themes in ReVita's blue, pink and purple, Synthwave included, each with its own animated scene and its own song: eight calm, upbeat synthwave tracks written for ReVita. Play your own track or turn the music off if you like.
 - **A touch cursor** on the right stick for games that need the touch screen.
 - **Game fixes built in.** Some games need a certain setup, and the app applies it for you. Danganronpa, for example, always starts on OpenGL with surface sync on, because that's the combination that gets it past its interaction bug.
 - **Diagnostics when you need them.** A report from Settings, plus a short performance line in the log every minute, so a problem report actually says what went wrong.

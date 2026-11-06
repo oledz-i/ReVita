@@ -2,7 +2,7 @@
 
 ReVita's interface is native UWP, made for a controller on a TV. Everything is reachable with the Xbox controller; **B** goes back.
 
-The frame: the ReVita mark and the time float at the top, and the tabs (Home, Library, Settings) sit in a glass dock at the bottom. **LB** and **RB** move between tabs from anywhere. Soft veils fade the page out under the header and the dock, so content scrolls behind the glass.
+The frame: the ReVita mark and the time float at the top, and the tabs (Home, Library, Settings) sit in a glass dock at the bottom that shows where you are. **LB** and **RB** move between tabs from anywhere; the controller never gets stuck in the dock, and the page always ends above it. Pressing a setting keeps you on it instead of jumping back to the top. Soft veils fade the page out under the header and the dock, so content scrolls behind the glass.
 
 ## Home layouts
 
@@ -32,7 +32,7 @@ The XMB has eleven colours: Monthly (the PS3's colour of the month, darker at ni
 
 ## Themes, music and sounds
 
-Twelve themes: ReVita (default, violet night with the mark's cyan-violet-pink ribbon), Aurora, Ember, Glacier, Orbit, Sakura, Synthwave, Verdant, Gilded, Abyss, Crimson and Prism, each with its own living scene. Nine original home soundtracks (Afterglow, Neon Arcade, Stardust, Tidal, Sakura, Night Drive, Golden Hour, Abyss, Crimson), composed for this project by `scripts/music/compose.py`, or your own file, or off. Original interface cues for focus, select, back and shelf swipes, played through XAudio2 so they never hold up the menu. Music and cues each have their own volume.
+Eight themes, all in ReVita's neon blue, pink and purple: ReVita (default, violet night), Synthwave (a striped sun over a neon grid), Miami Night (a pink sun sinking into a cyan grid), Pastel Dream, Ultraviolet, Cotton Sky, Midnight Arcade and Starfall, each with its own living scene. Eight original songs, calm but upbeat synthwave and dreamwave written for ReVita by `scripts/music/revita.py`: full pieces of two and a half to three minutes (intro, verse, chorus, breakdown, last chorus, outro), not short loops. **Match the theme** (the default) plays each theme's own song; you can also pick any song, play your own file, or turn music off. Original interface cues for focus, select, back and shelf swipes, played through XAudio2 so they never hold up the menu. Music and cues each have their own volume.
 
 ## In a game
 

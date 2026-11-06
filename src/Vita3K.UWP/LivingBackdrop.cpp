@@ -364,7 +364,62 @@ void LivingBackdrop::Build() {
     s.Sprite(floor, width_, height_, 0, 0);
 
     const Color white = ColorHelper::FromArgb(255, 255, 255, 255);
-    switch (theme_) {
+    // Synthwave and Miami Night: a striped sun on the horizon, a neon floor rolling towards you
+    auto synthwave = [&](Color sunTop, Color sunBottom, Color neonColor) {
+        s.Stars(white, 60);
+        const float horizon = height_ * 0.58f;
+        const float sun = (std::min)(width_, height_) * 0.62f;
+        auto sunBrush = compositor_->CreateLinearGradientBrush();
+        sunBrush->StartPoint = float2(0.5f, 0);
+        sunBrush->EndPoint = float2(0.5f, 1);
+        sunBrush->ColorStops->Append(compositor_->CreateColorGradientStop(0.0f, sunTop));
+        sunBrush->ColorStops->Append(compositor_->CreateColorGradientStop(1.0f, sunBottom));
+        auto disc = compositor_->CreateEllipseGeometry();
+        disc->Radius = float2(sun / 2, sun / 2);
+        disc->Center = float2(sun / 2, sun / 2);
+        auto discShape = compositor_->CreateSpriteShape(disc);
+        discShape->FillBrush = sunBrush;
+        auto sunVisual = compositor_->CreateShapeVisual();
+        sunVisual->Size = float2(sun, sun);
+        sunVisual->Shapes->Append(discShape);
+        sunVisual->Offset = float3(width_ / 2 - sun / 2, horizon - sun * 0.72f, 0);
+        scene_->Children->InsertAtTop(sunVisual);
+        auto halo = s.Sprite(s.Glow(accent_, 150, 0.35f), sun * 2.2f, sun * 2.2f, width_ / 2 - sun * 1.1f, horizon - sun * 1.6f);
+        s.LoopScalar(halo, L"Opacity", { 0.6f, 0.95f, 0.6f }, 7);
+        // stripes cut across the lower half of the sun, sliding down
+        for (int i = 0; i < 6; ++i) {
+            const float stripeH = 3.0f + i * 1.6f;
+            auto stripe = s.Sprite(compositor_->CreateColorBrush(base_), sun * 1.05f, stripeH,
+                                   width_ / 2 - sun * 0.525f, horizon - sun * 0.4f + i * sun * 0.06f);
+            const float y = stripe->Offset.y;
+            s.Loop(stripe, L"Offset", { float3(stripe->Offset.x, y, 0), float3(stripe->Offset.x, y + sun * 0.06f, 0) }, 3.2, 0);
+        }
+        // the floor
+        s.Sprite(compositor_->CreateColorBrush(Scale(base_, 0.8)), width_, height_ - horizon, 0, horizon);
+        const Color neon = neonColor;
+        for (int i = 0; i < 9; ++i) {
+            auto line = s.Sprite(compositor_->CreateColorBrush(WithAlpha(neon, 210)), width_, 2, 0, horizon);
+            line->Opacity = 0;
+            s.Loop(line, L"Offset", { float3(0, horizon, 0), float3(0, horizon + (height_ - horizon) * 0.25f, 0),
+                                      float3(0, static_cast<float>(height_), 0) }, 4.5, i * 0.5);
+            s.LoopScalar(line, L"Opacity", { 0.0f, 0.5f, 0.9f }, 4.5, i * 0.5);
+        }
+        for (int i = -7; i <= 7; ++i) {
+            const float len = (height_ - horizon) * 2.2f;
+            auto ray = s.Sprite(compositor_->CreateColorBrush(WithAlpha(neon, 150)), 2, len, width_ / 2, horizon);
+            ray->CenterPoint = float3(1, 0, 0);
+            ray->RotationAngleInDegrees = -i * 9.0f;
+        }
+        auto haze = s.Sprite(s.Glow(accent_, 120, 0.4f), width_ * 1.4f, height_ * 0.5f, -width_ * 0.2f, horizon - height_ * 0.22f);
+        s.LoopScalar(haze, L"Opacity", { 0.5f, 0.85f, 0.5f }, 9);
+    };
+
+    // ReVita's eight themes, each drawn by one of the scenes below
+    //   0 ReVita, 1 Synthwave, 2 Miami Night, 3 Pastel Dream, 4 Ultraviolet,
+    //   5 Cotton Sky, 6 Midnight Arcade, 7 Starfall
+    static const int sceneOf[8] = { 0, 6, 12, 5, 1, 13, 11, 4 };
+    const int scene = (theme_ >= 0 && theme_ < 8) ? sceneOf[theme_] : 0;
+    switch (scene) {
     case 1: { // Aurora: curtains of light swaying over a dark sea, drifting motes
         s.Wanderers(glow_, Mix(glow_, accent_, 0.4), 2, 150);
         for (int i = 0; i < 3; ++i) {
@@ -425,53 +480,19 @@ void LivingBackdrop::Build() {
         s.Stream(s.Glow(white, 220, 0.25f), 14, 3, 6, true, 40, 18, 30, 0.5f);
         break;
     }
-    case 6: { // Synthwave: a striped sun on the horizon and a neon floor rolling towards you
-        s.Stars(white, 60);
-        const float horizon = height_ * 0.58f;
-        const float sun = (std::min)(width_, height_) * 0.62f;
-        auto sunBrush = compositor_->CreateLinearGradientBrush();
-        sunBrush->StartPoint = float2(0.5f, 0);
-        sunBrush->EndPoint = float2(0.5f, 1);
-        sunBrush->ColorStops->Append(compositor_->CreateColorGradientStop(0.0f, ColorHelper::FromArgb(255, 255, 214, 96)));
-        sunBrush->ColorStops->Append(compositor_->CreateColorGradientStop(1.0f, WithAlpha(accent_, 255)));
-        auto disc = compositor_->CreateEllipseGeometry();
-        disc->Radius = float2(sun / 2, sun / 2);
-        disc->Center = float2(sun / 2, sun / 2);
-        auto discShape = compositor_->CreateSpriteShape(disc);
-        discShape->FillBrush = sunBrush;
-        auto sunVisual = compositor_->CreateShapeVisual();
-        sunVisual->Size = float2(sun, sun);
-        sunVisual->Shapes->Append(discShape);
-        sunVisual->Offset = float3(width_ / 2 - sun / 2, horizon - sun * 0.72f, 0);
-        scene_->Children->InsertAtTop(sunVisual);
-        auto halo = s.Sprite(s.Glow(accent_, 150, 0.35f), sun * 2.2f, sun * 2.2f, width_ / 2 - sun * 1.1f, horizon - sun * 1.6f);
-        s.LoopScalar(halo, L"Opacity", { 0.6f, 0.95f, 0.6f }, 7);
-        // stripes cut across the lower half of the sun, sliding down
-        for (int i = 0; i < 6; ++i) {
-            const float stripeH = 3.0f + i * 1.6f;
-            auto stripe = s.Sprite(compositor_->CreateColorBrush(base_), sun * 1.05f, stripeH,
-                                   width_ / 2 - sun * 0.525f, horizon - sun * 0.4f + i * sun * 0.06f);
-            const float y = stripe->Offset.y;
-            s.Loop(stripe, L"Offset", { float3(stripe->Offset.x, y, 0), float3(stripe->Offset.x, y + sun * 0.06f, 0) }, 3.2, 0);
-        }
-        // the floor
-        s.Sprite(compositor_->CreateColorBrush(Scale(base_, 0.8)), width_, height_ - horizon, 0, horizon);
-        const Color neon = Mix(accent_, white, 0.15);
-        for (int i = 0; i < 9; ++i) {
-            auto line = s.Sprite(compositor_->CreateColorBrush(WithAlpha(neon, 210)), width_, 2, 0, horizon);
-            line->Opacity = 0;
-            s.Loop(line, L"Offset", { float3(0, horizon, 0), float3(0, horizon + (height_ - horizon) * 0.25f, 0),
-                                      float3(0, static_cast<float>(height_), 0) }, 4.5, i * 0.5);
-            s.LoopScalar(line, L"Opacity", { 0.0f, 0.5f, 0.9f }, 4.5, i * 0.5);
-        }
-        for (int i = -7; i <= 7; ++i) {
-            const float len = (height_ - horizon) * 2.2f;
-            auto ray = s.Sprite(compositor_->CreateColorBrush(WithAlpha(neon, 150)), 2, len, width_ / 2, horizon);
-            ray->CenterPoint = float3(1, 0, 0);
-            ray->RotationAngleInDegrees = -i * 9.0f;
-        }
-        auto haze = s.Sprite(s.Glow(accent_, 120, 0.4f), width_ * 1.4f, height_ * 0.5f, -width_ * 0.2f, horizon - height_ * 0.22f);
-        s.LoopScalar(haze, L"Opacity", { 0.5f, 0.85f, 0.5f }, 9);
+    case 6: { // Synthwave: golden-pink sun over a magenta grid
+        synthwave(ColorHelper::FromArgb(255, 255, 206, 120), WithAlpha(accent_, 255), Mix(accent_, white, 0.15));
+        break;
+    }
+    case 12: { // Miami Night: a pink sun sinking into a cyan grid
+        synthwave(ColorHelper::FromArgb(255, 255, 150, 210), ColorHelper::FromArgb(255, 255, 70, 160), Mix(accent_, white, 0.1));
+        break;
+    }
+    case 13: { // Cotton Sky: blue and pink clouds drifting past soft stars
+        s.Stars(white, 40);
+        s.Wanderers(glow_, Mix(glow_, accent_, 0.5), 4, 190);
+        s.Tumble(s.Glow(Mix(accent_, white, 0.4), 160, 0.6f), 10, 40, 80, 260, 26, 40, 0.5f);
+        s.Tumble(s.Glow(Mix(glow_, white, 0.45), 150, 0.6f), 8, 50, 90, 300, 30, 46, 0.45f);
         break;
     }
     case 7: { // Verdant: green mist, light through the canopy, fireflies
@@ -510,8 +531,10 @@ void LivingBackdrop::Build() {
         s.Stream(s.Ring(Mix(accent_, white, 0.5), 120), 12, 30, 110, true, 90, 30, 52, 0.6f);
         break;
     }
-    default: { // Onyx: rose light and the Vita's home-screen bubbles floating up
+    default: { // ReVita: violet night, stars, cyan and pink light, bubbles floating up
+        s.Stars(white, 50);
         s.Wanderers(glow_, Mix(glow_, accent_, 0.45), 3, 165);
+        s.Wanderers(ColorHelper::FromArgb(255, 47, 150, 200), ColorHelper::FromArgb(255, 200, 60, 150), 2, 120);
         s.Stream(s.Ring(Mix(accent_, white, 0.35), 150), 18, 40, 140, true, 120, 26, 48, 0.7f);
         s.Stream(s.Glow(Mix(accent_, white, 0.6), 220, 0.3f), 20, 4, 9, true, 60, 18, 30, 0.6f);
         break;

@@ -17,7 +17,7 @@ struct CoreOptionDef {
     CoreOptionValue values[20];
 };
 inline const CoreOptionDef kCoreOptions[] = {
-    { "vita3k_backend_renderer", L"Graphics", L"Renderer", L"Vulkan: the tested path (Mesa Dozen), and the faster one. OpenGL (experimental): Mesa's OpenGL on D3D12. Surface sync works on both. Takes effect when a game starts.", "Vulkan", 2, { { "Vulkan", L"Vulkan" }, { "OpenGL", L"OpenGL" } } },
+    { "vita3k_backend_renderer", L"Graphics", L"Renderer", L"Two renderers, both built for this console: Vulkan (through Mesa's Dozen) and OpenGL (Mesa on Direct3D 12). Most games run on either; if one misbehaves, try the other. Surface sync works on both. Takes effect when a game starts.", "Vulkan", 2, { { "Vulkan", L"Vulkan" }, { "OpenGL", L"OpenGL" } } },
     { "vita3k_resolution_multiplier", L"Graphics", L"Internal resolution", L"Multiplier for the internal rendering resolution (960x544 base). Series S: stay at 1x until games run well. Series X can try 2x.", "1", 4, { { "1", L"1x (960x544)" }, { "2", L"2x (1920x1088)" }, { "3", L"3x (2880x1632)" }, { "4", L"4x (3840x2176)" } } },
     { "vita3k_screen_filter", L"Graphics", L"Screen Filter", L"Post-processing filter applied to the rendered frame. (FSR was removed: it did not work on the console; a saved FSR runs as Bilinear.)", "Bilinear", 4, { { "Bilinear", L"Bilinear" }, { "Nearest", L"Nearest" }, { "Bicubic", L"Bicubic" }, { "FXAA", L"FXAA" } } },
     { "vita3k_anisotropic_filtering", L"Graphics", L"Anisotropic Filtering", L"Level of anisotropic texture filtering.", "1", 5, { { "1", L"1x (Off)" }, { "2", L"2x" }, { "4", L"4x" }, { "8", L"8x" }, { "16", L"16x" } } },

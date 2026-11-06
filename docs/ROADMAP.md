@@ -7,7 +7,7 @@ No performance guarantees. Windows CI builds do not prove Xbox hardware support;
 | Repository and CI | **Done.** Signed x64 APPX on GitHub Actions |
 | Core integration | **Done.** Full Vita3K core, Dynarmic with a UWP W^X patch, firmware install |
 | Graphics | **Working, being tuned.** Vulkan (Dozen) and OpenGL (Mesa) on D3D12, per-game choice |
-| Frontend | **Working.** ReVita cover-flow home or PS3-style XMB, poster Library, game pages, SteamGridDB art, twelve themes, music |
+| Frontend | **Working.** ReVita cover-flow home or PS3-style XMB, poster Library, game pages, SteamGridDB art, eight neon themes with their own songs |
 | First games | **Done.** Several commercial titles run ([compatibility](COMPATIBILITY.md)) |
 | Alpha release | **Done.** 2026-10-29 |
 | **ReVita beta** | **Now.** New name and look, firmware download from PlayStation, game fixes from Vita3K-Plus, Dozen pipeline variants built ahead |

@@ -288,7 +288,7 @@ jobs:
               # The menu music plays from ms-appx:///Assets/Music: missing, the menu is
               # silent. Reported (with what the package holds), not fatal.
               $all = @($archive.Entries | ForEach-Object FullName)
-              $missing = @('afterglow','neon-arcade','stardust','tidal','sakura','night-drive','golden-hour','abyss','crimson' | Where-Object { $t = $_; !($all | Where-Object { $_ -ieq "Assets/Music/$t.wav" }) })
+              $missing = @('starlight-drive','afterlight','neon-bloom','midnight-arcade','coastline-87','pastel-horizon','cotton-sky','ultraviolet' | Where-Object { $t = $_; !($all | Where-Object { $_ -ieq "Assets/Music/$t.m4a" }) })
               if ($missing.Count) {
                 $seen = ($all | Where-Object { $_ -match '(?i)wav|music|^assets' }) -join ', '
                 Write-Host "::error title=Menu music not packaged::Missing Assets/Music/: $($missing -join ', '). Package has: $seen"
@@ -306,6 +306,24 @@ jobs:
               "Packaged DLLs ($($dlls.Count)): $($dlls -join ', ')"
             } finally { $archive.Dispose() }
           } finally { Stop-Transcript }
+      - name: Keep only what the Xbox installs
+        shell: pwsh
+        run: |
+          # The SDK copies VCLibs for every architecture; the console only takes x64.
+          Get-ChildItem artifacts/package -Recurse -Directory |
+            Where-Object { $_.Parent.Name -eq 'Dependencies' -and $_.Name -ne 'x64' } |
+            ForEach-Object { Write-Host "Dropping $($_.FullName)"; Remove-Item -Recurse -Force $_.FullName }
+          Get-ChildItem artifacts/package -Recurse -Include *.pdb,*.appxsym | Remove-Item -Force -ErrorAction SilentlyContinue
+          Get-ChildItem artifacts/package -Recurse -File | Sort-Object Length -Descending |
+            ForEach-Object { "{0,8:N1} MB  {1}" -f ($_.Length / 1MB), $_.FullName.Substring((Resolve-Path artifacts/package).Path.Length) }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $main = Get-ChildItem artifacts/package -Recurse -Filter *.appx | Where-Object { $_.FullName -notmatch 'Dependencies' } | Select-Object -First 1
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($main.FullName)
+          try {
+            "Largest files inside $($main.Name):"
+            $zip.Entries | Sort-Object CompressedLength -Descending | Select-Object -First 15 |
+              ForEach-Object { "{0,8:N1} MB packed  {1,8:N1} MB  {2}" -f ($_.CompressedLength / 1MB), ($_.Length / 1MB), $_.FullName }
+          } finally { $zip.Dispose() }
       - name: Upload signed Xbox package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

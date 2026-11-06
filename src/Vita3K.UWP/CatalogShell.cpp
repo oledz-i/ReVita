@@ -202,66 +202,50 @@ Platform::String^ PrettyFileName(Platform::String^ value) {
 }
 Color CatalogShell::Bg() const {
     switch (theme_) {
-    case 1: return RgbColor(7, 16, 19);       // Aurora: deep ocean
-    case 2: return RgbColor(18, 12, 11);      // Ember: dark theater
-    case 3: return RgbColor(10, 17, 25);      // Glacier: midnight blue
-    case 4: return RgbColor(13, 10, 23);      // Orbit: deep cosmic
-    case 5: return RgbColor(22, 12, 18);      // Sakura: plum night
-    case 6: return RgbColor(14, 6, 24);       // Synthwave: neon dusk
-    case 7: return RgbColor(7, 17, 12);       // Verdant: forest floor
-    case 8: return RgbColor(16, 13, 8);       // Gilded: black and gold
-    case 9: return RgbColor(4, 12, 22);       // Abyss: deep sea
-    case 10: return RgbColor(16, 6, 8);       // Crimson: red and black
-    case 11: return RgbColor(14, 15, 20);     // Prism: graphite glass
+    case 1: return RgbColor(14, 6, 24);       // Synthwave: neon dusk
+    case 2: return RgbColor(6, 10, 22);       // Miami Night: night sea
+    case 3: return RgbColor(20, 14, 30);      // Pastel Dream: lavender haze
+    case 4: return RgbColor(10, 4, 22);       // Ultraviolet: deep violet
+    case 5: return RgbColor(14, 12, 30);      // Cotton Sky: dusk blue
+    case 6: return RgbColor(6, 8, 24);        // Midnight Arcade: navy
+    case 7: return RgbColor(8, 8, 20);        // Starfall: night sky
     default: return RgbColor(8, 7, 16);       // ReVita: violet night
     }
 }
 Color CatalogShell::Card() const {
     // Glass: the moving scene shows through every card a little.
     switch (theme_) {
-    case 1: return Alpha(206, 16, 32, 35);
-    case 2: return Alpha(206, 35, 24, 22);
-    case 3: return Alpha(206, 22, 33, 46);
-    case 4: return Alpha(206, 27, 22, 41);
-    case 5: return Alpha(206, 40, 24, 33);
-    case 6: return Alpha(206, 30, 16, 46);
-    case 7: return Alpha(206, 17, 34, 25);
-    case 8: return Alpha(206, 33, 28, 18);
-    case 9: return Alpha(206, 12, 28, 44);
-    case 10: return Alpha(206, 36, 14, 18);
-    case 11: return Alpha(206, 30, 32, 42);
+    case 1: return Alpha(206, 30, 16, 46);
+    case 2: return Alpha(206, 14, 24, 46);
+    case 3: return Alpha(206, 36, 28, 52);
+    case 4: return Alpha(206, 26, 14, 50);
+    case 5: return Alpha(206, 28, 26, 56);
+    case 6: return Alpha(206, 14, 20, 50);
+    case 7: return Alpha(206, 22, 22, 44);
     default: return Alpha(206, 22, 19, 40);
     }
 }
 Color CatalogShell::Accent() const {
     switch (theme_) {
-    case 1: return RgbColor(83, 225, 206);
-    case 2: return RgbColor(246, 163, 100);
-    case 3: return RgbColor(118, 179, 246);
-    case 4: return RgbColor(178, 149, 255);
-    case 5: return RgbColor(255, 158, 196);
-    case 6: return RgbColor(255, 92, 205);
-    case 7: return RgbColor(146, 222, 120);
-    case 8: return RgbColor(232, 190, 104);
-    case 9: return RgbColor(64, 200, 255);
-    case 10: return RgbColor(255, 64, 82);
-    case 11: return RgbColor(196, 210, 255);
-    default: return RgbColor(139, 108, 255);
+    case 1: return RgbColor(255, 92, 205);    // hot magenta
+    case 2: return RgbColor(64, 224, 255);    // neon cyan
+    case 3: return RgbColor(255, 170, 222);   // pastel pink
+    case 4: return RgbColor(176, 102, 255);   // ultraviolet
+    case 5: return RgbColor(130, 200, 255);   // baby blue
+    case 6: return RgbColor(255, 84, 170);    // arcade pink
+    case 7: return RgbColor(184, 170, 255);   // periwinkle
+    default: return RgbColor(139, 108, 255);  // ReVita violet
     }
 }
 Color CatalogShell::Glow() const {
     switch (theme_) {
-    case 1: return RgbColor(16, 67, 65);
-    case 2: return RgbColor(103, 46, 32);
-    case 3: return RgbColor(28, 71, 109);
-    case 4: return RgbColor(75, 40, 105);
-    case 5: return RgbColor(112, 46, 78);
-    case 6: return RgbColor(92, 26, 120);
-    case 7: return RgbColor(28, 82, 46);
-    case 8: return RgbColor(104, 72, 22);
-    case 9: return RgbColor(10, 62, 104);
-    case 10: return RgbColor(110, 14, 24);
-    case 11: return RgbColor(60, 66, 96);
+    case 1: return RgbColor(92, 26, 120);
+    case 2: return RgbColor(130, 30, 110);    // the pink against the cyan
+    case 3: return RgbColor(90, 70, 150);
+    case 4: return RgbColor(40, 30, 150);     // electric blue under violet
+    case 5: return RgbColor(120, 60, 130);
+    case 6: return RgbColor(20, 70, 150);
+    case 7: return RgbColor(44, 40, 120);
     default: return RgbColor(58, 30, 112);
     }
 }
@@ -446,16 +430,27 @@ void CatalogShell::SetStatus(Platform::String^ message) {
     if (status_ != nullptr) status_->Text = message;
 }
 CatalogShell::CatalogShell() {
-    const auto saved = Pref(L"theme", L"0");
-    theme_ = _wtoi(saved->Data());
-    if (theme_ < 0 || theme_ > 11) theme_ = 0;
+    {
+        // ReVita's eight themes. A theme saved before them maps to the closest one.
+        const auto saved = Pref(L"revita.theme", L"");
+        if (!saved->IsEmpty()) {
+            theme_ = _wtoi(saved->Data());
+        } else {
+            const int old = _wtoi(Pref(L"theme", L"0")->Data());
+            //                  Onyx Aurora Ember Glacier Orbit Sakura Synth Verdant Gilded Abyss Crimson Prism
+            const int map[12] = { 0,   4,     1,    5,      7,    3,     1,    0,      2,     6,    1,      7 };
+            theme_ = (old >= 0 && old < 12) ? map[old] : 0;
+            PutPref(L"revita.theme", StringOf(std::to_wstring(theme_)));
+        }
+        if (theme_ < 0 || theme_ > 7) theme_ = 0;
+    }
     xmbMode_ = Pref(L"ui.layout", L"cinematic")->Equals(L"xmb");
     xmbTheme_ = _wtoi(Pref(L"xmb.theme", L"1")->Data());
     if (xmbTheme_ < 0 || xmbTheme_ >= kXmbThemeCount) xmbTheme_ = 0;
-    const auto savedTrack = Pref(L"music.track", L"1");
-    // 0 off, 1-4 and 6-8 bundled tracks, 5 the player's own
+    const auto savedTrack = Pref(L"music.track", L"10");
+    // 0 off, 1-4 and 6-9 bundled songs, 5 the player's own, 10 the theme's song
     track_ = _wtoi(savedTrack->Data());
-    if (track_ < 0 || track_ > 10 || (track_ == 0 && !savedTrack->Equals(L"0"))) track_ = 1;
+    if (track_ < 0 || track_ > 10 || (track_ == 0 && !savedTrack->Equals(L"0"))) track_ = 10;
     try {
         musicVolume_ = std::stod(Pref(L"music.volume", L"0.45")->Data());
     } catch (...) { musicVolume_ = 0.45; }
@@ -546,9 +541,10 @@ CatalogShell::CatalogShell() {
     scroll->VerticalScrollBarVisibility = ScrollBarVisibility::Hidden;
     scroll->HorizontalScrollBarVisibility = ScrollBarVisibility::Disabled;
     content_ = Vertical();
-    content_->Margin = Thickness(56, 10, 56, 118);
+    content_->Margin = Thickness(56, 10, 56, 28);
     scroll->Content = content_;
-    scroll->Margin = Thickness(0, 70, 0, 0);
+    // the page ends where the dock begins, so focus never scrolls a control under it
+    scroll->Margin = Thickness(0, 70, 0, 80);
     Grid::SetColumn(scroll, 1);
     Grid::SetRow(scroll, 0);
     root_->Children->Append(scroll);
@@ -899,6 +895,9 @@ void CatalogShell::BuildNavigation() {
         nav->BorderThickness = Thickness(0);
         nav->Background = selected ? static_cast<Brush^>(BrandBrush(0.92)) : Solid(Colors::Transparent);
         Skin(nav, 23, selected);
+        // The dock shows where you are; LB and RB move between tabs. Focus
+        // never lands here, so the controller can't get stuck in the dock.
+        nav->IsTabStop = false;
         Windows::UI::Xaml::Automation::AutomationProperties::SetName(nav, ref new Platform::String(labels[i]));
         auto inside = ref new StackPanel();
         inside->Orientation = Orientation::Horizontal;
@@ -952,6 +951,7 @@ void CatalogShell::ShowPage(int nextPage) {
     if (nextPage < 0 || nextPage > 4) nextPage = 0;
     if (page_ == 3 && nextPage != 3) renderer_.Shutdown();
     if (nextPage != page_) PlayCue(4);
+    if (nextPage == 2 && page_ != 2) focusSettingsTab_ = true;
     page_ = nextPage;
     BuildNavigation();
     Render();
@@ -1441,6 +1441,13 @@ void CatalogShell::FocusFlow(int position, bool animate) {
         animateTo(card, L"Opacity", d == 0 ? 1.0 : 0.9 - 0.16 * reach);
         Canvas::SetZIndex(card, 100 - std::abs(d));
     }
+    // Down from Play, Game page or Library lands on the poster in the middle,
+    // and Up from any poster goes back to Play
+    for (auto action : homeActions_)
+        action->XYFocusDown = flowCards_[position];
+    if (!homeActions_.empty())
+        for (auto card : flowCards_)
+            card->XYFocusUp = homeActions_.front();
     board->Begin();
     // keep the focused card in the middle: the row has half a screen of
     // padding on each side, so the focused card's offset is position * step
@@ -1592,6 +1599,7 @@ void CatalogShell::Home() {
     all->Height = 42;
     all->Click += ref new RoutedEventHandler([this](Platform::Object^, RoutedEventArgs^) { ShowPage(1); });
     controls->Children->Append(all);
+    homeActions_ = { play, details, all };
     spot->Children->Append(controls);
     content_->Children->Append(spot);
 
@@ -2044,7 +2052,47 @@ void CatalogShell::AppendGameInfo(size_t index) {
     panel->Margin = Thickness(0, 14, 0, 10);
     content_->Children->Append(panel);
 }
+void CatalogShell::CollectFocusable(DependencyObject^ node, std::vector<Control^>& out) {
+    const int count = Windows::UI::Xaml::Media::VisualTreeHelper::GetChildrenCount(node);
+    for (int i = 0; i < count; ++i) {
+        auto child = Windows::UI::Xaml::Media::VisualTreeHelper::GetChild(node, i);
+        auto control = dynamic_cast<Control^>(child);
+        if (control != nullptr && control->IsTabStop) {
+            if (control->IsEnabled && control->Visibility == Windows::UI::Xaml::Visibility::Visible)
+                out.push_back(control);
+            continue;   // a control's own insides are not separate stops
+        }
+        CollectFocusable(child, out);
+    }
+}
 void CatalogShell::Render() {
+    // Drawing the same page again (a toggle, a theme, a sort) keeps the
+    // controller on the control it was on instead of throwing it to the top.
+    int keepFocus = -1;
+    if (page_ == shownPage_ && content_ != nullptr) {
+        auto focused = dynamic_cast<DependencyObject^>(Windows::UI::Xaml::Input::FocusManager::GetFocusedElement());
+        if (focused != nullptr) {
+            std::vector<Control^> stops;
+            CollectFocusable(content_, stops);
+            for (size_t i = 0; i < stops.size(); ++i)
+                if (stops[i] == focused) { keepFocus = static_cast<int>(i); break; }
+        }
+    }
+    if (keepFocus >= 0) {
+        // the page keeps its scroll position too
+        const double keepOffset = contentScroll_ != nullptr ? contentScroll_->VerticalOffset : 0.0;
+        Dispatcher->RunAsync(Windows::UI::Core::CoreDispatcherPriority::Low,
+            ref new Windows::UI::Core::DispatchedHandler([this,keepFocus,keepOffset]() {
+                if (content_ == nullptr) return;
+                if (contentScroll_ != nullptr)
+                    contentScroll_->ChangeView(nullptr, ref new Platform::Box<double>(keepOffset), nullptr, true);
+                std::vector<Control^> stops;
+                CollectFocusable(content_, stops);
+                if (stops.empty()) return;
+                stops[std::min(static_cast<size_t>(keepFocus), stops.size() - 1)]->Focus(
+                    Windows::UI::Xaml::FocusState::Programmatic);
+            }));
+    }
     content_->Children->Clear();
     clock_ = nullptr;
     greeting_ = nullptr;
@@ -2057,6 +2105,7 @@ void CatalogShell::Render() {
     flowScroll_ = nullptr;
     flowRow_ = nullptr;
     flowFocus_ = -1;
+    homeActions_.clear();
     // the spotlight belongs to Home and a game's page
     if (page_ != 0 && page_ != 4) HideSpotlight();
     // The PS3-style home takes the whole screen over the usual layout.
@@ -2114,7 +2163,8 @@ void CatalogShell::Settings() {
                 PutPref(L"settings.tab", StringOf(std::to_wstring(i)));
                 Render();
             });
-            if (settingsTab_ == i) {
+            if (settingsTab_ == i && focusSettingsTab_) {
+                focusSettingsTab_ = false;
                 chip->Loaded += ref new RoutedEventHandler([chip](Platform::Object^, RoutedEventArgs^) {
                     chip->Focus(Windows::UI::Xaml::FocusState::Programmatic);
                 });
@@ -2135,31 +2185,25 @@ void CatalogShell::Settings() {
     }
     if (settingsTab_ == 1) EmulationSettings();
     if (settingsTab_ == 2) {
-    Section(L"Appearance", L"Twelve moods, each with its own living scene behind the whole app.");
+    Section(L"Appearance", L"Eight moods in ReVita's neon colours, each with its own living scene and its own song.");
     const wchar_t* styles[] = {
-        L"ReVita", L"Aurora", L"Ember", L"Glacier", L"Orbit",
-        L"Sakura", L"Synthwave", L"Verdant", L"Gilded",
-        L"Abyss", L"Crimson", L"Prism"
+        L"ReVita", L"Synthwave", L"Miami Night", L"Pastel Dream",
+        L"Ultraviolet", L"Cotton Sky", L"Midnight Arcade", L"Starfall"
     };
     const wchar_t* captions[] = {
-        L"Neon orbit", L"Electric teal", L"Warm cinema",
-        L"Arctic blue", L"Cosmic violet",
-        L"Falling blossoms", L"Neon horizon", L"Firefly forest", L"Black & gold",
-        L"Deep sea light", L"Red & black", L"Glass & light"
+        L"Violet night", L"Neon sun, endless grid", L"Cyan tide, hot pink",
+        L"Lavender haze", L"Violet aurora", L"Blue and pink clouds",
+        L"Navy glass, neon light", L"Planets and stars"
     };
     const Color samples[] = {
-        RgbColor(92, 64, 200), RgbColor(23, 95, 94),
-        RgbColor(127, 65, 37), RgbColor(48, 95, 145),
-        RgbColor(83, 55, 131),
-        RgbColor(150, 70, 110), RgbColor(130, 36, 150),
-        RgbColor(40, 110, 62), RgbColor(150, 112, 40),
-        RgbColor(20, 84, 130), RgbColor(150, 24, 34), RgbColor(96, 104, 130)
+        RgbColor(92, 64, 200), RgbColor(150, 36, 160), RgbColor(30, 150, 190), RgbColor(190, 120, 180),
+        RgbColor(110, 50, 200), RgbColor(90, 140, 210), RgbColor(200, 50, 140), RgbColor(110, 100, 200)
     };
     auto palettes = ref new VariableSizedWrapGrid();
     palettes->Orientation = Orientation::Horizontal;
     palettes->ItemWidth = 158;
     palettes->ItemHeight = 96;
-    for (int i = 0; i < 12; ++i) {
+    for (int i = 0; i < 8; ++i) {
         const bool active = theme_ == i;
         auto choice = ref new Windows::UI::Xaml::Controls::Button();
         choice->Width = 148;
@@ -2245,14 +2289,14 @@ void CatalogShell::Settings() {
     }
 
     if (settingsTab_ == 3) {
-    Section(L"Home menu soundtrack", L"Original loopable music, your own audio, or silence.");
+    Section(L"Home menu soundtrack", L"Original ReVita songs, written for this app. Match the theme plays each theme's own song.");
     // shown in this order; the number is the saved track
     const wchar_t* names[] = {
-        L"Off", L"Afterglow", L"Neon Arcade", L"Stardust", L"Tidal",
-        L"Sakura", L"Night Drive", L"Golden Hour", L"Abyss", L"Crimson", L"Your own track"
+        L"Match the theme", L"Starlight Drive", L"Afterlight", L"Neon Bloom", L"Midnight Arcade",
+        L"Coastline '87", L"Pastel Horizon", L"Cotton Sky", L"Ultraviolet", L"Your own track", L"Off"
     };
-    const int trackOf[] = { 0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 5 };
-    auto music = ActionRow(142);
+    const int trackOf[] = { 10, 1, 2, 3, 4, 6, 7, 8, 9, 5, 0 };
+    auto music = ActionRow(160);
     for (int slot = 0; slot < 11; ++slot) {
         const int i = trackOf[slot];
         auto b = Button(ref new Platform::String(names[slot]), track_ == i);
@@ -2627,15 +2671,24 @@ void CatalogShell::UpdateClock() {
     }
 }
 void CatalogShell::SaveTheme(int theme) {
-    if (theme < 0 || theme > 11) return;
+    if (theme < 0 || theme > 7) return;
     theme_ = theme;
-    PutPref(L"theme", StringOf(std::to_wstring(theme)));
+    PutPref(L"revita.theme", StringOf(std::to_wstring(theme)));
     PlayCue(5);
     ApplySurfaceColors();
     backdrop_.SetTheme(theme_, Bg(), Accent(), Glow());
     BuildNavigation();
+    if (track_ == 10) {
+        musicPlayer_->Stop();
+        PlayBundledMusic(10);
+    }
     Render();
     SetStatus(L"Theme saved. Your colors will be restored on the next launch.");
+}
+int CatalogShell::ThemeTrack() const {
+    // ReVita, Synthwave, Miami Night, Pastel Dream, Ultraviolet, Cotton Sky, Midnight Arcade, Starfall
+    static const int song[8] = { 1, 3, 6, 7, 9, 8, 4, 2 };
+    return song[(theme_ >= 0 && theme_ < 8) ? theme_ : 0];
 }
 void CatalogShell::SetVolume(double value) {
     musicVolume_ = std::max(0.0, std::min(1.0, value));
@@ -2656,15 +2709,16 @@ void CatalogShell::SetMusic(int track) {
     if (musicStatus_ != nullptr) musicStatus_->Text = playbackStatus_;
 }
 void CatalogShell::PlayBundledMusic(int track) {
-    if (track < 1 || track > 10 || track == 5) return;
-    // Original tracks shipped in the package (scripts/music/compose.py).
-    // 5 is the player's own track, so the second set starts at 6.
-    static const wchar_t* files[11] = { nullptr, L"afterglow", L"neon-arcade", L"stardust", L"tidal",
-                                        nullptr, L"sakura", L"night-drive", L"golden-hour",
-                                        L"abyss", L"crimson" };
+    if (track == 10) track = ThemeTrack();
+    if (track < 1 || track > 9 || track == 5) return;
+    // Original ReVita songs shipped in the package (scripts/music/revita.py).
+    // 5 is the player's own track; 10 means "the theme's song".
+    static const wchar_t* files[10] = { nullptr, L"starlight-drive", L"afterlight", L"neon-bloom",
+                                        L"midnight-arcade", nullptr, L"coastline-87", L"pastel-horizon",
+                                        L"cotton-sky", L"ultraviolet" };
     musicPlayer_->IsLooping = true;
     musicPlayer_->Source = ref new Uri(ref new Platform::String(
-        (std::wstring(L"ms-appx:///Assets/Music/") + files[track] + L".wav").c_str()));
+        (std::wstring(L"ms-appx:///Assets/Music/") + files[track] + L".m4a").c_str()));
     playbackStatus_ = L"Playing";
     if (musicStatus_ != nullptr) musicStatus_->Text = playbackStatus_;
     musicPlayer_->Play(); // MediaOpened also starts it once ready.
@@ -6039,9 +6093,10 @@ std::vector<XmbCategory> CatalogShell::XmbCategories() {
         XmbCategory c;
         c.name = L"Music";
         c.glyph = L"\uE8D6";
-        const wchar_t* names[] = { L"No Music", L"Afterglow", L"Neon Arcade", L"Stardust", L"Tidal",
-                                   L"Sakura", L"Night Drive", L"Golden Hour", L"Abyss", L"Crimson" };
-        const int trackOf[] = { 0, 1, 2, 3, 4, 6, 7, 8, 9, 10 };
+        const wchar_t* names[] = { L"Match the Theme", L"Starlight Drive", L"Afterlight", L"Neon Bloom",
+                                   L"Midnight Arcade", L"Coastline '87", L"Pastel Horizon", L"Cotton Sky",
+                                   L"Ultraviolet", L"No Music" };
+        const int trackOf[] = { 10, 1, 2, 3, 4, 6, 7, 8, 9, 0 };
         c.initial = 0;
         for (int slot = 0; slot < 10; ++slot) {
             const int i = trackOf[slot];

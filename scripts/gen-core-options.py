@@ -58,7 +58,7 @@ label_overrides = {
     'vita3k_pkg_mode': 'Run mode',
 }
 info_overrides = {
-    'vita3k_backend_renderer': 'Vulkan: the tested path (Mesa Dozen), and the faster one. OpenGL (experimental): Mesa\'s OpenGL on D3D12. Surface sync works on both. Takes effect when a game starts.',
+    'vita3k_backend_renderer': "Two renderers, both built for this console: Vulkan (through Mesa's Dozen) and OpenGL (Mesa on Direct3D 12). Most games run on either; if one misbehaves, try the other. Surface sync works on both. Takes effect when a game starts.",
     'vita3k_cpu_opt': 'On: the Vita\'s ARM code is recompiled to x64 as it runs, which is what makes games playable. Off: far slower; only for telling a JIT problem from a game problem.',
 }
 
