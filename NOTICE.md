@@ -1,12 +1,14 @@
 # Attribution and project identity
 
-Vita3K-UWP is an independent project maintained at https://github.com/oledz-i/Vita3K-UWP . It is not an official Vita3K release and is not endorsed by Sony or Microsoft.
+ReVita (formerly Vita3K-UWP) is an independent project maintained at https://github.com/oledz-i/Vita3K-UWP . It is not an official Vita3K release and is not endorsed by Sony or Microsoft.
 
-The planned emulation foundation is Vita3K, by the Vita3K team and contributors: https://github.com/Vita3K/Vita3K . The current UWP shell contains no upstream emulation core. `upstream.lock.json` records the reviewed source revision. `COPYING.txt` reproduces its GNU GPL version 2 license text.
+The emulation is Vita3K, by the Vita3K team and contributors: https://github.com/Vita3K/Vita3K , built from WizzardSK's libretro core https://github.com/WizzardSK/vita3k-libretro . The pinned revisions are recorded in the lock files. `COPYING.txt` reproduces its GNU GPL version 2 license text.
 
-Original shell, scripts and geometric repository banner: Copyright (C) 2026 Vita3K-UWP contributors. Licensed under GNU GPL version 2 or, at your option, any later version (SPDX: GPL-2.0-or-later). See COPYING.txt. Upstream source and third-party components retain their own copyright notices and licensing terms when integrated.
+Some game fixes (`scripts/core-patches/`) are ported from nckstwrt's Vita3K-Plus, https://github.com/nckstwrt/Vita3K-Plus , a GPL-2.0-or-later fork of Vita3K; they keep that license and their authors' copyright.
 
-The app icons and splash screen use the upstream Vita3K logo, rasterized from `vita3k/org.vita3k.vita3k.svg` at revision `fa296cc043742692ea3a51ff0a82e5683b201f72`. The original vector is preserved at `docs/assets/vita3k-logo.svg`. The logo belongs to its upstream owners; the project maintainer reports permission to use it for this app. It is not claimed as original Vita3K-UWP artwork. The geometric repository banner remains original placeholder branding. PlayStation, PS Vita, Xbox and other product names remain the trademarks of their respective owners. No Sony or Microsoft endorsement is implied.
+Original shell, scripts and artwork: Copyright (C) 2026 ReVita contributors. Licensed under GNU GPL version 2 or, at your option, any later version (SPDX: GPL-2.0-or-later). See COPYING.txt. Upstream source and third-party components retain their own copyright notices and licensing terms when integrated.
+
+The ReVita name, mark (`branding/revita-mark.svg`), wordmark, app icons, tiles, splash screen and banner are original ReVita artwork. The wordmark is set in Inter Display (SIL Open Font License); the font itself is not distributed. The previous app icons used the upstream Vita3K logo, which is still preserved at `docs/assets/vita3k-logo.svg` and belongs to its upstream owners. PlayStation, PS Vita, Xbox and other product names remain the trademarks of their respective owners. No Sony or Microsoft endorsement is implied. ReVita includes no Sony firmware, keys or games; the in-app firmware download fetches Sony's system software from PlayStation's own update server on the user's console.
 
 ## OnyxEMU/Mesa Dozen Xbox renderer experiment
 
