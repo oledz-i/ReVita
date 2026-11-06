@@ -1345,9 +1345,9 @@ void CatalogShell::UpdateSpotlight(int index) {
 // Moving left and right glides the row so the focused poster stays centred,
 // and its picture fills the screen behind the page.
 namespace {
-constexpr double kFlowCardWidth = 138;
-constexpr double kFlowCardHeight = 188;
-constexpr double kFlowStep = 150;   // card plus gap
+constexpr double kFlowCardWidth = 120;
+constexpr double kFlowCardHeight = 164;
+constexpr double kFlowStep = 132;   // card plus gap
 }
 Button^ CatalogShell::MakeFlowCard(size_t index, int position) {
     auto card = ref new Windows::UI::Xaml::Controls::Button();
@@ -1428,7 +1428,7 @@ void CatalogShell::FocusFlow(int position, bool animate) {
         auto projection = dynamic_cast<PlaneProjection^>(card->Projection);
         auto scale = dynamic_cast<ScaleTransform^>(card->RenderTransform);
         const double turn = d == 0 ? 0.0 : (d < 0 ? 42.0 : -42.0);
-        const double size = d == 0 ? 1.16 : 0.9 - 0.04 * (reach - 1);
+        const double size = d == 0 ? 1.12 : 0.9 - 0.04 * (reach - 1);
         const double depth = d == 0 ? 30.0 : -40.0 * reach;
         if (projection != nullptr) {
             animateTo(projection, L"RotationY", turn);
@@ -1464,8 +1464,8 @@ void CatalogShell::MakeFlow(const std::vector<size_t>& items, size_t focus) {
         if (items[i] == focus) start = static_cast<int>(i);
     }
     flowScroll_ = ref new ScrollViewer();
-    flowScroll_->Height = kFlowCardHeight * 1.3;
-    flowScroll_->Margin = Thickness(-56, 4, -56, 0);   // edge to edge
+    flowScroll_->Height = kFlowCardHeight * 1.22;
+    flowScroll_->Margin = Thickness(-56, 2, -56, 0);   // edge to edge
     flowScroll_->HorizontalScrollBarVisibility = ScrollBarVisibility::Hidden;
     flowScroll_->HorizontalScrollMode = ScrollMode::Enabled;
     flowScroll_->VerticalScrollBarVisibility = ScrollBarVisibility::Disabled;
@@ -1534,29 +1534,29 @@ void CatalogShell::Home() {
 
     // The focused game's name and actions, over its own picture.
     auto spot = Vertical();
-    spot->Margin = Thickness(2, 14, 0, 4);
+    spot->Margin = Thickness(2, 6, 0, 2);
     spot->MaxWidth = 720;
     spot->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Left;
     spotKicker_ = Text(recents.empty() ? L"IN YOUR COLLECTION" : L"JUMP BACK IN", 11, true);
     spotKicker_->CharacterSpacing = 260;
     spotKicker_->Foreground = BrandBrush();
     spot->Children->Append(spotKicker_);
-    spotTitle_ = Text(games_[featured].name, 38, false);
+    spotTitle_ = Text(games_[featured].name, 34, false);
     spotTitle_->FontFamily = ref new Windows::UI::Xaml::Media::FontFamily(L"Bahnschrift");
     spotTitle_->FontWeight = FontWeights::SemiLight;
     spotTitle_->MaxLines = 1;
     spotTitle_->TextWrapping = TextWrapping::NoWrap;
-    spotTitle_->Margin = Thickness(0, 6, 0, 4);
+    spotTitle_->Margin = Thickness(0, 4, 0, 2);
     spot->Children->Append(spotTitle_);
     spotMeta_ = Text(GameMeta(featured), 11, true, true);
     spotMeta_->CharacterSpacing = 90;
     spot->Children->Append(spotMeta_);
     auto controls = ref new StackPanel();
     controls->Orientation = Orientation::Horizontal;
-    controls->Margin = Thickness(0, 16, 0, 0);
+    controls->Margin = Thickness(0, 12, 0, 0);
     auto play = Button(L"Play", true);
     play->MinWidth = 150;
-    play->Height = 46;
+    play->Height = 42;
     play->FontSize = 16;
     play->Background = BrandBrush();
     play->Foreground = Solid(Colors::White);
@@ -1582,14 +1582,14 @@ void CatalogShell::Home() {
     });
     controls->Children->Append(play);
     auto details = Button(L"Game page");
-    details->Height = 46;
+    details->Height = 42;
     details->Click += ref new RoutedEventHandler([this,featured](Platform::Object^, RoutedEventArgs^) {
         selectedGame_ = spotIndex_ >= 0 ? spotIndex_ : static_cast<int>(featured);
         ShowPage(4);
     });
     controls->Children->Append(details);
     auto all = Button(L"Library");
-    all->Height = 46;
+    all->Height = 42;
     all->Click += ref new RoutedEventHandler([this](Platform::Object^, RoutedEventArgs^) { ShowPage(1); });
     controls->Children->Append(all);
     spot->Children->Append(controls);
@@ -1608,14 +1608,6 @@ void CatalogShell::Home() {
     order.insert(order.end(), rest.begin(), rest.end());
     MakeFlow(order, featured);
 
-    wchar_t count[96] = {};
-    swprintf_s(count, L"%zu %s   •   \x2190 \x2192 TO BROWSE   •   A FOR THE GAME PAGE",
-        games_.size(), games_.size() == 1 ? L"GAME" : L"GAMES");
-    auto hint = Text(ref new Platform::String(count), 10, true, true);
-    hint->CharacterSpacing = 120;
-    hint->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Center;
-    hint->Margin = Thickness(0, 6, 0, 0);
-    content_->Children->Append(hint);
 
     // The controller starts on the poster in the middle.
     if (!flowCards_.empty() && flowFocus_ >= 0) {
