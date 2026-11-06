@@ -3244,3 +3244,75 @@ replace(libretro_cpp, '''    read_core_option("vita3k_shader_threads", "4", [](c
         const int threads = static_cast<int>(std::strtol(value, nullptr, 10));
         vita3k_uwp_shader_threads = (threads >= 1 && threads <= 8) ? threads : 6;''')
 print('Threads: shader compilers below normal priority (6 by default), renderer above normal.')
+
+# ── Surface sync reads the picture after the draws that made it ─────────────
+# A scene split by a mid-scene flush or a macroblock change leaves its
+# command buffers waiting in cmdbuffers_to_submit until the scene ends. A
+# transfer that read the surface in between copied it from a command buffer
+# submitted ahead of them, i.e. a picture without those draws (stale or
+# empty). The waiting buffers now go in the same submission, first.
+replace('vita3k/renderer/src/vulkan/surface_cache.cpp', '''            vk::SubmitInfo submit_info{};
+            submit_info.setCommandBuffers(surface_cmd);
+            state.locked_queue_submit(state.general_queue, submit_info, fence);
+            if (state.device.waitForFences(fence, vk::True, 2'000'000'000ULL) == vk::Result::eSuccess) {''', '''            std::vector<vk::CommandBuffer> in_order = std::move(context.cmdbuffers_to_submit);
+            context.cmdbuffers_to_submit.clear();
+            in_order.push_back(surface_cmd);
+            vk::SubmitInfo submit_info{};
+            submit_info.setCommandBuffers(in_order);
+            state.locked_queue_submit(state.general_queue, submit_info, fence);
+            if (state.device.waitForFences(fence, vk::True, 2'000'000'000ULL) == vk::Result::eSuccess) {''')
+print('Surface sync: draws waiting to be submitted go before the copy that reads them.')
+
+# ── OpenGL: the game's saved shader programs are built before it draws ──────
+# Upstream compiles every program in the title's shader cache list while it
+# shows the start image (render_loop's precompile). The core never did, so
+# every OpenGL program was compiled at the draw that first needed it, in the
+# middle of play (each one a link through Mesa's GL-on-D3D12: tens to
+# hundreds of ms on the console). Now, from the second time a game runs, its
+# known programs are compiled before its first frame, in 250 ms slices so the
+# app keeps its loading screen responsive; draws wait until they are done,
+# exactly like upstream.
+replace(libretro_cpp, '''    if (libretro.active_context != RETRO_HW_CONTEXT_VULKAN
+        && libretro.renderer_ready && emuenv.renderer) {
+        emuenv.renderer->should_display = false;
+        renderer::process_batches(*emuenv.renderer, emuenv.renderer->features, emuenv.mem, emuenv.cfg);
+    }''', '''#ifdef VITA3K_UWP
+    static std::string uwp_gl_precompiled_for;
+    static size_t uwp_gl_precompile_next = 0;
+    static std::chrono::steady_clock::time_point uwp_gl_precompile_start{};
+    bool uwp_gl_precompiling = false;
+    if (libretro.active_context != RETRO_HW_CONTEXT_VULKAN && libretro.renderer_ready && emuenv.renderer
+        && libretro.app_started && emuenv.cfg.shader_cache && uwp_gl_precompiled_for != emuenv.io.title_id) {
+        auto &list = emuenv.renderer->shaders_cache_hashs;
+        if (uwp_gl_precompile_next == 0)
+            uwp_gl_precompile_start = std::chrono::steady_clock::now();
+        const auto slice_end = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+        while (uwp_gl_precompile_next < list.size() && std::chrono::steady_clock::now() < slice_end) {
+            try {
+                emuenv.renderer->precompile_shader(list[uwp_gl_precompile_next]);
+            } catch (...) {
+            }
+            ++uwp_gl_precompile_next;
+        }
+        if (uwp_gl_precompile_next >= list.size()) {
+            if (!list.empty()) {
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - uwp_gl_precompile_start).count();
+                lr_log(RETRO_LOG_INFO, "OpenGL: %zu saved shader programs compiled before the game's first frame in %lld ms\\n",
+                    list.size(), static_cast<long long>(ms));
+            }
+            uwp_gl_precompiled_for = emuenv.io.title_id;
+            uwp_gl_precompile_next = 0;
+        } else {
+            uwp_gl_precompiling = true;
+        }
+    }
+    if (libretro.active_context != RETRO_HW_CONTEXT_VULKAN
+        && libretro.renderer_ready && emuenv.renderer && !uwp_gl_precompiling) {
+#else
+    if (libretro.active_context != RETRO_HW_CONTEXT_VULKAN
+        && libretro.renderer_ready && emuenv.renderer) {
+#endif
+        emuenv.renderer->should_display = false;
+        renderer::process_batches(*emuenv.renderer, emuenv.renderer->features, emuenv.mem, emuenv.cfg);
+    }''')
+print('OpenGL: saved shader programs compiled before the first frame, as upstream does.')
