@@ -2174,6 +2174,18 @@ index 9cab4a01..512107c6 100644
      } else
          return FileNotFound;
      // Set self name from self path, can contain folder, get file name only
+diff --git a/vita3k/libretro/CMakeLists.txt b/vita3k/libretro/CMakeLists.txt
+index c975ca1b..e3e321ee 100644
+--- a/vita3k/libretro/CMakeLists.txt
++++ b/vita3k/libretro/CMakeLists.txt
+@@ -22,6 +22,7 @@ target_link_libraries(vita3k_libretro PRIVATE
+ 	app
+ 	audio
+ 	camera
++	cheat
+ 	config
+ 	ctrl
+ 	compat
 diff --git a/vita3k/libretro/libretro_vita3k.cpp b/vita3k/libretro/libretro_vita3k.cpp
 index 3d84aa50..d078d8f7 100644
 --- a/vita3k/libretro/libretro_vita3k.cpp
