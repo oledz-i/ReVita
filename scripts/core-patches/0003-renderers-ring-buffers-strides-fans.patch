@@ -42,10 +42,20 @@ index f009a7f5..265c9068 100644
  
  public:
 diff --git a/vita3k/renderer/src/gl/draw.cpp b/vita3k/renderer/src/gl/draw.cpp
-index 65979730..4b82acca 100644
+index 65979730..4d9d13f6 100644
 --- a/vita3k/renderer/src/gl/draw.cpp
 +++ b/vita3k/renderer/src/gl/draw.cpp
-@@ -77,7 +77,7 @@ static GLuint uwp_color_attachment_copy(GLuint attachment) {
+@@ -60,6 +60,9 @@ static GLenum translate_primitive(SceGxmPrimitiveType primType) {
+ // size and format, for a shader that reads the frame's colour as an image:
+ // Direct3D 12 cannot bind the render target itself as one while drawing to
+ // it. A few copies are kept, one per size and format.
++// set by any draw that writes the target without reading it, and at a new scene
++bool uwp_render_target_dirty = true;
++
+ static GLuint uwp_color_attachment_copy(GLuint attachment) {
+     struct Copy {
+         GLuint texture = 0;
+@@ -77,7 +80,7 @@ static GLuint uwp_color_attachment_copy(GLuint attachment) {
      glGetTextureLevelParameteriv(attachment, 0, GL_TEXTURE_WIDTH, &width);
      glGetTextureLevelParameteriv(attachment, 0, GL_TEXTURE_HEIGHT, &height);
      if (width <= 0 || height <= 0 || format == 0)
@@ -54,7 +64,7 @@ index 65979730..4b82acca 100644
      Copy *copy = nullptr;
      for (auto &c : copies) {
          if (c.texture && c.format == format && c.width == width && c.height == height) {
-@@ -178,8 +178,13 @@ void draw(GLState &renderer, GLContext &context, const FeatureState &features, S
+@@ -178,8 +181,13 @@ void draw(GLState &renderer, GLContext &context, const FeatureState &features, S
      }
  
      if (!program_id) {
@@ -70,7 +80,38 @@ index 65979730..4b82acca 100644
      }
  
      glUseProgram(program_id);
-@@ -270,7 +275,8 @@ void draw(GLState &renderer, GLContext &context, const FeatureState &features, S
+@@ -196,7 +204,18 @@ void draw(GLState &renderer, GLContext &context, const FeatureState &features, S
+         (void)use_raw_image;
+         (void)surface_format;
+         glActiveTexture(GL_TEXTURE0 + shader::UWP_COLOR_ATTACHMENT_TEXTURE_UNIT);
+-        glBindTexture(GL_TEXTURE_2D, uwp_color_attachment_copy(context.current_color_attachment));
++        static GLuint copied_from = 0;
++        static GLuint copy_texture = 0;
++        static int reuses_left = 0;
++        if (uwp_render_target_dirty || copied_from != context.current_color_attachment || reuses_left <= 0 || !copy_texture) {
++            copy_texture = uwp_color_attachment_copy(context.current_color_attachment);
++            copied_from = context.current_color_attachment;
++            reuses_left = 32;
++            uwp_render_target_dirty = false;
++        } else {
++            reuses_left--;
++        }
++        glBindTexture(GL_TEXTURE_2D, copy_texture);
+ #else
+         if (use_raw_image) {
+             glBindImageTexture(shader::COLOR_ATTACHMENT_RAW_TEXTURE_SLOT_IMAGE, context.current_color_attachment, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA16UI);
+@@ -208,6 +227,10 @@ void draw(GLState &renderer, GLContext &context, const FeatureState &features, S
+ #endif
+     }
+ 
++#ifdef VITA3K_UWP
++    if (!(fragment_program_gxp.is_frag_color_used() && features.is_programmable_blending_need_to_bind_color_attachment()))
++        uwp_render_target_dirty = true;
++#endif
+     if (renderer.features.use_mask_bit)
+         glBindImageTexture(shader::MASK_TEXTURE_SLOT_IMAGE, context.render_target->masktexture[0], 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA8);
+ 
+@@ -270,7 +293,8 @@ void draw(GLState &renderer, GLContext &context, const FeatureState &features, S
      }
  
      // Upload vertex stream
@@ -80,6 +121,30 @@ index 65979730..4b82acca 100644
  
      // Upload index data.
      const GLsizeiptr index_size = (format == SCE_GXM_INDEX_FORMAT_U16) ? 2 : 4;
+diff --git a/vita3k/renderer/src/gl/renderer.cpp b/vita3k/renderer/src/gl/renderer.cpp
+index 9d4320e4..585edca2 100644
+--- a/vita3k/renderer/src/gl/renderer.cpp
++++ b/vita3k/renderer/src/gl/renderer.cpp
+@@ -45,6 +45,9 @@
+ #include <string_view>
+ 
+ namespace renderer::gl {
++#ifdef VITA3K_UWP
++extern bool uwp_render_target_dirty; // draw.cpp
++#endif
+ 
+ GLContext::GLContext()
+     : vertex_stream_ring_buffer(GL_ARRAY_BUFFER, MiB(128))
+@@ -405,6 +408,9 @@ void set_context(GLState &state, GLContext &context, const MemState &mem, const
+     context.self_sampling_indices.clear();
+ 
+     glBindFramebuffer(GL_FRAMEBUFFER, context.current_framebuffer);
++#ifdef VITA3K_UWP
++    uwp_render_target_dirty = true; // a new scene: the blending copy starts fresh
++#endif
+ 
+     if (context.record.region_clip_mode != SCE_GXM_REGION_CLIP_NONE) {
+         glDisable(GL_SCISSOR_TEST);
 diff --git a/vita3k/renderer/src/gl/ring_buffer.cpp b/vita3k/renderer/src/gl/ring_buffer.cpp
 index 306044b0..7d1cd491 100644
 --- a/vita3k/renderer/src/gl/ring_buffer.cpp
