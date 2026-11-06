@@ -64,6 +64,8 @@ if ($LASTEXITCODE -ne 0) { throw 'Pinned filesystem port failed' }
 if ($LASTEXITCODE -ne 0) { throw 'Checked config/codec/io port adapter failed' }
 & python "$root/scripts/patch-vita3k-uwp-round3.py" "$upstream" 2>&1 | Tee-Object -FilePath (Join-Path $out 'firmware-install-port.log')
 if ($LASTEXITCODE -ne 0) { throw 'Firmware installation hardening failed' }
+& python "$root/scripts/apply-core-patches.py" "$upstream" 2>&1 | Tee-Object -FilePath (Join-Path $out 'core-patches.log')
+if ($LASTEXITCODE -ne 0) { throw 'Core game-fix patches did not apply' }
 & "$root/scripts/test-uwp-path-format.ps1"
 $vcpkg = "C:/vcpkg/scripts/buildsystems/vcpkg.cmake"
 if (!(Test-Path $vcpkg)) { throw "GitHub Windows runner does not include $vcpkg" }

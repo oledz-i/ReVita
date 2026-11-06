@@ -152,6 +152,15 @@ private:
     Windows::UI::Xaml::Controls::TextBlock^ spotKicker_ = nullptr;
     Windows::UI::Xaml::Controls::TextBlock^ spotTitle_ = nullptr;
     Windows::UI::Xaml::Controls::TextBlock^ spotMeta_ = nullptr;
+    // ReVita home: the cover flow (cards turn toward the focused one)
+    std::vector<Windows::UI::Xaml::Controls::Button^> flowCards_;
+    std::vector<size_t> flowItems_;
+    Windows::UI::Xaml::Controls::ScrollViewer^ flowScroll_ = nullptr;
+    Windows::UI::Xaml::Controls::StackPanel^ flowRow_ = nullptr;
+    int flowFocus_ = -1;
+    void MakeFlow(const std::vector<size_t>& items, size_t focus);
+    void FocusFlow(int position, bool animate);
+    Windows::UI::Xaml::Controls::Button^ MakeFlowCard(size_t index, int position);
     int spotIndex_ = -1;
     int spotVeilTheme_ = -1;
     std::wstring spotArtUri_;

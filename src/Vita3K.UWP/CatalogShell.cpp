@@ -90,6 +90,21 @@ Color Alpha(unsigned a, unsigned r, unsigned g, unsigned b) {
     return ColorHelper::FromArgb(static_cast<unsigned char>(a), static_cast<unsigned char>(r),
         static_cast<unsigned char>(g), static_cast<unsigned char>(b));
 }
+// ReVita's ribbon: cyan, violet, pink (the mark's own gradient).
+LinearGradientBrush^ BrandBrush(double alpha = 1.0, bool vertical = false) {
+    auto brush = ref new LinearGradientBrush();
+    brush->StartPoint = Point(0, vertical ? 0.0 : 0.5);
+    brush->EndPoint = Point(vertical ? 0.0 : 1.0, vertical ? 1.0 : 0.5);
+    const unsigned a = static_cast<unsigned>(std::max(0.0, std::min(1.0, alpha)) * 255.0);
+    const unsigned stops[][4] = { { 47, 230, 255, 0 }, { 124, 92, 255, 48 }, { 255, 79, 180, 100 } };
+    for (const auto& c : stops) {
+        auto stop = ref new GradientStop();
+        stop->Color = Alpha(a, c[0], c[1], c[2]);
+        stop->Offset = c[3] / 100.0;
+        brush->GradientStops->Append(stop);
+    }
+    return brush;
+}
 VariableSizedWrapGrid^ ActionRow(double itemWidth) {
     // Wraps onto a second line instead of running off the edge of the screen.
     auto row = ref new VariableSizedWrapGrid();
@@ -198,7 +213,7 @@ Color CatalogShell::Bg() const {
     case 9: return RgbColor(4, 12, 22);       // Abyss: deep sea
     case 10: return RgbColor(16, 6, 8);       // Crimson: red and black
     case 11: return RgbColor(14, 15, 20);     // Prism: graphite glass
-    default: return RgbColor(9, 10, 13);      // Onyx: charcoal
+    default: return RgbColor(8, 7, 16);       // ReVita: violet night
     }
 }
 Color CatalogShell::Card() const {
@@ -215,7 +230,7 @@ Color CatalogShell::Card() const {
     case 9: return Alpha(206, 12, 28, 44);
     case 10: return Alpha(206, 36, 14, 18);
     case 11: return Alpha(206, 30, 32, 42);
-    default: return Alpha(206, 24, 25, 30);
+    default: return Alpha(206, 22, 19, 40);
     }
 }
 Color CatalogShell::Accent() const {
@@ -231,7 +246,7 @@ Color CatalogShell::Accent() const {
     case 9: return RgbColor(64, 200, 255);
     case 10: return RgbColor(255, 64, 82);
     case 11: return RgbColor(196, 210, 255);
-    default: return RgbColor(239, 69, 105);
+    default: return RgbColor(139, 108, 255);
     }
 }
 Color CatalogShell::Glow() const {
@@ -247,7 +262,7 @@ Color CatalogShell::Glow() const {
     case 9: return RgbColor(10, 62, 104);
     case 10: return RgbColor(110, 14, 24);
     case 11: return RgbColor(60, 66, 96);
-    default: return RgbColor(99, 24, 49);
+    default: return RgbColor(58, 30, 112);
     }
 }
 Color CatalogShell::Muted() const {
@@ -279,7 +294,7 @@ TextBlock^ CatalogShell::Text(Platform::String^ value, double size, bool bold, b
     auto t = ref new TextBlock();
     t->Text = value;
     t->FontSize = size;
-    t->FontFamily = ref new Windows::UI::Xaml::Media::FontFamily(L"Segoe UI");
+    t->FontFamily = ref new Windows::UI::Xaml::Media::FontFamily(size >= 28 ? L"Bahnschrift" : L"Segoe UI");
     t->FontWeight = bold ? FontWeights::SemiBold : FontWeights::Normal;
     t->Foreground = Solid(muted ? Muted() : Colors::White);
     t->TextWrapping = TextWrapping::Wrap;
@@ -418,11 +433,11 @@ StackPanel^ CatalogShell::Vertical(double spacing) {
 }
 Border^ CatalogShell::Panel(UIElement^ child, double pad) {
     auto border = ref new Border();
-    border->CornerRadius = Windows::UI::Xaml::CornerRadius(14);
+    border->CornerRadius = Windows::UI::Xaml::CornerRadius(18);
     border->Padding = Thickness(pad);
     border->Margin = Thickness(0, 8, 0, 10);
     border->Background = Solid(Card());
-    border->BorderBrush = Solid(Alpha(20, 255, 255, 255));
+    border->BorderBrush = BrandBrush(0.22);
     border->BorderThickness = Thickness(1);
     border->Child = child;
     return border;
@@ -518,10 +533,11 @@ CatalogShell::CatalogShell() {
     root_->RowDefinitions->Append(mainRow);
     root_->RowDefinitions->Append(footerRow);
 
+    // ReVita: a header (mark, wordmark, time) and a floating dock with the
+    // tabs, both over the page. The layer itself has no background, so the
+    // page under its empty middle still takes input.
     navigation_ = ref new Border();
-    navigation_->Background = Solid(RailColor());
-    navigation_->Height = 78;
-    navigation_->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Top;
+    navigation_->Background = nullptr;
     Grid::SetColumn(navigation_, 1);
     Grid::SetRow(navigation_, 0);
 
@@ -530,9 +546,9 @@ CatalogShell::CatalogShell() {
     scroll->VerticalScrollBarVisibility = ScrollBarVisibility::Hidden;
     scroll->HorizontalScrollBarVisibility = ScrollBarVisibility::Disabled;
     content_ = Vertical();
-    content_->Margin = Thickness(58, 12, 58, 24);
+    content_->Margin = Thickness(56, 10, 56, 118);
     scroll->Content = content_;
-    scroll->Margin = Thickness(0, 78, 0, 0);
+    scroll->Margin = Thickness(0, 70, 0, 0);
     Grid::SetColumn(scroll, 1);
     Grid::SetRow(scroll, 0);
     root_->Children->Append(scroll);
@@ -543,7 +559,7 @@ CatalogShell::CatalogShell() {
     statusBar_ = statusBar;
     statusBar->Background = Solid(Bg());
     statusBar->Padding = Thickness(32, 3, 48, 2);
-    status_ = Text(L"VITA3K  /  ALPHA", 10, false, true);
+    status_ = Text(L"REVITA  /  BETA  /  POWERED BY VITA3K", 10, false, true);
     status_->CharacterSpacing = 80;
     status_->TextTrimming = TextTrimming::CharacterEllipsis;
     status_->TextWrapping = TextWrapping::NoWrap;
@@ -740,50 +756,132 @@ CatalogShell::CatalogShell() {
     });
 }
 void CatalogShell::BuildNavigation() {
-    // The top bar: the mark, the tabs (LB and RB move between them), the time.
-    auto bar = ref new Grid();
-    bar->Margin = Thickness(58, 0, 58, 0);
-    auto c0 = ref new ColumnDefinition(); c0->Width = GridLength(1, GridUnitType::Auto);
-    auto c1 = ref new ColumnDefinition(); c1->Width = GridLength(1, GridUnitType::Star);
-    auto c2 = ref new ColumnDefinition(); c2->Width = GridLength(1, GridUnitType::Auto);
-    bar->ColumnDefinitions->Append(c0);
-    bar->ColumnDefinitions->Append(c1);
-    bar->ColumnDefinitions->Append(c2);
+    // ReVita's frame: the mark and the time float at the top, the tabs in a
+    // glass dock at the bottom (LB and RB move between them). Soft veils fade
+    // the page out under both, so scrolled content slides behind the glass.
+    auto layer = ref new Grid();
+    const Color page = Bg();
 
+    auto topVeil = ref new Border();
+    topVeil->Height = 96;
+    topVeil->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Top;
+    topVeil->IsHitTestVisible = false;
+    {
+        auto down = ref new LinearGradientBrush();
+        down->StartPoint = Point(0.5, 0);
+        down->EndPoint = Point(0.5, 1);
+        const double stops[][2] = { { 0.0, 235 }, { 0.55, 150 }, { 1.0, 0 } };
+        for (const auto& st : stops) {
+            auto stop = ref new GradientStop();
+            stop->Offset = st[0];
+            stop->Color = Alpha(static_cast<unsigned>(st[1]), page.R, page.G, page.B);
+            down->GradientStops->Append(stop);
+        }
+        topVeil->Background = down;
+    }
+    layer->Children->Append(topVeil);
+
+    auto bottomVeil = ref new Border();
+    bottomVeil->Height = 128;
+    bottomVeil->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Bottom;
+    bottomVeil->IsHitTestVisible = false;
+    {
+        auto up = ref new LinearGradientBrush();
+        up->StartPoint = Point(0.5, 0);
+        up->EndPoint = Point(0.5, 1);
+        const double stops[][2] = { { 0.0, 0 }, { 0.5, 150 }, { 1.0, 240 } };
+        for (const auto& st : stops) {
+            auto stop = ref new GradientStop();
+            stop->Offset = st[0];
+            stop->Color = Alpha(static_cast<unsigned>(st[1]), page.R, page.G, page.B);
+            up->GradientStops->Append(stop);
+        }
+        bottomVeil->Background = up;
+    }
+    layer->Children->Append(bottomVeil);
+
+    // The header: mark + wordmark, and the time.
+    auto header = ref new Grid();
+    header->Height = 70;
+    header->Margin = Thickness(52, 0, 56, 0);
+    header->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Top;
+    header->IsHitTestVisible = false;
     auto brand = ref new StackPanel();
     brand->Orientation = Orientation::Horizontal;
     brand->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
-    auto appLogo = ref new Image();
-    appLogo->Width = 34;
-    appLogo->Height = 34;
-    appLogo->Stretch = Stretch::Uniform;
-    appLogo->Source = ref new BitmapImage(ref new Uri(L"ms-appx:///Assets/Square150x150Logo.png"));
-    brand->Children->Append(appLogo);
-    auto word = Text(L"vita3k", 20, true);
-    word->FontFamily = ref new Windows::UI::Xaml::Media::FontFamily(L"Bahnschrift");
+    auto mark = ref new Image();
+    mark->Width = 36;
+    mark->Height = 36;
+    mark->Stretch = Stretch::Uniform;
+    mark->Source = ref new BitmapImage(ref new Uri(L"ms-appx:///Assets/ReVitaMark.png"));
+    brand->Children->Append(mark);
+    auto word = ref new Image();
+    word->Height = 22;
+    word->Stretch = Stretch::Uniform;
+    word->Margin = Thickness(10, 1, 0, 0);
     word->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
-    word->Margin = Thickness(10, 0, 34, 2);
+    word->Source = ref new BitmapImage(ref new Uri(L"ms-appx:///Assets/ReVitaWordmark.png"));
     brand->Children->Append(word);
-    bar->Children->Append(brand);
+    auto badge = ref new Border();
+    badge->CornerRadius = Windows::UI::Xaml::CornerRadius(8);
+    badge->Padding = Thickness(7, 1, 7, 2);
+    badge->Margin = Thickness(10, 2, 0, 0);
+    badge->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
+    badge->BorderBrush = BrandBrush(0.9);
+    badge->BorderThickness = Thickness(1);
+    auto badgeText = Text(L"BETA", 9, true);
+    badgeText->CharacterSpacing = 160;
+    badge->Child = badgeText;
+    brand->Children->Append(badge);
+    header->Children->Append(brand);
 
+    auto time = ref new StackPanel();
+    time->Orientation = Orientation::Horizontal;
+    time->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
+    time->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Right;
+    topDate_ = Text(L"", 10, true, true);
+    topDate_->CharacterSpacing = 140;
+    topDate_->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
+    topDate_->TextWrapping = TextWrapping::NoWrap;
+    topDate_->Margin = Thickness(0, 2, 12, 0);
+    time->Children->Append(topDate_);
+    topClock_ = Text(L"", 22, false);
+    topClock_->FontWeight = FontWeights::Light;
+    topClock_->FontFamily = ref new Windows::UI::Xaml::Media::FontFamily(L"Bahnschrift");
+    topClock_->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
+    topClock_->TextWrapping = TextWrapping::NoWrap;
+    time->Children->Append(topClock_);
+    header->Children->Append(time);
+    layer->Children->Append(header);
+
+    // The dock.
+    auto dock = ref new Border();
+    dock->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Center;
+    dock->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Bottom;
+    dock->Margin = Thickness(0, 0, 0, 16);
+    dock->Padding = Thickness(8, 6, 8, 6);
+    dock->CornerRadius = Windows::UI::Xaml::CornerRadius(30);
+    {
+        const Color card = Card();
+        dock->Background = Solid(Alpha(232, card.R, card.G, card.B));
+    }
+    dock->BorderBrush = BrandBrush(0.55);
+    dock->BorderThickness = Thickness(1);
     auto tabs = ref new StackPanel();
     tabs->Orientation = Orientation::Horizontal;
-    tabs->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
-    Grid::SetColumn(tabs, 1);
     auto bumper = [this](const wchar_t* label) {
         auto hint = ref new Border();
-        hint->CornerRadius = Windows::UI::Xaml::CornerRadius(6);
+        hint->CornerRadius = Windows::UI::Xaml::CornerRadius(7);
         hint->Padding = Thickness(7, 2, 7, 3);
-        hint->Margin = Thickness(4, 0, 8, 0);
+        hint->Margin = Thickness(6, 0, 6, 0);
         hint->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
-        hint->BorderBrush = Solid(Alpha(70, 255, 255, 255));
-        hint->BorderThickness = Thickness(1);
-        auto text = Text(ref new Platform::String(label), 10, true, true);
+        hint->Background = Solid(Alpha(26, 255, 255, 255));
+        auto text = Text(ref new Platform::String(label), 9, true, true);
         hint->Child = text;
         return hint;
     };
     tabs->Children->Append(bumper(L"LB"));
-    const wchar_t* glyphs[] = {L"", L"", L"", L""};
+    const wchar_t* glyphs[] = {L"\xE80F", L"\xE8F1", L"\xE713", L"\xE90F"};
     const wchar_t* labels[] = {L"Home", L"Library", L"Settings", L"Tools"};
     // Tools holds developer diagnostics. Release builds (VITA3K_RELEASE_BUILD)
     // leave it out; development builds keep it. See docs/RELEASING.md.
@@ -795,25 +893,28 @@ void CatalogShell::BuildNavigation() {
     for (int i = 0; i < visibleTabs; ++i) {
         const bool selected = page_ == i || (i == 1 && page_ == 4);
         auto nav = ref new Windows::UI::Xaml::Controls::Button();
-        nav->Margin = Thickness(0, 0, 6, 0);
-        nav->Height = 42;
-        nav->Padding = Thickness(16, 0, 18, 0);
+        nav->Margin = Thickness(2, 0, 2, 0);
+        nav->Height = 46;
+        nav->Padding = Thickness(selected ? 20 : 15, 0, selected ? 22 : 15, 0);
         nav->BorderThickness = Thickness(0);
-        nav->Background = Solid(selected ? Alpha(46, Accent().R, Accent().G, Accent().B) : Colors::Transparent);
-        Skin(nav, 21);
+        nav->Background = selected ? static_cast<Brush^>(BrandBrush(0.92)) : Solid(Colors::Transparent);
+        Skin(nav, 23, selected);
         Windows::UI::Xaml::Automation::AutomationProperties::SetName(nav, ref new Platform::String(labels[i]));
         auto inside = ref new StackPanel();
         inside->Orientation = Orientation::Horizontal;
-        auto symbol = Text(ref new Platform::String(glyphs[i]), 15, false);
+        auto symbol = Text(ref new Platform::String(glyphs[i]), 16, false);
         symbol->FontFamily = ref new Windows::UI::Xaml::Media::FontFamily(L"Segoe MDL2 Assets");
-        symbol->Foreground = Solid(selected ? Accent() : RgbColor(170, 174, 184));
+        symbol->Foreground = Solid(selected ? Colors::White : RgbColor(160, 162, 178));
         symbol->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
-        symbol->Margin = Thickness(0, 1, 9, 0);
+        symbol->Margin = Thickness(0, 1, selected ? 9 : 0, 0);
         inside->Children->Append(symbol);
-        auto name = Text(ref new Platform::String(labels[i]), 14, selected);
-        name->Foreground = Solid(selected ? Colors::White : RgbColor(186, 189, 198));
-        name->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
-        inside->Children->Append(name);
+        if (selected) {
+            // only the current tab spells its name; the others are icons
+            auto name = Text(ref new Platform::String(labels[i]), 14, true);
+            name->Foreground = Solid(Colors::White);
+            name->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
+            inside->Children->Append(name);
+        }
         nav->Content = inside;
         nav->GotFocus += ref new RoutedEventHandler([this](Platform::Object^, RoutedEventArgs^) {
             PlayCue(0);
@@ -826,26 +927,10 @@ void CatalogShell::BuildNavigation() {
         tabs->Children->Append(nav);
     }
     tabs->Children->Append(bumper(L"RB"));
-    bar->Children->Append(tabs);
+    dock->Child = tabs;
+    layer->Children->Append(dock);
 
-    auto time = ref new StackPanel();
-    time->Orientation = Orientation::Vertical;
-    time->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
-    time->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Right;
-    Grid::SetColumn(time, 2);
-    topClock_ = Text(L"", 20, false);
-    topClock_->FontWeight = FontWeights::Light;
-    topClock_->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Right;
-    topClock_->TextWrapping = TextWrapping::NoWrap;
-    time->Children->Append(topClock_);
-    topDate_ = Text(L"", 10, true, true);
-    topDate_->CharacterSpacing = 120;
-    topDate_->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Right;
-    topDate_->TextWrapping = TextWrapping::NoWrap;
-    time->Children->Append(topDate_);
-    bar->Children->Append(time);
-
-    navigation_->Child = bar;
+    navigation_->Child = layer;
     UpdateClock();
 }
 void CatalogShell::SwitchTab(int delta) {
@@ -877,7 +962,7 @@ void CatalogShell::Banner(Platform::String^ eyebrow, Platform::String^ headline,
     body->Margin = Thickness(2, 0, 0, 16);
     auto tag = Text(eyebrow, 10, true);
     tag->CharacterSpacing = 220;
-    tag->Foreground = Solid(Accent());
+    tag->Foreground = BrandBrush();
     body->Children->Append(tag);
     auto title = Text(headline, 32, false);
     title->FontWeight = FontWeights::Light;
@@ -964,62 +1049,79 @@ BitmapImage^ CatalogShell::CachedBitmap(Platform::String^ uri, int decodeWidth) 
 }
 
 Button^ CatalogShell::MakeTile(size_t index) {
+    // ReVita poster: the art edge to edge, the name over a dark fade at its
+    // foot, a ribbon of the brand gradient along the top.
     auto tile = ref new Windows::UI::Xaml::Controls::Button();
-    tile->Width = 146;
-    tile->Height = 236;
-    tile->Margin = Thickness(0, 4, 10, 8);
-    tile->Padding = Thickness(8);
+    tile->Width = 134;
+    tile->Height = 190;
+    tile->Margin = Thickness(0, 4, 12, 10);
+    tile->Padding = Thickness(0);
     tile->BorderThickness = Thickness(0);
     tile->Background = Solid(Colors::Transparent);
-    tile->HorizontalContentAlignment = Windows::UI::Xaml::HorizontalAlignment::Left;
-    tile->VerticalContentAlignment = Windows::UI::Xaml::VerticalAlignment::Top;
+    tile->HorizontalContentAlignment = Windows::UI::Xaml::HorizontalAlignment::Stretch;
+    tile->VerticalContentAlignment = Windows::UI::Xaml::VerticalAlignment::Stretch;
     Skin(tile, 14);
+    Windows::UI::Xaml::Automation::AutomationProperties::SetName(tile, games_[index].name);
 
-    auto card = Vertical();
-    card->Width = 130;
     auto cover = ref new Border();
-    cover->Width = 130;
-    cover->Height = 174;
-    cover->CornerRadius = Windows::UI::Xaml::CornerRadius(10);
+    cover->CornerRadius = Windows::UI::Xaml::CornerRadius(14);
+    cover->BorderBrush = Solid(Alpha(40, 255, 255, 255));
+    cover->BorderThickness = Thickness(1);
     ConfigureCover(cover, index);
 
     auto art = ref new Grid();
-    auto systemMark = Text(L"PS VITA", 9, true);
-    systemMark->CharacterSpacing = 130;
-    systemMark->Foreground = Solid(Alpha(210, 255, 255, 255));
-    systemMark->Margin = Thickness(10, 10, 0, 0);
-    systemMark->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Top;
-    art->Children->Append(systemMark);
-    if (ArtworkUri(index)->IsEmpty() && games_[index].icon == nullptr) {
-        auto v = Text(L"V", 88, true);
-        v->FontFamily = ref new Windows::UI::Xaml::Media::FontFamily(L"Bahnschrift");
-        v->Foreground = Solid(Colors::White);
-        v->Opacity = 0.14;
-        v->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Center;
-        v->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
-        art->Children->Append(v);
-        auto coverCaption = Text(games_[index].name, 12, true);
-        coverCaption->Foreground = Solid(Colors::White);
-        coverCaption->MaxHeight = 44;
-        coverCaption->Margin = Thickness(10, 0, 10, 12);
-        coverCaption->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Bottom;
-        art->Children->Append(coverCaption);
+    const bool bare = ArtworkUri(index)->IsEmpty() && games_[index].icon == nullptr;
+    if (bare) {
+        auto mark = ref new Image();
+        mark->Source = ref new BitmapImage(ref new Uri(L"ms-appx:///Assets/ReVitaMark.png"));
+        mark->Width = 56;
+        mark->Height = 56;
+        mark->Opacity = 0.3;
+        mark->Margin = Thickness(0, 0, 0, 30);
+        art->Children->Append(mark);
     }
-    cover->Child = art;
-    card->Children->Append(cover);
+    auto ribbon = ref new Border();
+    ribbon->Height = 3;
+    ribbon->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Top;
+    ribbon->Margin = Thickness(14, 0, 14, 0);
+    ribbon->CornerRadius = Windows::UI::Xaml::CornerRadius(0, 0, 3, 3);
+    ribbon->Background = BrandBrush(0.9);
+    art->Children->Append(ribbon);
+    auto foot = ref new Border();
+    foot->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Bottom;
+    foot->CornerRadius = Windows::UI::Xaml::CornerRadius(0, 0, 13, 13);
+    foot->Padding = Thickness(10, 26, 10, 9);
+    {
+        auto fade = ref new LinearGradientBrush();
+        fade->StartPoint = Point(0.5, 0);
+        fade->EndPoint = Point(0.5, 1);
+        auto top = ref new GradientStop();
+        top->Color = Alpha(0, 0, 0, 0);
+        top->Offset = 0;
+        auto bottom = ref new GradientStop();
+        bottom->Color = Alpha(225, 6, 5, 12);
+        bottom->Offset = 0.7;
+        fade->GradientStops->Append(top);
+        fade->GradientStops->Append(bottom);
+        foot->Background = fade;
+    }
+    auto words = ref new StackPanel();
     auto title = Text(games_[index].name, 12, true);
-    title->MaxHeight = 34;
-    title->Margin = Thickness(2, 9, 0, 1);
-    card->Children->Append(title);
-    auto kind = Text(games_[index].sourceType, 10, false, true);
+    title->MaxLines = 2;
+    title->LineHeight = 15;
+    words->Children->Append(title);
+    auto kind = Text(games_[index].sourceType, 9, false, true);
     kind->CharacterSpacing = 70;
-    kind->Margin = Thickness(2, 1, 0, 0);
     kind->MaxLines = 1;
     kind->TextWrapping = TextWrapping::NoWrap;
-    card->Children->Append(kind);
-    tile->Content = card;
+    kind->Margin = Thickness(0, 2, 0, 0);
+    words->Children->Append(kind);
+    foot->Child = words;
+    art->Children->Append(foot);
+    cover->Child = art;
+    tile->Content = cover;
+
     // Scale, ring and press feedback come from the shared button template.
-    // On Home, the focused game takes the spotlight behind the page.
     tile->GotFocus += ref new RoutedEventHandler([this,index](Platform::Object^, RoutedEventArgs^) {
         PlayCue(0);
         if (page_ == 0) UpdateSpotlight(static_cast<int>(index));
@@ -1047,7 +1149,7 @@ void CatalogShell::MakeShelf(Platform::String^ heading,
         Reveal(tile, 140.0 + 38.0 * std::min(order++, 9u), 16);
     }
     auto scroller = ref new ScrollViewer();
-    scroller->Height = 256;
+    scroller->Height = 212;
     scroller->HorizontalScrollBarVisibility = ScrollBarVisibility::Hidden;
     scroller->HorizontalScrollMode = ScrollMode::Enabled;
     scroller->VerticalScrollBarVisibility = ScrollBarVisibility::Disabled;
@@ -1059,7 +1161,7 @@ void CatalogShell::MakeShelf(Platform::String^ heading,
             if (event->IsIntermediate) return;
             auto view = dynamic_cast<ScrollViewer^>(sender);
             if (view == nullptr) return;
-            const int cell = static_cast<int>(view->HorizontalOffset / 156.0);
+            const int cell = static_cast<int>(view->HorizontalOffset / 146.0);
             if (cell != *lastCell) {
                 *lastCell = cell;
                 PlayCue(3);
@@ -1143,8 +1245,8 @@ void CatalogShell::MakeGrid(const std::vector<size_t>& items, StackPanel^ target
     // The whole library at once, in rows that wrap with the screen.
     auto grid = ref new VariableSizedWrapGrid();
     grid->Orientation = Orientation::Horizontal;
-    grid->ItemWidth = 156;
-    grid->ItemHeight = 250;
+    grid->ItemWidth = 146;
+    grid->ItemHeight = 206;
     grid->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Left;
     unsigned order = 0;
     for (const auto index : items) {
@@ -1237,6 +1339,151 @@ void CatalogShell::UpdateSpotlight(int index) {
     board->Children->Append(fade);
     board->Begin();
 }
+// ── ReVita Home: the cover flow ─────────────────────────────────────────────
+// Every game as a poster in one row. The focused poster faces you, larger;
+// the others turn toward it and step back, like a shelf seen from its middle.
+// Moving left and right glides the row so the focused poster stays centred,
+// and its picture fills the screen behind the page.
+namespace {
+constexpr double kFlowCardWidth = 138;
+constexpr double kFlowCardHeight = 188;
+constexpr double kFlowStep = 150;   // card plus gap
+}
+Button^ CatalogShell::MakeFlowCard(size_t index, int position) {
+    auto card = ref new Windows::UI::Xaml::Controls::Button();
+    card->Width = kFlowCardWidth;
+    card->Height = kFlowCardHeight;
+    card->Margin = Thickness((kFlowStep - kFlowCardWidth) / 2, 0, (kFlowStep - kFlowCardWidth) / 2, 0);
+    card->Padding = Thickness(0);
+    card->BorderThickness = Thickness(0);
+    card->Background = Solid(Colors::Transparent);
+    card->HorizontalContentAlignment = Windows::UI::Xaml::HorizontalAlignment::Stretch;
+    card->VerticalContentAlignment = Windows::UI::Xaml::VerticalAlignment::Stretch;
+    card->RenderTransformOrigin = Point(0.5, 0.5);
+    Skin(card, 14);
+    Windows::UI::Xaml::Automation::AutomationProperties::SetName(card, games_[index].name);
+
+    auto poster = ref new Border();
+    poster->CornerRadius = Windows::UI::Xaml::CornerRadius(14);
+    poster->BorderBrush = Solid(Alpha(46, 255, 255, 255));
+    poster->BorderThickness = Thickness(1);
+    ConfigureCover(poster, index);
+    if (ArtworkUri(index)->IsEmpty() && games_[index].icon == nullptr) {
+        auto art = ref new Grid();
+        auto r = ref new Image();
+        r->Source = ref new BitmapImage(ref new Uri(L"ms-appx:///Assets/ReVitaMark.png"));
+        r->Width = 64;
+        r->Height = 64;
+        r->Opacity = 0.35;
+        art->Children->Append(r);
+        auto caption = Text(games_[index].name, 12, true);
+        caption->Margin = Thickness(10, 0, 10, 12);
+        caption->MaxHeight = 44;
+        caption->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Bottom;
+        art->Children->Append(caption);
+        poster->Child = art;
+    }
+    card->Content = poster;
+
+    // the turn and the step back (animated in FocusFlow)
+    auto projection = ref new PlaneProjection();
+    card->Projection = projection;
+    auto scale = ref new ScaleTransform();
+    card->RenderTransform = scale;
+
+    card->GotFocus += ref new RoutedEventHandler([this,position](Platform::Object^, RoutedEventArgs^) {
+        PlayCue(3);
+        FocusFlow(position, true);
+    });
+    card->Click += ref new RoutedEventHandler([this,index](Platform::Object^, RoutedEventArgs^) {
+        PlayCue(1);
+        selectedGame_ = static_cast<int>(index);
+        ShowPage(4);
+    });
+    return card;
+}
+void CatalogShell::FocusFlow(int position, bool animate) {
+    if (position < 0 || static_cast<size_t>(position) >= flowCards_.size()) return;
+    flowFocus_ = position;
+    auto board = ref new Storyboard();
+    auto ease = ref new CubicEase();
+    ease->EasingMode = EasingMode::EaseOut;
+    const auto duration = DurationHelper::FromTimeSpan(Millis(animate ? 300 : 1));
+    auto animateTo = [&](DependencyObject^ target, Platform::String^ path, double to) {
+        auto a = ref new DoubleAnimation();
+        a->To = to;
+        a->Duration = duration;
+        a->EasingFunction = ease;
+        a->EnableDependentAnimation = true;
+        Storyboard::SetTarget(a, target);
+        Storyboard::SetTargetProperty(a, path);
+        board->Children->Append(a);
+    };
+    for (size_t i = 0; i < flowCards_.size(); ++i) {
+        const int d = static_cast<int>(i) - position;
+        const int reach = std::min(std::abs(d), 4);
+        // only the cards near the middle move; the rest are off screen
+        if (std::abs(d) > 7) continue;
+        auto card = flowCards_[i];
+        auto projection = dynamic_cast<PlaneProjection^>(card->Projection);
+        auto scale = dynamic_cast<ScaleTransform^>(card->RenderTransform);
+        const double turn = d == 0 ? 0.0 : (d < 0 ? 42.0 : -42.0);
+        const double size = d == 0 ? 1.16 : 0.9 - 0.04 * (reach - 1);
+        const double depth = d == 0 ? 30.0 : -40.0 * reach;
+        if (projection != nullptr) {
+            animateTo(projection, L"RotationY", turn);
+            animateTo(projection, L"GlobalOffsetZ", depth);
+        }
+        if (scale != nullptr) {
+            animateTo(scale, L"ScaleX", size);
+            animateTo(scale, L"ScaleY", size);
+        }
+        animateTo(card, L"Opacity", d == 0 ? 1.0 : 0.9 - 0.16 * reach);
+        Canvas::SetZIndex(card, 100 - std::abs(d));
+    }
+    board->Begin();
+    // keep the focused card in the middle: the row has half a screen of
+    // padding on each side, so the focused card's offset is position * step
+    if (flowScroll_ != nullptr)
+        flowScroll_->ChangeView(ref new Platform::Box<double>(position * kFlowStep), nullptr, nullptr, !animate);
+    if (static_cast<size_t>(position) < flowItems_.size())
+        UpdateSpotlight(static_cast<int>(flowItems_[position]));
+}
+void CatalogShell::MakeFlow(const std::vector<size_t>& items, size_t focus) {
+    flowCards_.clear();
+    flowItems_ = items;
+    flowFocus_ = -1;
+    flowRow_ = ref new StackPanel();
+    flowRow_->Orientation = Orientation::Horizontal;
+    flowRow_->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
+    int start = 0;
+    for (size_t i = 0; i < items.size(); ++i) {
+        auto card = MakeFlowCard(items[i], static_cast<int>(i));
+        flowCards_.push_back(card);
+        flowRow_->Children->Append(card);
+        if (items[i] == focus) start = static_cast<int>(i);
+    }
+    flowScroll_ = ref new ScrollViewer();
+    flowScroll_->Height = kFlowCardHeight * 1.3;
+    flowScroll_->Margin = Thickness(-56, 4, -56, 0);   // edge to edge
+    flowScroll_->HorizontalScrollBarVisibility = ScrollBarVisibility::Hidden;
+    flowScroll_->HorizontalScrollMode = ScrollMode::Enabled;
+    flowScroll_->VerticalScrollBarVisibility = ScrollBarVisibility::Disabled;
+    flowScroll_->VerticalScrollMode = ScrollMode::Disabled;
+    // the gamepad moves focus; the row follows it (FocusFlow), not the other way round
+    flowScroll_->IsHorizontalRailEnabled = true;
+    flowScroll_->Content = flowRow_;
+    auto row = flowRow_;
+    auto scroller = flowScroll_;
+    flowScroll_->SizeChanged += ref new SizeChangedEventHandler(
+        [this,row,scroller](Platform::Object^, SizeChangedEventArgs^ e) {
+            const double side = std::max(0.0, e->NewSize.Width / 2 - kFlowStep / 2);
+            row->Margin = Thickness(side, 0, side, 0);
+            if (flowFocus_ >= 0) scroller->ChangeView(ref new Platform::Box<double>(flowFocus_ * kFlowStep), nullptr, nullptr, true);
+        });
+    content_->Children->Append(flowScroll_);
+    FocusFlow(start, false);
+}
 void CatalogShell::Home() {
     const bool hasGames = !games_.empty();
     const auto recents = RecentGames();
@@ -1244,17 +1491,27 @@ void CatalogShell::Home() {
 
     if (!hasGames) {
         HideSpotlight();
+        flowCards_.clear();
+        flowScroll_ = nullptr;
         auto welcome = Vertical();
-        welcome->Margin = Thickness(2, 70, 0, 26);
-        auto kicker = Text(L"WELCOME TO VITA3K", 11, true);
+        welcome->Margin = Thickness(2, 48, 0, 26);
+        auto mark = ref new Image();
+        mark->Source = ref new BitmapImage(ref new Uri(L"ms-appx:///Assets/ReVitaMark.png"));
+        mark->Width = 96;
+        mark->Height = 96;
+        mark->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Left;
+        welcome->Children->Append(mark);
+        auto kicker = Text(L"WELCOME TO REVITA", 11, true);
         kicker->CharacterSpacing = 260;
-        kicker->Foreground = Solid(Accent());
+        kicker->Foreground = BrandBrush();
+        kicker->Margin = Thickness(0, 22, 0, 0);
         welcome->Children->Append(kicker);
-        auto headline = Text(L"Every game.\nA new world.", 56, false);
+        auto headline = Text(L"Bring your Vita\nback to life.", 54, false);
         headline->FontWeight = FontWeights::Light;
+        headline->FontFamily = ref new Windows::UI::Xaml::Media::FontFamily(L"Bahnschrift");
         headline->Margin = Thickness(0, 10, 0, 12);
         welcome->Children->Append(headline);
-        auto detail = Text(L"Your Vita collection, on the big screen. Add a game or a folder to begin.", 15, false, true);
+        auto detail = Text(L"Your PS Vita collection on the big screen. Add a game or a folder to begin.", 15, false, true);
         detail->MaxWidth = 560;
         welcome->Children->Append(detail);
         auto controls = ref new StackPanel();
@@ -1275,38 +1532,41 @@ void CatalogShell::Home() {
         return;
     }
 
-    // The spotlight: the featured (or focused) game, big, over its own picture.
+    // The focused game's name and actions, over its own picture.
     auto spot = Vertical();
-    spot->Margin = Thickness(2, 64, 0, 30);
-    spot->MaxWidth = 760;
+    spot->Margin = Thickness(2, 14, 0, 4);
+    spot->MaxWidth = 720;
     spot->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Left;
     spotKicker_ = Text(recents.empty() ? L"IN YOUR COLLECTION" : L"JUMP BACK IN", 11, true);
     spotKicker_->CharacterSpacing = 260;
-    spotKicker_->Foreground = Solid(Accent());
+    spotKicker_->Foreground = BrandBrush();
     spot->Children->Append(spotKicker_);
-    spotTitle_ = Text(games_[featured].name, 52, false);
-    spotTitle_->FontWeight = FontWeights::Light;
-    spotTitle_->MaxLines = 2;
-    spotTitle_->LineHeight = 58;
-    spotTitle_->Margin = Thickness(0, 10, 0, 8);
+    spotTitle_ = Text(games_[featured].name, 38, false);
+    spotTitle_->FontFamily = ref new Windows::UI::Xaml::Media::FontFamily(L"Bahnschrift");
+    spotTitle_->FontWeight = FontWeights::SemiLight;
+    spotTitle_->MaxLines = 1;
+    spotTitle_->TextWrapping = TextWrapping::NoWrap;
+    spotTitle_->Margin = Thickness(0, 6, 0, 4);
     spot->Children->Append(spotTitle_);
-    spotMeta_ = Text(GameMeta(featured), 12, true, true);
+    spotMeta_ = Text(GameMeta(featured), 11, true, true);
     spotMeta_->CharacterSpacing = 90;
     spot->Children->Append(spotMeta_);
     auto controls = ref new StackPanel();
     controls->Orientation = Orientation::Horizontal;
-    controls->Margin = Thickness(0, 26, 0, 0);
+    controls->Margin = Thickness(0, 16, 0, 0);
     auto play = Button(L"Play", true);
-    play->MinWidth = 160;
-    play->Height = 50;
-    play->FontSize = 17;
+    play->MinWidth = 150;
+    play->Height = 46;
+    play->FontSize = 16;
+    play->Background = BrandBrush();
+    play->Foreground = Solid(Colors::White);
     {
         auto inside = ref new StackPanel();
         inside->Orientation = Orientation::Horizontal;
         auto glyph = ref new TextBlock();
-        glyph->Text = L"";
+        glyph->Text = L"\xE768";
         glyph->FontFamily = ref new Windows::UI::Xaml::Media::FontFamily(L"Segoe MDL2 Assets");
-        glyph->FontSize = 15;
+        glyph->FontSize = 14;
         glyph->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
         glyph->Margin = Thickness(0, 1, 10, 0);
         inside->Children->Append(glyph);
@@ -1316,46 +1576,54 @@ void CatalogShell::Home() {
         inside->Children->Append(label);
         play->Content = inside;
     }
-    // Play and Details act on whichever game has the spotlight.
+    // Play and the game page act on whichever poster is in the middle.
     play->Click += ref new RoutedEventHandler([this,featured](Platform::Object^, RoutedEventArgs^) {
         AttemptBoot(spotIndex_ >= 0 ? static_cast<size_t>(spotIndex_) : featured);
     });
     controls->Children->Append(play);
     auto details = Button(L"Game page");
-    details->Height = 50;
+    details->Height = 46;
     details->Click += ref new RoutedEventHandler([this,featured](Platform::Object^, RoutedEventArgs^) {
         selectedGame_ = spotIndex_ >= 0 ? spotIndex_ : static_cast<int>(featured);
         ShowPage(4);
     });
     controls->Children->Append(details);
+    auto all = Button(L"Library");
+    all->Height = 46;
+    all->Click += ref new RoutedEventHandler([this](Platform::Object^, RoutedEventArgs^) { ShowPage(1); });
+    controls->Children->Append(all);
     spot->Children->Append(controls);
     content_->Children->Append(spot);
-    UpdateSpotlight(static_cast<int>(featured));
-    play->Loaded += ref new RoutedEventHandler([play](Platform::Object^, RoutedEventArgs^) {
-        play->Focus(Windows::UI::Xaml::FocusState::Programmatic);
-    });
 
     SetupCard();
 
-    if (!recents.empty()) MakeShelf(L"Jump back in", recents);
-    std::vector<size_t> all, folders, packages;
-    for (size_t i = 0; i < games_.size(); ++i) {
-        all.push_back(i);
-        if (games_[i].format == vita3k_uwp::GameFormat::GameFolder) folders.push_back(i);
-        else packages.push_back(i);
-    }
-    std::sort(all.begin(), all.end(), [this](size_t a, size_t b) {
+    // The flow: played games first (newest first), then the rest A-Z.
+    std::vector<size_t> order(recents.begin(), recents.end());
+    std::vector<size_t> rest;
+    for (size_t i = 0; i < games_.size(); ++i)
+        if (std::find(order.begin(), order.end(), i) == order.end()) rest.push_back(i);
+    std::sort(rest.begin(), rest.end(), [this](size_t a, size_t b) {
         return _wcsicmp(games_[a].name ? games_[a].name->Data() : L"", games_[b].name ? games_[b].name->Data() : L"") < 0;
     });
-    MakeShelf(L"Your collection", all);
-    if (!folders.empty() && !packages.empty()) {
-        MakeShelf(L"Game folders", folders);
-        MakeShelf(L"Archives and packages", packages);
+    order.insert(order.end(), rest.begin(), rest.end());
+    MakeFlow(order, featured);
+
+    wchar_t count[96] = {};
+    swprintf_s(count, L"%zu %s   •   \x2190 \x2192 TO BROWSE   •   A FOR THE GAME PAGE",
+        games_.size(), games_.size() == 1 ? L"GAME" : L"GAMES");
+    auto hint = Text(ref new Platform::String(count), 10, true, true);
+    hint->CharacterSpacing = 120;
+    hint->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Center;
+    hint->Margin = Thickness(0, 6, 0, 0);
+    content_->Children->Append(hint);
+
+    // The controller starts on the poster in the middle.
+    if (!flowCards_.empty() && flowFocus_ >= 0) {
+        auto first = flowCards_[flowFocus_];
+        first->Loaded += ref new RoutedEventHandler([first](Platform::Object^, RoutedEventArgs^) {
+            first->Focus(Windows::UI::Xaml::FocusState::Programmatic);
+        });
     }
-    auto note = Text(L"ALPHA   •   Some games don't run yet. If one fails, Settings > Help saves the log.", 10, false, true);
-    note->CharacterSpacing = 40;
-    note->Margin = Thickness(2, 16, 0, 6);
-    content_->Children->Append(note);
 }
 void CatalogShell::Library() {
     auto header = ref new Grid();
@@ -1363,7 +1631,7 @@ void CatalogShell::Library() {
     auto heading = Vertical();
     auto eyebrow = Text(L"COLLECTION", 11, true);
     eyebrow->CharacterSpacing = 260;
-    eyebrow->Foreground = Solid(Accent());
+    eyebrow->Foreground = BrandBrush();
     heading->Children->Append(eyebrow);
     auto title = Text(L"Library", 40, false);
     title->FontWeight = FontWeights::Light;
@@ -1543,7 +1811,7 @@ void CatalogShell::GameDetails() {
     Grid::SetColumn(right, 1);
     auto category = Text(GameMeta(index), 11, true);
     category->CharacterSpacing = 140;
-    category->Foreground = Solid(Accent());
+    category->Foreground = BrandBrush();
     right->Children->Append(category);
     auto title = Text(games_[index].name, 46, false);
     title->FontWeight = FontWeights::Light;
@@ -1557,7 +1825,7 @@ void CatalogShell::GameDetails() {
     const bool installed = titleId.size() == 9 && HasFiles(FirmwareRoot() + L"\\ux0\\app\\" + titleId);
     auto note = Text(installed
         ? L"Installed and ready to play."
-        : L"The first start installs the game into Vita3K's data folder; after that it starts straight away.",
+        : L"The first start installs the game into ReVita's data folder; after that it starts straight away.",
         14, false, true);
     note->MaxWidth = 620;
     right->Children->Append(note);
@@ -1681,7 +1949,7 @@ void CatalogShell::AppendGameInfo(size_t index) {
     auto body = Vertical();
     auto eyebrow = Text(L"ABOUT THIS GAME", 10, true);
     eyebrow->CharacterSpacing = 160;
-    eyebrow->Foreground = Solid(Accent());
+    eyebrow->Foreground = BrandBrush();
     body->Children->Append(eyebrow);
 
     if (!have) {
@@ -1793,6 +2061,10 @@ void CatalogShell::Render() {
     spotKicker_ = nullptr;
     spotTitle_ = nullptr;
     spotMeta_ = nullptr;
+    flowCards_.clear();
+    flowScroll_ = nullptr;
+    flowRow_ = nullptr;
+    flowFocus_ = -1;
     // the spotlight belongs to Home and a game's page
     if (page_ != 0 && page_ != 4) HideSpotlight();
     // The PS3-style home takes the whole screen over the usual layout.
@@ -1826,7 +2098,7 @@ void CatalogShell::Settings() {
         heading->Margin = Thickness(2, 10, 0, 16);
         auto eyebrow = Text(L"SETTINGS", 11, true);
         eyebrow->CharacterSpacing = 260;
-        eyebrow->Foreground = Solid(Accent());
+        eyebrow->Foreground = BrandBrush();
         heading->Children->Append(eyebrow);
         auto title = Text(L"Set up once. Play anywhere.", 40, false);
         title->FontWeight = FontWeights::Light;
@@ -1873,18 +2145,18 @@ void CatalogShell::Settings() {
     if (settingsTab_ == 2) {
     Section(L"Appearance", L"Twelve moods, each with its own living scene behind the whole app.");
     const wchar_t* styles[] = {
-        L"Onyx", L"Aurora", L"Ember", L"Glacier", L"Orbit",
+        L"ReVita", L"Aurora", L"Ember", L"Glacier", L"Orbit",
         L"Sakura", L"Synthwave", L"Verdant", L"Gilded",
         L"Abyss", L"Crimson", L"Prism"
     };
     const wchar_t* captions[] = {
-        L"Midnight & rose", L"Electric teal", L"Warm cinema",
+        L"Neon orbit", L"Electric teal", L"Warm cinema",
         L"Arctic blue", L"Cosmic violet",
         L"Falling blossoms", L"Neon horizon", L"Firefly forest", L"Black & gold",
         L"Deep sea light", L"Red & black", L"Glass & light"
     };
     const Color samples[] = {
-        RgbColor(111, 34, 56), RgbColor(23, 95, 94),
+        RgbColor(92, 64, 200), RgbColor(23, 95, 94),
         RgbColor(127, 65, 37), RgbColor(48, 95, 145),
         RgbColor(83, 55, 131),
         RgbColor(150, 70, 110), RgbColor(130, 36, 150),
@@ -2083,6 +2355,38 @@ void CatalogShell::Settings() {
     }
 
     if (settingsTab_ == 5) {
+    {
+        // About: the name, the mark, and the engine underneath
+        auto about = ref new Grid();
+        auto c0 = ref new ColumnDefinition(); c0->Width = GridLength(1, GridUnitType::Auto);
+        auto c1 = ref new ColumnDefinition(); c1->Width = GridLength(1, GridUnitType::Star);
+        about->ColumnDefinitions->Append(c0);
+        about->ColumnDefinitions->Append(c1);
+        auto mark = ref new Image();
+        mark->Source = ref new BitmapImage(ref new Uri(L"ms-appx:///Assets/ReVitaMark.png"));
+        mark->Width = 76;
+        mark->Height = 76;
+        mark->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Top;
+        about->Children->Append(mark);
+        auto words = Vertical();
+        words->Margin = Thickness(18, 0, 0, 0);
+        Grid::SetColumn(words, 1);
+        auto word = ref new Image();
+        word->Source = ref new BitmapImage(ref new Uri(L"ms-appx:///Assets/ReVitaWordmark.png"));
+        word->Height = 30;
+        word->Stretch = Stretch::Uniform;
+        word->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Left;
+        words->Children->Append(word);
+        auto line = Text(L"PS Vita emulation for Xbox. Beta.", 14, false);
+        line->Margin = Thickness(0, 8, 0, 4);
+        words->Children->Append(line);
+        words->Children->Append(Text(
+            L"Powered by Vita3K, the open-source PS Vita emulator, with Mesa's Dozen driver for "
+            L"graphics. ReVita and Vita3K are free software under the GNU GPL v2. ReVita includes "
+            L"no Sony firmware, keys or games.", 12, false, true));
+        about->Children->Append(words);
+        content_->Children->Append(Panel(about, 20));
+    }
     Section(L"Diagnostics", L"Where to look when something goes wrong.");
     auto advanced = Vertical();
     advanced->Children->Append(Text(
@@ -2683,7 +2987,7 @@ void CatalogShell::SetupCard() {
     auto setup = Vertical();
     auto kick = Text(L"GET STARTED", 10, true);
     kick->CharacterSpacing = 300;
-    kick->Foreground = Solid(Accent());
+    kick->Foreground = BrandBrush();
     setup->Children->Append(kick);
     auto heading = Text(L"Three steps and you're playing", 22, false);
     heading->FontWeight = FontWeights::Light;
@@ -2726,7 +3030,7 @@ void CatalogShell::SetupCard() {
     };
 
     // 1. Storage: USB drives first.
-    auto storage = step(1, storageDone, !storageDone, L"Choose where Vita3K keeps its data",
+    auto storage = step(1, storageDone, !storageDone, L"Choose where ReVita keeps its data",
         storageDone ? ref new Platform::String(Pref(L"storage.dataRoot", L"")->IsEmpty() ? L"Internal storage" : Pref(L"storage.dataRoot", L"")->Data())
                     : ref new Platform::String(L"Firmware, installed games and saves. A USB drive is best: installed games can be large."));
     if (!storageDone) {
@@ -2806,7 +3110,7 @@ std::wstring CatalogShell::RecentLogText() {
     libretro_.FlushLog();
     const std::wstring path = std::wstring(ApplicationData::Current->LocalFolder->Path->Data()) + L"\\vita3k-runtime.log";
     FILE* file = _wfsopen(path.c_str(), L"rb", _SH_DENYNO);
-    if (!file) return L"No log yet. It is written when Vita3K starts.";
+    if (!file) return L"No log yet. It is written when ReVita starts a game.";
     std::fseek(file, 0, SEEK_END);
     const long size = std::ftell(file);
     const long take = std::min<long>(size, 24 * 1024);
@@ -3227,7 +3531,7 @@ void CatalogShell::ApplyCoreOptions(const std::wstring& contentPath) {
 }
 
 void CatalogShell::FirmwareSettings() {
-    Section(L"Firmware", L"Vita3K runs on Sony's PS Vita firmware. This app ships none of it.");
+    Section(L"Firmware", L"ReVita runs on Sony's PS Vita firmware. ReVita ships none of it.");
     auto box = Vertical();
     // One status tile per part.
     auto tiles = ref new Grid();
@@ -3257,7 +3561,7 @@ void CatalogShell::FirmwareSettings() {
         head->Children->Append(firmwareDot_[i]);
         auto need = Text(part.required ? L"REQUIRED" : L"RECOMMENDED", 10, true, !part.required);
         need->CharacterSpacing = 160;
-        if (part.required) need->Foreground = Solid(Accent());
+        if (part.required) need->Foreground = BrandBrush();
         head->Children->Append(need);
         inner->Children->Append(head);
         auto title = Text(ref new Platform::String(part.title), 17, true);
@@ -3296,12 +3600,12 @@ void CatalogShell::FirmwareSettings() {
     firmwareProgress_->Maximum = 100;
     firmwareProgress_->Height = 6;
     firmwareProgress_->Margin = Thickness(0, 14, 0, 0);
-    firmwareProgress_->Foreground = Solid(Accent());
+    firmwareProgress_->Foreground = BrandBrush();
     firmwareProgress_->Visibility = firmwareBusy_ ? Windows::UI::Xaml::Visibility::Visible
                                                   : Windows::UI::Xaml::Visibility::Collapsed;
     box->Children->Append(firmwareProgress_);
     firmwareMessage_ = Text(
-        L"Pick your .PUP files, all at once, under any names. Vita3K looks inside each one, "
+        L"Pick your .PUP files, all at once, under any names. ReVita looks inside each one, "
         L"tells the system firmware, preinstalled package and fonts apart, and installs them right away.",
         12, false, true);
     firmwareMessage_->Margin = Thickness(0, 10, 0, 0);
@@ -3311,7 +3615,7 @@ void CatalogShell::FirmwareSettings() {
 }
 
 void CatalogShell::StorageSettings() {
-    Section(L"Storage", L"Games play from where they are. Vita3K's own data can live on your drive too.");
+    Section(L"Storage", L"Games play from where they are. ReVita's own data can live on your drive too.");
     auto box = Vertical();
     auto addRow = [this,box](Platform::String^ title, Platform::String^ detail, TextBlock^ label,
                              Windows::UI::Xaml::Controls::Button^ first, Windows::UI::Xaml::Controls::Button^ second) {
@@ -3325,7 +3629,7 @@ void CatalogShell::StorageSettings() {
         grid->ColumnDefinitions->Append(right);
         auto copy = Vertical();
         copy->Children->Append(Text(title, 15, true));
-        label->Foreground = Solid(Accent());
+        label->Foreground = BrandBrush();
         label->Margin = Thickness(0, 3, 0, 3);
         copy->Children->Append(label);
         auto about = Text(detail, 11, false, true);
@@ -3354,7 +3658,7 @@ void CatalogShell::StorageSettings() {
     onDrive->Click += ref new RoutedEventHandler([this](Platform::Object^, RoutedEventArgs^) { ChooseDataFolder(); });
     auto internal = Button(L"Use internal storage");
     internal->Click += ref new RoutedEventHandler([this](Platform::Object^, RoutedEventArgs^) { ChangeDataRoot(L""); });
-    addRow(L"Vita3K data", L"Firmware, installed games, saves and caches. Vita3K installs a game here the first "
+    addRow(L"ReVita data", L"Firmware, installed games, saves and caches. ReVita installs a game here the first "
         L"time it runs it, so if internal space is short, put this on your USB drive.", dataLabel_, onDrive, internal);
     addonsLabel_ = Text(L"", 13);
     auto chooseAddons = Button(L"Choose updates folder", true);
@@ -3591,7 +3895,7 @@ void CatalogShell::ChangeDataRoot(const std::wstring& chosen) {
     const std::wstring from = DataRoot();
     const std::wstring to = chosen.empty() ? InternalDataRoot() : chosen;
     if (_wcsicmp(from.c_str(), to.c_str()) == 0) {
-        SetStatus(L"Vita3K data is already there.");
+        SetStatus(L"ReVita data is already there.");
         return;
     }
     if (!chosen.empty()) {
@@ -3604,7 +3908,7 @@ void CatalogShell::ChangeDataRoot(const std::wstring& chosen) {
     }
     auto apply = [this,chosen,to]() {
         PutPref(L"storage.dataRoot", ref new Platform::String(chosen.c_str()));
-        SetStatus(ref new Platform::String((L"Vita3K data now lives in " + to + L".").c_str()));
+        SetStatus(ref new Platform::String((L"ReVita data now lives in " + to + L".").c_str()));
         Render();
     };
     if (!HasFiles(from + L"\\vita3k")) {
@@ -3612,7 +3916,7 @@ void CatalogShell::ChangeDataRoot(const std::wstring& chosen) {
         return;
     }
     auto dialog = ref new ContentDialog();
-    dialog->Title = L"Move your Vita3K data?";
+    dialog->Title = L"Move your ReVita data?";
     dialog->Content = ref new Platform::String((L"Firmware, installed games and saves are in " + from +
         L". Move them to " + to + L"? Large games take a while.").c_str());
     dialog->PrimaryButtonText = L"Move";
@@ -3622,7 +3926,7 @@ void CatalogShell::ChangeDataRoot(const std::wstring& chosen) {
         if (answer == ContentDialogResult::Secondary) { apply(); return; }
         if (answer != ContentDialogResult::Primary) return;
         booting_ = true; // keeps games from starting while files move
-        SetStatus(L"Moving Vita3K data. Leave the app open until it finishes...");
+        SetStatus(L"Moving ReVita data. Leave the app open until it finishes...");
         create_task([from,to]() -> std::wstring {
             std::error_code ec;
             std::filesystem::create_directories(to + L"\\vita3k", ec);
@@ -3642,7 +3946,7 @@ void CatalogShell::ChangeDataRoot(const std::wstring& chosen) {
 }
 
 void CatalogShell::EmulationSettings() {
-    Section(L"Emulation", L"Vita3K's own options. They take effect when a game starts.");
+    Section(L"Emulation", L"The Vita3K engine's own options. They take effect when a game starts.");
     {
         // What draws the game, and how it fills the screen.
         auto display = Vertical();
@@ -3737,7 +4041,7 @@ void CatalogShell::EmulationSettings() {
             ApplicationData::Current->LocalSettings->Values->Remove(CoreOptionPrefKey(option));
             libretro_.SetOption(option.key, option.defaultValue);
         }
-        SetStatus(L"Emulation options restored to Vita3K's defaults.");
+        SetStatus(L"Emulation options restored to their defaults.");
         Render();
     });
     content_->Children->Append(reset);
@@ -4062,12 +4366,12 @@ void CatalogShell::AttemptBoot(size_t index) {
         lastReport->store(done);
         dispatcher->RunAsync(Windows::UI::Core::CoreDispatcherPriority::Low,
             ref new Windows::UI::Core::DispatchedHandler([this,progress]() {
-                SetStatus(L"Copying the game into Vita3K storage: " +
+                SetStatus(L"Copying the game into ReVita storage: " +
                     StringOf(std::to_wstring(progress->files.load())) + L" copied, " +
                     StringOf(std::to_wstring(progress->skipped.load())) + L" already there...");
             }));
     };
-    SetStatus(L"Vita3K can't read this game where it is, so it is being copied into app storage first...");
+    SetStatus(L"ReVita can't read this game where it is, so it is being copied into app storage first...");
     create_task(ApplicationData::Current->LocalFolder->CreateFolderAsync(
         L"Vita3KContent", CreationCollisionOption::OpenIfExists))
     .then([file,folder,progress,report](StorageFolder^ content) -> task<Platform::String^> {
@@ -4089,15 +4393,15 @@ void CatalogShell::AttemptBoot(size_t index) {
             auto path = staged.get();
             SetStatus(L"Game ready (" + StringOf(std::to_wstring(progress->files.load())) +
                 L" files copied, " + StringOf(std::to_wstring(progress->skipped.load())) +
-                L" reused). Starting Vita3K...");
+                L" reused). Starting...");
             StartCore(path);
         } catch (Platform::Exception^ error) {
             booting_ = false;
-            SetStatus(L"Couldn't copy the game into Vita3K storage: " + error->Message +
+            SetStatus(L"Couldn't copy the game into ReVita storage: " + error->Message +
                 L" Check free space on the console.");
         } catch (...) {
             booting_ = false;
-            SetStatus(L"Couldn't copy the game into Vita3K storage.");
+            SetStatus(L"Couldn't copy the game into ReVita storage.");
         }
     }, task_continuation_context::use_current());
 }
@@ -4206,7 +4510,7 @@ void CatalogShell::EnterGameView(Platform::String^ title) {
     column->MaxWidth = 720;
     auto kicker = Text(L"NOW LOADING", 11, true);
     kicker->CharacterSpacing = 300;
-    kicker->Foreground = Solid(Accent());
+    kicker->Foreground = BrandBrush();
     column->Children->Append(kicker);
     auto name = Text(title, 42, false);
     name->FontWeight = FontWeights::Light;
@@ -4220,7 +4524,7 @@ void CatalogShell::EnterGameView(Platform::String^ title) {
     loadingBar_->Minimum = 0;
     loadingBar_->Maximum = 100;
     loadingBar_->IsIndeterminate = true;
-    loadingBar_->Foreground = Solid(Accent());
+    loadingBar_->Foreground = BrandBrush();
     loadingBar_->Background = Solid(Alpha(40, 255, 255, 255));
     column->Children->Append(loadingBar_);
     loadingStage_ = Text(L"Getting ready", 14, false, true);
@@ -4476,7 +4780,7 @@ void CatalogShell::ShowQuickMenu() {
     }
     auto kicker = Text(L"PAUSED", 10, true);
     kicker->CharacterSpacing = 300;
-    kicker->Foreground = Solid(Accent());
+    kicker->Foreground = BrandBrush();
     column->Children->Append(kicker);
     auto name = Text(gameTitle_ ? gameTitle_ : ref new Platform::String(L"Your game"), 30, false);
     name->FontWeight = FontWeights::Light;
@@ -4619,7 +4923,7 @@ static bool WriteBmp(const std::wstring& path, const uint8_t* pixels, unsigned w
 // to do this. If it refuses, the game starts in this session as before.
 void CatalogShell::RestartInto(Platform::String^ contentPath) {
     PutPref(L"pendingBoot", contentPath);
-    SetStatus(L"Restarting Vita3K so this game starts on a fresh emulator...");
+    SetStatus(L"Restarting ReVita so this game starts on a fresh emulator...");
     libretro_.LogLine("Restarting the app to start the next game on a fresh emulator");
     create_task(Windows::ApplicationModel::Core::CoreApplication::RequestRestartAsync(L"boot"))
     .then([this,contentPath](task<Windows::ApplicationModel::Core::AppRestartFailureReason> work) {
@@ -4675,7 +4979,7 @@ void CatalogShell::StartCore(Platform::String^ contentPath) {
         if (displayError.find(L"2289696800") != std::wstring::npos || displayError.find(L"2289696773") != std::wstring::npos)
             // DXGI_ERROR_DRIVER_INTERNAL_ERROR / DEVICE_REMOVED: a game before
             // this one left the console's GPU driver failed for this app.
-            displayError = L"The graphics driver stopped during an earlier game. Close Vita3K completely (Menu button on its tile, then Quit) and open it again.";
+            displayError = L"The graphics driver stopped during an earlier game. Close ReVita completely (Menu button on its tile, then Quit) and open it again.";
         libretro_.LogLine("Display: the presenter could not start: " + NarrowUtf8(displayError));
         ShowLoadFailure(StringOf(displayError));
         return;
@@ -4818,7 +5122,7 @@ void CatalogShell::StartCore(Platform::String^ contentPath) {
         return std::make_pair(true, detail);
     }).then([this](task<std::pair<bool, std::wstring>> result) {
         booting_ = false;
-        std::pair<bool, std::wstring> outcome{ false, L"Vita3K stopped while loading." };
+        std::pair<bool, std::wstring> outcome{ false, L"The emulator stopped while loading." };
         try { outcome = result.get(); } catch (...) {}
         if (!outcome.first) {
             ShowLoadFailure(ref new Platform::String(outcome.second.c_str()));
@@ -5369,7 +5673,7 @@ void CatalogShell::ShowArtPicker(size_t index) {
 
     auto eyebrow = Text(L"STEAMGRIDDB", 10, true);
     eyebrow->CharacterSpacing = 220;
-    eyebrow->Foreground = Solid(Accent());
+    eyebrow->Foreground = BrandBrush();
     body->Children->Append(eyebrow);
     auto heading = Text(L"Art for " + games_[index].name, 28, false);
     heading->FontWeight = FontWeights::Light;
@@ -5660,8 +5964,8 @@ std::vector<XmbCategory> CatalogShell::XmbCategories() {
             L"Press A for the next colour", L"\uE790", -1, [this]() { SaveXmbTheme(xmbTheme_ + 1); }, nullptr });
         c.items.push_back(XmbEntry{ L"App Settings", L"Themes, music, sounds and the home screen", L"\uE771", -1, settings, nullptr });
         c.items.push_back(XmbEntry{ L"Emulation Settings", L"Renderer, resolution, shaders and the CPU", L"\uE7FC", -1, settings, nullptr });
-        c.items.push_back(XmbEntry{ L"System Software", L"The PS Vita firmware Vita3K runs on", L"\uE896", -1, settings, nullptr });
-        c.items.push_back(XmbEntry{ L"Storage", L"Where games, saves and Vita3K's data live", L"\uEDA2", -1, settings, nullptr });
+        c.items.push_back(XmbEntry{ L"System Software", L"The PS Vita firmware ReVita runs on", L"\uE896", -1, settings, nullptr });
+        c.items.push_back(XmbEntry{ L"Storage", L"Where games, saves and ReVita's data live", L"\uEDA2", -1, settings, nullptr });
         c.items.push_back(XmbEntry{ L"Cinematic Home", L"Go back to the cinematic home screen", L"\uE80F", -1, [this]() { SaveLayout(false); }, nullptr });
         cats.push_back(std::move(c));
     }

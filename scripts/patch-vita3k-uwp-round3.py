@@ -3638,3 +3638,214 @@ replace(pcc, '''    // note: the flag can_use_deferred_compilation is not consid
 #endif
 #ifdef VITA3K_UWP''')
 print('Vulkan: pipeline warm-up - pipelines from earlier sessions compile in the background once their programs exist.')
+
+# ── Dozen draw-time variants, remembered and built ahead ────────────────────
+# Dozen makes some of a pipeline's GPU code only when a draw first needs it
+# (dynamic stencil masks, emulated depth bias, strip cut values): a stall at
+# draw time that the background compilers cannot hide. Our Dozen build
+# (patch 0109) reports each such variant; the core files it under the
+# pipeline's content key, saves the list next to the warm-up list, and in the
+# next session builds those variants on the compiler thread that makes the
+# pipeline, before any draw can use it (Dozen's variant table has no lock, so
+# it is only touched before the pipeline is published).
+replace(libretro_cpp, '''extern int vita3k_uwp_quad_wait_ms;
+''', '''extern int vita3k_uwp_quad_wait_ms;
+// Dozen's own exports (vulkan_dzn.dll is already loaded by the app)
+void *vita3k_uwp_dzn_proc(const char *name) {
+    static HMODULE dozen = LoadPackagedLibrary(L"vulkan_dzn.dll", 0);
+    return dozen ? reinterpret_cast<void *>(GetProcAddress(dozen, name)) : nullptr;
+}
+''')
+
+replace(pch, '''    void uwp_replay_warm();
+#endif''', '''    void uwp_replay_warm();
+    // Dozen draw-time variants by pipeline key (raw variant keys)
+    std::map<uint64_t, std::vector<std::vector<uint8_t>>> uwp_variants;
+    std::unordered_map<uint64_t, uint64_t> uwp_pipeline_keys; // VkPipeline -> key
+    bool uwp_variants_dirty = false;
+    void uwp_variants_load();
+    void uwp_variants_save();
+    void uwp_variant_seen(uint64_t pipeline, const void *data, uint32_t size);
+    void uwp_variants_prebuild(uint64_t key, vk::Pipeline pipeline);
+#endif''')
+if '#include <unordered_map>' not in read(pch):
+    replace(pch, '#include <mutex>\n', '#include <mutex>\n#include <unordered_map>\n')
+
+replace(pcc, '''    alignas(8) uint8_t record_data[record_pipeline_len];
+
+    const GxmRecordState *get_record() {''', '''    alignas(8) uint8_t record_data[record_pipeline_len];
+#ifdef VITA3K_UWP
+    // the pipeline's content key (for Dozen's variants)
+    uint64_t uwp_key = 0;
+#endif
+
+    const GxmRecordState *get_record() {''')
+
+replace(pcc, '''#endif
+
+PipelineCache::PipelineCache(VKState &state)''', '''
+// ---- Dozen variants ----
+using uwp_dzn_hook_fn = void (*)(uint64_t, const void *, uint32_t);
+static PipelineCache *uwp_variant_owner = nullptr;
+static int (*uwp_dzn_prebuild)(uint64_t, const void *, uint32_t) = nullptr;
+static uint32_t uwp_dzn_key_size = 0;
+constexpr uint32_t uwp_variants_magic = 0x5644564B; // "KVDV"
+
+static void uwp_dzn_variant_hook(uint64_t pipeline, const void *data, uint32_t size) {
+    if (PipelineCache *owner = uwp_variant_owner)
+        owner->uwp_variant_seen(pipeline, data, size);
+}
+
+void PipelineCache::uwp_variants_load() {
+    if (!uwp_variant_owner) {
+        const auto set_hook = reinterpret_cast<void (*)(uwp_dzn_hook_fn)>(vita3k_uwp_dzn_proc("vita3k_dzn_set_variant_hook"));
+        const auto key_size = reinterpret_cast<uint32_t (*)()>(vita3k_uwp_dzn_proc("vita3k_dzn_variant_key_size"));
+        uwp_dzn_prebuild = reinterpret_cast<int (*)(uint64_t, const void *, uint32_t)>(vita3k_uwp_dzn_proc("vita3k_dzn_prebuild_variant"));
+        if (!set_hook || !key_size || !uwp_dzn_prebuild) {
+            LOG_INFO("Dozen variants: this driver does not report them");
+            return;
+        }
+        uwp_dzn_key_size = key_size();
+        uwp_variant_owner = this;
+        set_hook(&uwp_dzn_variant_hook);
+    }
+    std::lock_guard<std::mutex> guard(uwp_replay_mutex);
+    uwp_variants.clear();
+    const fs::path path = state.shaders_path / fmt::format("pipeline-variants-vk{}.bin", shader::CURRENT_VERSION);
+    std::ifstream file(path, std::ios::in | std::ios::binary);
+    if (!file.is_open())
+        return;
+    uint32_t magic = 0, size = 0;
+    uint64_t count = 0;
+    file.read(reinterpret_cast<char *>(&magic), sizeof(magic));
+    file.read(reinterpret_cast<char *>(&size), sizeof(size));
+    file.read(reinterpret_cast<char *>(&count), sizeof(count));
+    if (!file || magic != uwp_variants_magic || size != uwp_dzn_key_size || count > 200000) {
+        LOG_WARN("Dozen variants: saved list from another driver build, starting a new one");
+        return;
+    }
+    size_t total = 0;
+    for (uint64_t i = 0; i < count; ++i) {
+        uint64_t key = 0;
+        std::vector<uint8_t> variant(size);
+        file.read(reinterpret_cast<char *>(&key), sizeof(key));
+        file.read(reinterpret_cast<char *>(variant.data()), size);
+        if (!file)
+            break;
+        uwp_variants[key].push_back(std::move(variant));
+        ++total;
+    }
+    LOG_INFO("Dozen variants: {} draw-time variants of {} pipelines will be built with their pipelines", total, uwp_variants.size());
+}
+
+void PipelineCache::uwp_variants_save() {
+    std::vector<uint8_t> out;
+    {
+        std::lock_guard<std::mutex> guard(uwp_replay_mutex);
+        if (!uwp_variants_dirty || !uwp_dzn_key_size)
+            return;
+        uwp_variants_dirty = false;
+        uint64_t count = 0;
+        for (const auto &[key, list] : uwp_variants)
+            count += list.size();
+        const uint32_t magic = uwp_variants_magic, size = uwp_dzn_key_size;
+        out.resize(16);
+        memcpy(out.data(), &magic, 4);
+        memcpy(out.data() + 4, &size, 4);
+        memcpy(out.data() + 8, &count, 8);
+        for (const auto &[key, list] : uwp_variants) {
+            for (const auto &variant : list) {
+                const uint8_t *k = reinterpret_cast<const uint8_t *>(&key);
+                out.insert(out.end(), k, k + sizeof(key));
+                out.insert(out.end(), variant.begin(), variant.end());
+            }
+        }
+    }
+    const fs::path path = state.shaders_path / fmt::format("pipeline-variants-vk{}.bin", shader::CURRENT_VERSION);
+    fs::path temp = path;
+    temp += ".tmp";
+    {
+        std::ofstream file(temp, std::ios::out | std::ios::binary | std::ios::trunc);
+        if (!file.is_open())
+            return;
+        file.write(reinterpret_cast<const char *>(out.data()), out.size());
+    }
+    std::error_code error;
+    fs::rename(temp, path, error);
+}
+
+// Dozen, at a draw: this pipeline needed a variant it did not have yet.
+void PipelineCache::uwp_variant_seen(uint64_t pipeline, const void *data, uint32_t size) {
+    if (size != uwp_dzn_key_size || !data)
+        return;
+    std::lock_guard<std::mutex> guard(uwp_replay_mutex);
+    const auto found = uwp_pipeline_keys.find(pipeline);
+    if (found == uwp_pipeline_keys.end())
+        return;
+    auto &list = uwp_variants[found->second];
+    if (list.size() >= 64)
+        return;
+    const uint8_t *bytes = static_cast<const uint8_t *>(data);
+    for (const auto &known : list)
+        if (memcmp(known.data(), bytes, size) == 0)
+            return;
+    list.emplace_back(bytes, bytes + size);
+    uwp_variants_dirty = true;
+}
+
+// The thread that made the pipeline, before publishing it: build its known variants.
+void PipelineCache::uwp_variants_prebuild(uint64_t key, vk::Pipeline pipeline) {
+    if (!key || !pipeline || pipeline == std::bit_cast<vk::Pipeline, uint64_t>(~1ULL) || !uwp_dzn_prebuild)
+        return;
+    const uint64_t handle = std::bit_cast<uint64_t>(static_cast<VkPipeline>(pipeline));
+    std::vector<std::vector<uint8_t>> todo;
+    {
+        std::lock_guard<std::mutex> guard(uwp_replay_mutex);
+        uwp_pipeline_keys[handle] = key;
+        const auto found = uwp_variants.find(key);
+        if (found != uwp_variants.end())
+            todo = found->second;
+    }
+    for (const auto &variant : todo)
+        uwp_dzn_prebuild(handle, variant.data(), static_cast<uint32_t>(variant.size()));
+}
+#endif
+
+PipelineCache::PipelineCache(VKState &state)''')
+
+replace(pcc, '''#ifdef VITA3K_UWP
+    uwp_replay_load();
+#endif''', '''#ifdef VITA3K_UWP
+    uwp_replay_load();
+    uwp_variants_load();
+#endif''')
+replace(pcc, '''    uwp_replay_save();''', '''    uwp_replay_save();
+    uwp_variants_save();''')
+
+# remember each request's key: warm-up and draw-time requests
+replace(pcc, '''        memcpy(request->record_data, rec.record_data, record_pipeline_len);
+        it->second = pipeline_compiling;''', '''        memcpy(request->record_data, rec.record_data, record_pipeline_len);
+        request->uwp_key = key;
+        it->second = pipeline_compiling;''')
+replace(pcc, '''        memcpy(request->record_data, &record, record_pipeline_len);
+        it->second = pipeline_compiling;''', '''        memcpy(request->record_data, &record, record_pipeline_len);
+#ifdef VITA3K_UWP
+        request->uwp_key = key;
+#endif
+        it->second = pipeline_compiling;''')
+# build the variants before the pipeline is visible to draws
+replace(pcc, '''#endif
+        *request->pipeline = pipeline;''', '''        uwp_variants_prebuild(request->uwp_key, pipeline);
+#endif
+        *request->pipeline = pipeline;''')
+replace(pcc, '''        vk::Pipeline result = compile_pipeline(type, render_pass, vertex_program_gxm, fragment_program_gxm, record, context.shader_hints, mem);
+#endif
+''', '''        vk::Pipeline result = compile_pipeline(type, render_pass, vertex_program_gxm, fragment_program_gxm, record, context.shader_hints, mem);
+#endif
+#ifdef VITA3K_UWP
+        uwp_variants_prebuild(key, result);
+#endif
+''')
+# (declared outside renderer::vulkan: it lives in the libretro file)
+replace(pcc, 'int vita3k_uwp_shader_threads = 6;', 'int vita3k_uwp_shader_threads = 6;\nvoid *vita3k_uwp_dzn_proc(const char *name);')
+print('Dozen: draw-time pipeline variants remembered per pipeline and built with it in later sessions.')

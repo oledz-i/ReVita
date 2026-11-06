@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: oledz-i <x@x>
+Date: Fri, 6 Nov 2026 15:30:00 -0500
+Subject: [PATCH] dzn: report draw-time pipeline variants and build them ahead on request
+
+---
+diff --git a/src/microsoft/vulkan/dzn_pipeline.c b/src/microsoft/vulkan/dzn_pipeline.c
+index 174c246..6b68b50 100644
+--- a/src/microsoft/vulkan/dzn_pipeline.c
++++ b/src/microsoft/vulkan/dzn_pipeline.c
+@@ -1984,6 +1984,37 @@ static __declspec(thread) bool onyx_in_precompile;
+ static __thread bool onyx_in_precompile;
+ #endif
+ 
++/* VITA3K: draw-time variants, reported to the application and built ahead.
++ * Pipelines with dynamic stencil masks or emulated depth bias get their real
++ * GPU code per variant, at the first draw that needs it: a stall the app's
++ * background compiling cannot hide. The app is told each variant a draw
++ * needed (pipeline handle + key) and, in a later session, asks for the same
++ * variants right after making the pipeline, before anything draws with it. */
++#ifdef _WIN32
++#define VITA3K_DZN_EXPORT __declspec(dllexport)
++#else
++#define VITA3K_DZN_EXPORT PUBLIC
++#endif
++typedef void (*vita3k_variant_hook_fn)(uint64_t pipeline, const void *key, uint32_t key_size);
++static vita3k_variant_hook_fn vita3k_variant_hook;
++
++VITA3K_DZN_EXPORT void
++vita3k_dzn_set_variant_hook(vita3k_variant_hook_fn hook);
++VITA3K_DZN_EXPORT void
++vita3k_dzn_set_variant_hook(vita3k_variant_hook_fn hook)
++{
++   vita3k_variant_hook = hook;
++}
++
++VITA3K_DZN_EXPORT uint32_t
++vita3k_dzn_variant_key_size(void);
++VITA3K_DZN_EXPORT uint32_t
++vita3k_dzn_variant_key_size(void)
++{
++   return (uint32_t)sizeof(struct dzn_graphics_pipeline_variant_key);
++}
++
++
+ static VkResult
+ dzn_graphics_pipeline_create(struct dzn_device *device,
+                              VkPipelineCache cache,
+@@ -3005,6 +3036,9 @@ dzn_graphics_pipeline_get_state(struct dzn_graphics_pipeline *pipeline,
+       }
+       he = _mesa_hash_table_insert(pipeline->variants, &variant->key, variant);
+       assert(he);
++      if (!onyx_in_precompile && vita3k_variant_hook)
++         vita3k_variant_hook((uint64_t)(uintptr_t)dzn_graphics_pipeline_to_handle(pipeline),
++                             &masked_key, (uint32_t)sizeof(masked_key));
+    } else {
+       variant = he->data;
+    }
+@@ -3021,6 +3055,25 @@ dzn_graphics_pipeline_get_state(struct dzn_graphics_pipeline *pipeline,
+    return variant->state;
+ }
+ 
++VITA3K_DZN_EXPORT int
++vita3k_dzn_prebuild_variant(uint64_t pipeline_handle, const void *key, uint32_t key_size);
++VITA3K_DZN_EXPORT int
++vita3k_dzn_prebuild_variant(uint64_t pipeline_handle, const void *key, uint32_t key_size)
++{
++   if (!pipeline_handle || !key || key_size != sizeof(struct dzn_graphics_pipeline_variant_key))
++      return 0;
++   struct dzn_graphics_pipeline *pipeline =
++      dzn_graphics_pipeline_from_handle((VkPipeline)(uintptr_t)pipeline_handle);
++   if (!pipeline || pipeline->base.type != VK_PIPELINE_BIND_POINT_GRAPHICS || !pipeline->variants)
++      return 0;
++   struct dzn_graphics_pipeline_variant_key copy;
++   memcpy(&copy, key, sizeof(copy));
++   onyx_in_precompile = true;
++   ID3D12PipelineState *state = dzn_graphics_pipeline_get_state(pipeline, &copy);
++   onyx_in_precompile = false;
++   return state != NULL;
++}
++
+ #define DZN_INDIRECT_CMD_SIG_MAX_ARGS 4
+ 
+ ID3D12CommandSignature *
