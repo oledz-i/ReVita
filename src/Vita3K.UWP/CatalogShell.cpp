@@ -28,6 +28,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <set>
 #include <system_error>
 #include <string>
 #include <stdexcept>
@@ -514,6 +515,13 @@ CatalogShell::CatalogShell() {
     // understated status line. Column 0 (the old rail) is kept at no width so
     // every full-screen layer still spans both columns.
     root_ = ref new Grid();
+    // The controller moves to the nearest control in the direction pressed,
+    // even when nothing lines up exactly (rows of different lengths, a button
+    // on the far right): focus never just stays put.
+    root_->XYFocusUpNavigationStrategy = Windows::UI::Xaml::Input::XYFocusNavigationStrategy::NavigationDirectionDistance;
+    root_->XYFocusDownNavigationStrategy = Windows::UI::Xaml::Input::XYFocusNavigationStrategy::NavigationDirectionDistance;
+    root_->XYFocusLeftNavigationStrategy = Windows::UI::Xaml::Input::XYFocusNavigationStrategy::NavigationDirectionDistance;
+    root_->XYFocusRightNavigationStrategy = Windows::UI::Xaml::Input::XYFocusNavigationStrategy::NavigationDirectionDistance;
     root_->Background = Solid(Bg());
     auto railColumn = ref new ColumnDefinition();
     railColumn->Width = GridLength(0);
@@ -720,6 +728,16 @@ CatalogShell::CatalogShell() {
                 if (code == Windows::System::VirtualKey::GamepadB ||
                     code == Windows::System::VirtualKey::Escape) {
                     PlayCue(2);
+                    if (page_ == 2) {
+                        auto focused = Windows::UI::Xaml::Input::FocusManager::GetFocusedElement();
+                        const bool onRail = std::any_of(settingsRail_.begin(), settingsRail_.end(),
+                            [&](Windows::UI::Xaml::Controls::Button^ b) { return Platform::Object::ReferenceEquals(b, focused); });
+                        if (!onRail) {
+                            FocusSettingsRail();
+                            e->Handled = true;
+                            return;
+                        }
+                    }
                     ShowPage(page_ == 4 ? 1 : 0);
                 }
             });
@@ -877,16 +895,18 @@ void CatalogShell::BuildNavigation() {
         return hint;
     };
     tabs->Children->Append(bumper(L"LB"));
-    const wchar_t* glyphs[] = {L"\xE80F", L"\xE8F1", L"\xE713", L"\xE90F"};
-    const wchar_t* labels[] = {L"Home", L"Library", L"Settings", L"Tools"};
+    const wchar_t* glyphs[] = {L"\xE80F", L"\xE8F1", L"\xE945", L"\xE713", L"\xE90F"};
+    const wchar_t* labels[] = {L"Home", L"Library", L"Mods", L"Settings", L"Tools"};
+    const int tabPage[] = { 0, 1, 5, 2, 3 };
     // Tools holds developer diagnostics. Release builds (VITA3K_RELEASE_BUILD)
     // leave it out; development builds keep it. See docs/RELEASING.md.
 #if defined(VITA3K_RELEASE_BUILD)
-    constexpr int visibleTabs = 3;
-#else
     constexpr int visibleTabs = 4;
+#else
+    constexpr int visibleTabs = 5;
 #endif
-    for (int i = 0; i < visibleTabs; ++i) {
+    for (int tab = 0; tab < visibleTabs; ++tab) {
+        const int i = tabPage[tab];
         const bool selected = page_ == i || (i == 1 && page_ == 4);
         auto nav = ref new Windows::UI::Xaml::Controls::Button();
         nav->Margin = Thickness(2, 0, 2, 0);
@@ -898,10 +918,10 @@ void CatalogShell::BuildNavigation() {
         // The dock shows where you are; LB and RB move between tabs. Focus
         // never lands here, so the controller can't get stuck in the dock.
         nav->IsTabStop = false;
-        Windows::UI::Xaml::Automation::AutomationProperties::SetName(nav, ref new Platform::String(labels[i]));
+        Windows::UI::Xaml::Automation::AutomationProperties::SetName(nav, ref new Platform::String(labels[tab]));
         auto inside = ref new StackPanel();
         inside->Orientation = Orientation::Horizontal;
-        auto symbol = Text(ref new Platform::String(glyphs[i]), 16, false);
+        auto symbol = Text(ref new Platform::String(glyphs[tab]), 16, false);
         symbol->FontFamily = ref new Windows::UI::Xaml::Media::FontFamily(L"Segoe MDL2 Assets");
         symbol->Foreground = Solid(selected ? Colors::White : RgbColor(160, 162, 178));
         symbol->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
@@ -909,7 +929,7 @@ void CatalogShell::BuildNavigation() {
         inside->Children->Append(symbol);
         if (selected) {
             // only the current tab spells its name; the others are icons
-            auto name = Text(ref new Platform::String(labels[i]), 14, true);
+            auto name = Text(ref new Platform::String(labels[tab]), 14, true);
             name->Foreground = Solid(Colors::White);
             name->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
             inside->Children->Append(name);
@@ -929,26 +949,124 @@ void CatalogShell::BuildNavigation() {
     dock->Child = tabs;
     layer->Children->Append(dock);
 
+    // Settings: the categories in a fixed list down the left. Moving through
+    // it switches the page at once; Right goes into the options.
+    settingsRail_.clear();
+    if (page_ == 2) {
+        auto rail = ref new Border();
+        rail->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Left;
+        rail->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Top;
+        rail->Margin = Thickness(44, 88, 0, 0);
+        rail->Width = 172;
+        rail->Padding = Thickness(8);
+        rail->CornerRadius = Windows::UI::Xaml::CornerRadius(22);
+        {
+            const Color card = Card();
+            rail->Background = Solid(Alpha(225, card.R, card.G, card.B));
+        }
+        rail->BorderBrush = BrandBrush(0.4);
+        rail->BorderThickness = Thickness(1);
+        auto list = ref new StackPanel();
+        const wchar_t* groups[] = { L"System", L"Emulation", L"Look", L"Sound", L"Artwork", L"Help" };
+        const wchar_t* groupGlyphs[] = { L"\xE7F8", L"\xE7FC", L"\xE790", L"\xE767", L"\xEB9F", L"\xE897" };
+        for (int i = 0; i < 6; ++i) {
+            auto item = ref new Windows::UI::Xaml::Controls::Button();
+            item->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Stretch;
+            item->HorizontalContentAlignment = Windows::UI::Xaml::HorizontalAlignment::Left;
+            item->Height = 44;
+            item->Margin = Thickness(0, 2, 0, 2);
+            item->Padding = Thickness(14, 0, 12, 0);
+            item->BorderThickness = Thickness(0);
+            Skin(item, 22);
+            Windows::UI::Xaml::Automation::AutomationProperties::SetName(item, ref new Platform::String(groups[i]));
+            auto inside = ref new StackPanel();
+            inside->Orientation = Orientation::Horizontal;
+            auto symbol = Text(ref new Platform::String(groupGlyphs[i]), 15, false);
+            symbol->FontFamily = ref new Windows::UI::Xaml::Media::FontFamily(L"Segoe MDL2 Assets");
+            symbol->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
+            symbol->Margin = Thickness(0, 1, 12, 0);
+            inside->Children->Append(symbol);
+            auto name = Text(ref new Platform::String(groups[i]), 14, true);
+            name->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
+            inside->Children->Append(name);
+            item->Content = inside;
+            // the options sit to the right; Right from any category goes there
+            item->XYFocusRightNavigationStrategy = Windows::UI::Xaml::Input::XYFocusNavigationStrategy::NavigationDirectionDistance;
+            item->GotFocus += ref new RoutedEventHandler([this,i](Platform::Object^, RoutedEventArgs^) {
+                PlayCue(0);
+                if (settingsTab_ == i) return;
+                settingsTab_ = i;
+                PutPref(L"settings.tab", StringOf(std::to_wstring(i)));
+                StyleSettingsRail();
+                Render();   // only the page on the right is drawn again
+            });
+            item->Click += ref new RoutedEventHandler([this](Platform::Object^, RoutedEventArgs^) {
+                // A goes into the options
+                PlayCue(1);
+                if (content_ == nullptr) return;
+                std::vector<Control^> stops;
+                CollectFocusable(content_, stops);
+                if (!stops.empty()) stops.front()->Focus(Windows::UI::Xaml::FocusState::Programmatic);
+            });
+            settingsRail_.push_back(item);
+            list->Children->Append(item);
+        }
+        rail->Child = list;
+        layer->Children->Append(rail);
+        StyleSettingsRail();
+        if (focusSettingsTab_) {
+            focusSettingsTab_ = false;
+            auto first = settingsRail_[std::max(0, std::min(5, settingsTab_))];
+            first->Loaded += ref new RoutedEventHandler([first](Platform::Object^, RoutedEventArgs^) {
+                first->Focus(Windows::UI::Xaml::FocusState::Programmatic);
+            });
+        }
+    }
+
     navigation_->Child = layer;
     UpdateClock();
 }
+void CatalogShell::StyleSettingsRail() {
+    for (int i = 0; i < static_cast<int>(settingsRail_.size()); ++i) {
+        const bool on = i == settingsTab_;
+        auto item = settingsRail_[i];
+        item->Background = on ? static_cast<Brush^>(BrandBrush(0.9)) : Solid(Colors::Transparent);
+        item->Foreground = Solid(on ? Colors::White : RgbColor(176, 178, 194));
+        auto inside = dynamic_cast<StackPanel^>(item->Content);
+        if (inside == nullptr) continue;
+        for (auto child : inside->Children) {
+            if (auto text = dynamic_cast<TextBlock^>(child))
+                text->Foreground = Solid(on ? Colors::White : RgbColor(176, 178, 194));
+        }
+    }
+}
+void CatalogShell::FocusSettingsRail() {
+    if (settingsRail_.empty()) return;
+    settingsRail_[std::max(0, std::min(static_cast<int>(settingsRail_.size()) - 1, settingsTab_))]->Focus(
+        Windows::UI::Xaml::FocusState::Programmatic);
+}
 void CatalogShell::SwitchTab(int delta) {
+    // the dock's order: Home, Library, Mods, Settings, Tools
+    static const int order[] = { 0, 1, 5, 2, 3 };
 #if defined(VITA3K_RELEASE_BUILD)
-    constexpr int tabCount = 3;
-#else
     constexpr int tabCount = 4;
+#else
+    constexpr int tabCount = 5;
 #endif
-    int current = page_ == 4 ? 1 : page_;
-    int next = (current + delta + tabCount) % tabCount;
+    const int page = page_ == 4 ? 1 : page_;
+    int current = 0;
+    for (int i = 0; i < tabCount; ++i)
+        if (order[i] == page) current = i;
+    const int next = (current + delta + tabCount) % tabCount;
     if (next == current) return;
     PlayCue(4);
-    ShowPage(next);
+    ShowPage(order[next]);
 }
 void CatalogShell::ShowPage(int nextPage) {
 #if defined(VITA3K_RELEASE_BUILD)
     if (nextPage == 3) nextPage = 0;
 #endif
-    if (nextPage < 0 || nextPage > 4) nextPage = 0;
+    if (nextPage < 0 || nextPage > 5) nextPage = 0;
     if (page_ == 3 && nextPage != 3) renderer_.Shutdown();
     if (nextPage != page_) PlayCue(4);
     if (nextPage == 2 && page_ != 2) focusSettingsTab_ = true;
@@ -1869,6 +1987,13 @@ void CatalogShell::GameDetails() {
         ShowArtPicker(index);
     });
     actions->Children->Append(find);
+    auto mods = Button(L"Cheats & patches");
+    mods->Height = 54;
+    mods->Click += ref new RoutedEventHandler([this,index](Platform::Object^, RoutedEventArgs^) {
+        modsGame_ = static_cast<int>(index);
+        ShowPage(5);
+    });
+    actions->Children->Append(mods);
     right->Children->Append(actions);
     if (games_[index].format == vita3k_uwp::GameFormat::Pkg) {
         auto license = Button(L"Choose the game's license file");
@@ -1901,6 +2026,510 @@ void CatalogShell::GameDetails() {
         play->Focus(Windows::UI::Xaml::FocusState::Programmatic);
     });
 }
+// ── Mods: cheats and patches ────────────────────────────────────────────────
+// Cheats come from the VitaCheat database (one .psv file per title ID) and run
+// through the core's cheat engine; `_V1` marks a cheat that is on when the game
+// starts, `_V0` one that is off. Patches come from Vita3K's patch list
+// (patchlist.xml); the ones turned on are listed in patch_config.xml, by the
+// same key the core uses. All of it lives in the core's data folder.
+namespace {
+const wchar_t* kCheatDatabase = L"https://raw.githubusercontent.com/r0ah/vitacheat/master/db/";
+const wchar_t* kPatchList = L"https://github.com/Vita3K/vita3k-patches/releases/download/latest/patchlist.xml";
+
+struct CheatCard {
+    std::wstring name;
+    bool on = false;
+    size_t lines = 0;
+};
+struct CheatFileInfo {
+    bool present = false;
+    std::wstring title, author, note;
+    std::vector<CheatCard> cheats;
+};
+struct PatchCard {
+    std::wstring title, name, author, note, patchVer, appVer;
+    std::string key;
+    bool on = false;
+};
+
+std::wstring CheatFilePath(const std::wstring& id) { return FirmwareRoot() + L"\\cheats\\" + id + L".psv"; }
+std::wstring PatchDir() { return FirmwareRoot() + L"\\patch"; }
+
+bool ReadAll(const std::wstring& path, std::string& out) {
+    std::ifstream file(std::filesystem::path(path), std::ios::binary);
+    if (!file) return false;
+    out.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    return true;
+}
+bool WriteAll(const std::wstring& path, const std::string& data) {
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+    const std::wstring temp = path + L".tmp";
+    {
+        std::ofstream file(std::filesystem::path(temp), std::ios::binary | std::ios::trunc);
+        if (!file) return false;
+        file.write(data.data(), static_cast<std::streamsize>(data.size()));
+        if (!file) return false;
+    }
+    std::filesystem::rename(std::filesystem::path(temp), std::filesystem::path(path), ec);
+    if (ec) {
+        std::filesystem::remove(std::filesystem::path(path), ec);
+        std::filesystem::rename(std::filesystem::path(temp), std::filesystem::path(path), ec);
+    }
+    return !ec;
+}
+Platform::String^ XmlText(const std::string& utf8) {
+    std::wstring text = WidenUtf8(utf8);
+    if (!text.empty() && text[0] == 0xFEFF) text.erase(0, 1);
+    if (text.compare(0, 5, L"<?xml") == 0) {
+        const auto end = text.find(L"?>");
+        if (end != std::wstring::npos) text.erase(0, end + 2);
+    }
+    return StringOf(text);
+}
+std::wstring Trim(const std::wstring& s) {
+    const auto a = s.find_first_not_of(L" \t\r\n");
+    if (a == std::wstring::npos) return L"";
+    const auto b = s.find_last_not_of(L" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
+// each line with where it starts in the file
+std::vector<std::pair<size_t, std::string>> Lines(const std::string& text) {
+    std::vector<std::pair<size_t, std::string>> lines;
+    size_t start = 0;
+    while (start <= text.size()) {
+        size_t end = text.find('\n', start);
+        if (end == std::string::npos) end = text.size();
+        std::string line = text.substr(start, end - start);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        lines.emplace_back(start, line);
+        if (end == text.size()) break;
+        start = end + 1;
+    }
+    return lines;
+}
+bool IsCheatMarker(const std::string& line) {
+    return line.size() >= 3 && line[0] == '_' && (line[1] == 'V' || line[1] == 'v') && (line[2] == '0' || line[2] == '1');
+}
+CheatFileInfo ReadCheats(const std::wstring& id) {
+    CheatFileInfo info;
+    std::string text;
+    if (!ReadAll(CheatFilePath(id), text)) return info;
+    info.present = true;
+    for (const auto& [offset, line] : Lines(text)) {
+        (void)offset;
+        if (!line.empty() && line[0] == '#') {
+            const std::wstring w = WidenUtf8(line.substr(1));
+            const auto colon = w.find(L':');
+            if (colon == std::wstring::npos) continue;
+            const std::wstring field = Trim(w.substr(0, colon));
+            const std::wstring value = Trim(w.substr(colon + 1));
+            if (field == L"Title") info.title = value;
+            else if (field == L"Code Author" || field == L"Author") info.author = value;
+            else if (field == L"Note") info.note = value;
+        } else if (IsCheatMarker(line)) {
+            CheatCard card;
+            card.on = line[2] == '1';
+            card.name = Trim(WidenUtf8(line.substr(3)));
+            if (card.name.empty()) card.name = L"Unnamed cheat";
+            info.cheats.push_back(card);
+        } else if (!line.empty() && line[0] == '$' && !info.cheats.empty()) {
+            info.cheats.back().lines++;
+        }
+    }
+    return info;
+}
+std::set<std::string> ReadEnabledPatches() {
+    std::set<std::string> keys;
+    std::string text;
+    if (!ReadAll(PatchDir() + L"\\patch_config.xml", text) || text.empty()) return keys;
+    try {
+        auto doc = ref new Windows::Data::Xml::Dom::XmlDocument();
+        doc->LoadXml(XmlText(text));
+        auto nodes = doc->GetElementsByTagName(L"Enabled");
+        for (unsigned i = 0; i < nodes->Length; ++i) {
+            auto element = dynamic_cast<Windows::Data::Xml::Dom::XmlElement^>(nodes->Item(i));
+            if (element != nullptr) keys.insert(NarrowUtf8(element->GetAttribute(L"Key")->Data()));
+        }
+    } catch (Platform::Exception^) {}
+    return keys;
+}
+bool WriteEnabledPatches(const std::set<std::string>& keys) {
+    auto escape = [](const std::string& s) {
+        std::string out;
+        for (char c : s) {
+            switch (c) {
+            case '&': out += "&amp;"; break;
+            case '<': out += "&lt;"; break;
+            case '>': out += "&gt;"; break;
+            case '"': out += "&quot;"; break;
+            default: out += c; break;
+            }
+        }
+        return out;
+    };
+    std::string xml = "<?xml version=\"1.0\"?>\n<PatchConfig>\n";
+    for (const auto& key : keys) xml += "\t<Enabled Key=\"" + escape(key) + "\" />\n";
+    xml += "</PatchConfig>\n";
+    return WriteAll(PatchDir() + L"\\patch_config.xml", xml);
+}
+std::vector<PatchCard> ReadPatches(const std::wstring& id, bool& listPresent) {
+    std::vector<PatchCard> cards;
+    std::string text;
+    listPresent = ReadAll(PatchDir() + L"\\patchlist.xml", text) && !text.empty();
+    if (!listPresent) return cards;
+    const auto enabled = ReadEnabledPatches();
+    try {
+        auto doc = ref new Windows::Data::Xml::Dom::XmlDocument();
+        doc->LoadXml(XmlText(text));
+        auto root = doc->DocumentElement;
+        if (root == nullptr) return cards;
+        std::vector<std::wstring> ids;
+        for (unsigned i = 0; i < root->ChildNodes->Length; ++i) {
+            auto element = dynamic_cast<Windows::Data::Xml::Dom::XmlElement^>(root->ChildNodes->Item(i));
+            if (element == nullptr) continue;
+            const std::wstring tag = element->TagName->Data();
+            if (tag == L"TitleID") {
+                ids.clear();
+                auto idNodes = element->GetElementsByTagName(L"ID");
+                for (unsigned k = 0; k < idNodes->Length; ++k)
+                    ids.push_back(Trim(idNodes->Item(k)->InnerText->Data()));
+                continue;
+            }
+            if (tag != L"Metadata" || std::find(ids.begin(), ids.end(), id) == ids.end()) continue;
+            PatchCard card;
+            card.title = element->GetAttribute(L"Title")->Data();
+            card.name = element->GetAttribute(L"Name")->Data();
+            card.author = element->GetAttribute(L"Author")->Data();
+            card.note = element->GetAttribute(L"Note")->Data();
+            card.patchVer = element->GetAttribute(L"PatchVer")->Data();
+            card.appVer = element->GetAttribute(L"AppVer")->Data();
+            std::wstring elf = element->GetAttribute(L"AppElf")->Data();
+            if (elf.empty()) elf = L"eboot.bin";
+            const std::wstring nid = element->GetAttribute(L"NID")->Data();
+            // the core's key: first title ID | AppVer | AppElf | NID | Name
+            card.key = NarrowUtf8(ids.front() + L"|" + card.appVer + L"|" + elf + L"|" + nid + L"|" + card.name);
+            card.on = enabled.count(card.key) != 0;
+            cards.push_back(card);
+        }
+    } catch (Platform::Exception^) {}
+    return cards;
+}
+// A newer cheat file keeps the cheats the player had on.
+std::string MergeCheatStates(const std::string& fresh, const std::string& old) {
+    std::set<std::string> on;
+    for (const auto& [offset, line] : Lines(old)) {
+        (void)offset;
+        if (IsCheatMarker(line) && line[2] == '1') on.insert(line.substr(3));
+    }
+    std::string out = fresh;
+    for (const auto& [offset, line] : Lines(fresh)) {
+        if (IsCheatMarker(line) && on.count(line.substr(3)) != 0) out[offset + 2] = '1';
+    }
+    return out;
+}
+} // namespace
+
+void CatalogShell::ToggleCheat(const std::wstring& titleId, size_t cheatIndex) {
+    std::string text;
+    if (!ReadAll(CheatFilePath(titleId), text)) return;
+    size_t seen = 0;
+    for (const auto& [offset, line] : Lines(text)) {
+        if (!IsCheatMarker(line)) continue;
+        if (seen++ == cheatIndex) {
+            text[offset + 2] = line[2] == '1' ? '0' : '1';
+            break;
+        }
+    }
+    modsMessage_ = WriteAll(CheatFilePath(titleId), text)
+        ? L"Saved. Cheats apply from the next time the game starts."
+        : L"Couldn't save the cheat file.";
+    Render();
+}
+
+void CatalogShell::TogglePatch(const std::string& key) {
+    auto keys = ReadEnabledPatches();
+    if (keys.count(key)) keys.erase(key);
+    else keys.insert(key);
+    modsMessage_ = WriteEnabledPatches(keys)
+        ? L"Saved. Patches apply from the next time the game starts."
+        : L"Couldn't save the patch settings.";
+    Render();
+}
+
+void CatalogShell::FetchMods(size_t index, bool force) {
+    if (modsBusy_ || index >= games_.size()) return;
+    const std::wstring id = GameTitleId(index);
+    if (id.empty()) {
+        modsMessage_ = L"This game has no title ID, so it can't be matched with a database.";
+        Render();
+        return;
+    }
+    modsBusy_ = true;
+    modsMessage_ = L"Getting the latest cheats and patches...";
+    Render();
+    auto client = ref new Windows::Web::Http::HttpClient();
+    client->DefaultRequestHeaders->UserAgent->TryParseAdd(L"ReVita/1.0 (Xbox)");
+    auto result = std::make_shared<std::wstring>();
+    std::error_code existsError;
+    const bool getCheats = force || !std::filesystem::exists(std::filesystem::path(CheatFilePath(id)), existsError);
+    const bool getPatches = force || !std::filesystem::exists(std::filesystem::path(PatchDir() + L"\\patchlist.xml"), existsError);
+
+    task<void> chain = task_from_result();
+    if (getCheats) {
+        chain = chain.then([client, id, result]() {
+            return create_task(client->GetAsync(ref new Uri(StringOf(std::wstring(kCheatDatabase) + id + L".psv"))))
+            .then([id, result](Windows::Web::Http::HttpResponseMessage^ response) {
+                if (response->StatusCode == Windows::Web::Http::HttpStatusCode::NotFound) {
+                    *result += L"The cheat database has nothing for this game yet. ";
+                    return task_from_result();
+                }
+                response->EnsureSuccessStatusCode();
+                return create_task(response->Content->ReadAsStringAsync()).then([id, result](Platform::String^ body) {
+                    std::string fresh = NarrowUtf8(body->Data());
+                    std::string old;
+                    if (ReadAll(CheatFilePath(id), old)) fresh = MergeCheatStates(fresh, old);
+                    *result += WriteAll(CheatFilePath(id), fresh) ? L"Cheats updated. " : L"Couldn't save the cheats. ";
+                });
+            });
+        }).then([result](task<void> done) {
+            try { done.get(); }
+            catch (Platform::Exception^ e) { *result += L"Couldn't reach the cheat database (" + std::wstring(e->Message->Data()) + L"). "; }
+        });
+    }
+    if (getPatches) {
+        chain = chain.then([client, result]() {
+            return create_task(client->GetStringAsync(ref new Uri(StringOf(kPatchList))))
+            .then([result](Platform::String^ body) {
+                *result += WriteAll(PatchDir() + L"\\patchlist.xml", NarrowUtf8(body->Data()))
+                    ? L"Patch list updated." : L"Couldn't save the patch list.";
+            });
+        }).then([result](task<void> done) {
+            try { done.get(); }
+            catch (Platform::Exception^ e) { *result += L"Couldn't reach the patch list (" + std::wstring(e->Message->Data()) + L")."; }
+        });
+    }
+    chain.then([this, result](task<void> done) {
+        try { done.get(); } catch (...) {}
+        modsBusy_ = false;
+        modsMessage_ = result->empty() ? L"Already up to date." : Trim(*result);
+        if (page_ == 5) Render();
+    }, task_continuation_context::use_current());
+}
+
+void CatalogShell::Mods() {
+    {
+        auto heading = Vertical();
+        heading->Margin = Thickness(2, 10, 0, 12);
+        auto eyebrow = Text(L"MODS & CHEATS", 11, true);
+        eyebrow->CharacterSpacing = 260;
+        eyebrow->Foreground = BrandBrush();
+        heading->Children->Append(eyebrow);
+        auto title = Text(L"Make every game yours.", 40, false);
+        title->FontWeight = FontWeights::Light;
+        title->Margin = Thickness(0, 4, 0, 4);
+        heading->Children->Append(title);
+        auto note = Text(L"Cheats from the VitaCheat database and patches from Vita3K's patch list, for the games you have. Turn them on here; they apply when the game starts.", 13, false, true);
+        note->MaxWidth = 720;
+        heading->Children->Append(note);
+        content_->Children->Append(heading);
+    }
+    // games that can be matched (they need a title ID)
+    std::vector<size_t> matchable;
+    for (size_t i = 0; i < games_.size(); ++i)
+        if (!GameTitleId(i).empty()) matchable.push_back(i);
+    if (matchable.empty()) {
+        HideSpotlight();
+        auto none = Text(L"Add a game first. Cheats and patches are found by the game's title ID.", 14, false, true);
+        none->Margin = Thickness(2, 16, 0, 0);
+        content_->Children->Append(none);
+        return;
+    }
+    if (modsGame_ < 0 || std::find(matchable.begin(), matchable.end(), static_cast<size_t>(modsGame_)) == matchable.end()) {
+        const auto recents = RecentGames();
+        modsGame_ = static_cast<int>(matchable.front());
+        for (auto r : recents)
+            if (std::find(matchable.begin(), matchable.end(), r) != matchable.end()) { modsGame_ = static_cast<int>(r); break; }
+    }
+    const size_t index = static_cast<size_t>(modsGame_);
+    const std::wstring id = GameTitleId(index);
+    UpdateSpotlight(modsGame_);
+
+    // the games, as small posters; A picks one
+    auto strip = ref new StackPanel();
+    strip->Orientation = Orientation::Horizontal;
+    Windows::UI::Xaml::Controls::Button^ current = nullptr;
+    for (const auto i : matchable) {
+        auto pick = ref new Windows::UI::Xaml::Controls::Button();
+        pick->Width = 76;
+        pick->Height = 104;
+        pick->Margin = Thickness(0, 4, 10, 6);
+        pick->Padding = Thickness(0);
+        pick->BorderThickness = Thickness(i == index ? 2 : 0);
+        pick->BorderBrush = BrandBrush();
+        pick->Background = Solid(Colors::Transparent);
+        pick->HorizontalContentAlignment = Windows::UI::Xaml::HorizontalAlignment::Stretch;
+        pick->VerticalContentAlignment = Windows::UI::Xaml::VerticalAlignment::Stretch;
+        Skin(pick, 10);
+        Windows::UI::Xaml::Automation::AutomationProperties::SetName(pick, games_[i].name);
+        auto poster = ref new Border();
+        poster->CornerRadius = Windows::UI::Xaml::CornerRadius(10);
+        ConfigureCover(poster, i);
+        poster->Opacity = i == index ? 1.0 : 0.7;
+        pick->Content = poster;
+        pick->Click += ref new RoutedEventHandler([this, i](Platform::Object^, RoutedEventArgs^) {
+            PlayCue(1);
+            modsGame_ = static_cast<int>(i);
+            modsMessage_.clear();
+            Render();
+        });
+        if (i == index) current = pick;
+        strip->Children->Append(pick);
+    }
+    auto stripScroll = ref new ScrollViewer();
+    stripScroll->HorizontalScrollBarVisibility = ScrollBarVisibility::Hidden;
+    stripScroll->HorizontalScrollMode = ScrollMode::Enabled;
+    stripScroll->VerticalScrollBarVisibility = ScrollBarVisibility::Disabled;
+    stripScroll->VerticalScrollMode = ScrollMode::Disabled;
+    stripScroll->Content = strip;
+    content_->Children->Append(stripScroll);
+
+    // the chosen game, and the button that fetches the latest
+    auto gameRow = Vertical();
+    gameRow->Margin = Thickness(2, 10, 0, 6);
+    auto name = Text(games_[index].name, 26, false);
+    name->FontWeight = FontWeights::Light;
+    gameRow->Children->Append(name);
+    auto meta = Text(StringOf(id), 11, true, true);
+    meta->CharacterSpacing = 120;
+    gameRow->Children->Append(meta);
+    auto actions = ref new StackPanel();
+    actions->Orientation = Orientation::Horizontal;
+    actions->Margin = Thickness(0, 12, 0, 0);
+    auto latest = Button(modsBusy_ ? L"Downloading..." : L"Get the latest from the internet", true);
+    latest->IsEnabled = !modsBusy_;
+    latest->Click += ref new RoutedEventHandler([this, index](Platform::Object^, RoutedEventArgs^) { FetchMods(index, true); });
+    actions->Children->Append(latest);
+    gameRow->Children->Append(actions);
+    if (!modsMessage_.empty()) {
+        auto status = Text(StringOf(modsMessage_), 12, false, true);
+        status->Margin = Thickness(0, 8, 0, 0);
+        gameRow->Children->Append(status);
+    }
+    content_->Children->Append(gameRow);
+
+    // A card for each cheat or patch: the game's cover, the name, who made it,
+    // what it does, and a switch.
+    auto card = [this, index](Platform::String^ title, Platform::String^ detail, Platform::String^ note,
+                              bool on, std::function<void()> toggle) {
+        auto button = ref new Windows::UI::Xaml::Controls::Button();
+        button->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Stretch;
+        button->HorizontalContentAlignment = Windows::UI::Xaml::HorizontalAlignment::Stretch;
+        button->Margin = Thickness(0, 4, 0, 4);
+        button->Padding = Thickness(10);
+        button->MaxWidth = 860;
+        button->BorderThickness = Thickness(1);
+        button->BorderBrush = on ? static_cast<Brush^>(BrandBrush(0.7)) : Solid(Alpha(30, 255, 255, 255));
+        button->Background = Solid(Card());
+        Skin(button, 16);
+        Windows::UI::Xaml::Automation::AutomationProperties::SetName(button, title);
+        auto grid = ref new Grid();
+        auto c0 = ref new ColumnDefinition(); c0->Width = GridLength(56);
+        auto c1 = ref new ColumnDefinition(); c1->Width = GridLength(1, GridUnitType::Star);
+        auto c2 = ref new ColumnDefinition(); c2->Width = GridLength(1, GridUnitType::Auto);
+        grid->ColumnDefinitions->Append(c0);
+        grid->ColumnDefinitions->Append(c1);
+        grid->ColumnDefinitions->Append(c2);
+        auto thumb = ref new Border();
+        thumb->Width = 52;
+        thumb->Height = 70;
+        thumb->CornerRadius = Windows::UI::Xaml::CornerRadius(8);
+        thumb->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Top;
+        ConfigureCover(thumb, index);
+        grid->Children->Append(thumb);
+        auto words = Vertical();
+        words->Margin = Thickness(12, 2, 12, 2);
+        auto heading = Text(title, 15, true);
+        heading->MaxLines = 2;
+        words->Children->Append(heading);
+        auto line = Text(detail, 11, true, true);
+        line->CharacterSpacing = 60;
+        line->Margin = Thickness(0, 3, 0, 0);
+        words->Children->Append(line);
+        if (note != nullptr && !note->IsEmpty()) {
+            auto about = Text(note, 12, false, true);
+            about->Margin = Thickness(0, 5, 0, 0);
+            about->MaxLines = 3;
+            words->Children->Append(about);
+        }
+        Grid::SetColumn(words, 1);
+        grid->Children->Append(words);
+        auto pill = ref new Border();
+        pill->CornerRadius = Windows::UI::Xaml::CornerRadius(14);
+        pill->Padding = Thickness(14, 5, 14, 6);
+        pill->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
+        pill->Background = on ? static_cast<Brush^>(BrandBrush()) : Solid(Alpha(24, 255, 255, 255));
+        pill->Child = Text(on ? L"ON" : L"OFF", 11, true, !on);
+        Grid::SetColumn(pill, 2);
+        grid->Children->Append(pill);
+        button->Content = grid;
+        button->GotFocus += ref new RoutedEventHandler([this](Platform::Object^, RoutedEventArgs^) { PlayCue(0); });
+        button->Click += ref new RoutedEventHandler([this, toggle](Platform::Object^, RoutedEventArgs^) {
+            PlayCue(1);
+            toggle();
+        });
+        return button;
+    };
+
+    const CheatFileInfo cheats = ReadCheats(id);
+    Section(L"Cheats", cheats.present
+        ? StringOf(L"From the VitaCheat database" + (cheats.author.empty() ? std::wstring() : L", codes by " + cheats.author) +
+                   L". A cheat that is ON runs from the moment the game starts.")
+        : StringOf(std::wstring(L"Nothing downloaded for this game yet.")));
+    if (cheats.present && cheats.cheats.empty()) {
+        content_->Children->Append(Text(L"This game's cheat file has no cheats in it.", 13, false, true));
+    }
+    for (size_t c = 0; c < cheats.cheats.size(); ++c) {
+        const auto& cheat = cheats.cheats[c];
+        wchar_t detail[96] = {};
+        swprintf_s(detail, L"CHEAT   \x2022   %zu CODE LINE%s", cheat.lines, cheat.lines == 1 ? L"" : L"S");
+        const std::wstring titleId = id;
+        content_->Children->Append(card(StringOf(cheat.name), ref new Platform::String(detail),
+            c == 0 && !cheats.note.empty() ? StringOf(cheats.note) : static_cast<Platform::String^>(nullptr), cheat.on,
+            [this, titleId, c]() { ToggleCheat(titleId, c); }));
+    }
+
+    bool listPresent = false;
+    const auto patches = ReadPatches(id, listPresent);
+    Section(L"Patches", listPresent
+        ? StringOf(std::wstring(L"From Vita3K's patch list: fixes and improvements like higher frame rates or resolution. Turn one on and start the game."))
+        : StringOf(std::wstring(L"The patch list hasn't been downloaded yet.")));
+    if (listPresent && patches.empty()) {
+        content_->Children->Append(Text(L"No patches in the list for this game yet.", 13, false, true));
+    }
+    for (const auto& patch : patches) {
+        std::wstring detail = L"PATCH";
+        if (!patch.patchVer.empty()) detail += L"   \x2022   V" + patch.patchVer;
+        if (!patch.author.empty()) detail += L"   \x2022   BY " + patch.author;
+        if (!patch.appVer.empty()) detail += L"   \x2022   GAME VERSION " + patch.appVer;
+        const std::string key = patch.key;
+        content_->Children->Append(card(StringOf(patch.name.empty() ? patch.title : patch.name), StringOf(detail),
+            StringOf(patch.note), patch.on, [this, key]() { TogglePatch(key); }));
+    }
+
+    // the first visit to a game gets its cheats and the patch list by itself
+    static std::set<std::wstring> fetched;
+    if (!modsBusy_ && (!cheats.present || !listPresent) && fetched.insert(id).second) {
+        Dispatcher->RunAsync(Windows::UI::Core::CoreDispatcherPriority::Low,
+            ref new Windows::UI::Core::DispatchedHandler([this, index]() { FetchMods(index, false); }));
+    }
+    if (current != nullptr && shownPage_ != 5) {
+        current->Loaded += ref new RoutedEventHandler([current](Platform::Object^, RoutedEventArgs^) {
+            current->Focus(Windows::UI::Xaml::FocusState::Programmatic);
+        });
+    }
+}
+
 std::wstring CatalogShell::GameTitleId(size_t index) const {
     const auto& game = games_[index];
     std::wstring id;
@@ -2066,6 +2695,9 @@ void CatalogShell::CollectFocusable(DependencyObject^ node, std::vector<Control^
     }
 }
 void CatalogShell::Render() {
+    // Settings keeps its category list on the left; its page sits beside it
+    if (content_ != nullptr)
+        content_->Margin = Thickness(page_ == 2 ? 236 : 56, 10, 56, 28);
     // Drawing the same page again (a toggle, a theme, a sort) keeps the
     // controller on the control it was on instead of throwing it to the top.
     int keepFocus = -1;
@@ -2107,7 +2739,7 @@ void CatalogShell::Render() {
     flowFocus_ = -1;
     homeActions_.clear();
     // the spotlight belongs to Home and a game's page
-    if (page_ != 0 && page_ != 4) HideSpotlight();
+    if (page_ != 0 && page_ != 4 && page_ != 5) HideSpotlight();
     // The PS3-style home takes the whole screen over the usual layout.
     if (page_ == 0 && xmbMode_) {
         if (!inGame_) ShowXmb();
@@ -2120,6 +2752,7 @@ void CatalogShell::Render() {
     case 2: Settings(); break;
     case 3: Diagnostics(); break;
     case 4: GameDetails(); break;
+    case 5: Mods(); break;
     default: Home(); break;
     }
     // Each page settles in: its blocks rise and fade in one after another.
@@ -2146,38 +2779,6 @@ void CatalogShell::Settings() {
         title->Margin = Thickness(0, 4, 0, 0);
         heading->Children->Append(title);
         content_->Children->Append(heading);
-    }
-    // One group at a time, chosen here, instead of one endless page.
-    {
-        const wchar_t* groups[] = { L"System", L"Emulation", L"Look", L"Sound", L"Artwork", L"Help" };
-        auto row = ref new StackPanel();
-        row->Orientation = Orientation::Horizontal;
-        row->Margin = Thickness(0, 0, 0, 14);
-        for (int i = 0; i < 6; ++i) {
-            auto chip = Chip(ref new Platform::String(groups[i]), settingsTab_ == i);
-            chip->Height = 40;
-            chip->Padding = Thickness(20, 0, 20, 1);
-            chip->Click += ref new RoutedEventHandler([this,i](Platform::Object^, RoutedEventArgs^) {
-                if (settingsTab_ == i) return;
-                settingsTab_ = i;
-                PutPref(L"settings.tab", StringOf(std::to_wstring(i)));
-                Render();
-            });
-            if (settingsTab_ == i && focusSettingsTab_) {
-                focusSettingsTab_ = false;
-                chip->Loaded += ref new RoutedEventHandler([chip](Platform::Object^, RoutedEventArgs^) {
-                    chip->Focus(Windows::UI::Xaml::FocusState::Programmatic);
-                });
-            }
-            row->Children->Append(chip);
-        }
-        auto rowScroll = ref new ScrollViewer();
-        rowScroll->HorizontalScrollBarVisibility = ScrollBarVisibility::Hidden;
-        rowScroll->HorizontalScrollMode = ScrollMode::Enabled;
-        rowScroll->VerticalScrollBarVisibility = ScrollBarVisibility::Disabled;
-        rowScroll->VerticalScrollMode = ScrollMode::Disabled;
-        rowScroll->Content = row;
-        content_->Children->Append(rowScroll);
     }
     if (settingsTab_ == 0) {
         FirmwareSettings();

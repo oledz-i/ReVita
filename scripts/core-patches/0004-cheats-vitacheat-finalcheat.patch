@@ -1,0 +1,2243 @@
+diff --git a/vita3k/CMakeLists.txt b/vita3k/CMakeLists.txt
+index 2cc9a5a5..c7b8e77c 100644
+--- a/vita3k/CMakeLists.txt
++++ b/vita3k/CMakeLists.txt
+@@ -125,6 +125,7 @@ endif()
+ add_subdirectory(app)
+ add_subdirectory(audio)
+ add_subdirectory(camera)
++add_subdirectory(cheat)
+ add_subdirectory(input)
+ add_subdirectory(config)
+ add_subdirectory(cpu)
+diff --git a/vita3k/app/CMakeLists.txt b/vita3k/app/CMakeLists.txt
+index aa0ebb00..1bfc8223 100644
+--- a/vita3k/app/CMakeLists.txt
++++ b/vita3k/app/CMakeLists.txt
+@@ -19,7 +19,7 @@ target_link_libraries(app PUBLIC emuenv mem)
+ if(USE_DISCORD_RICH_PRESENCE)
+   target_link_libraries(app PUBLIC discord-rpc)
+ endif()
+-target_link_libraries(app PRIVATE audio camera config ctrl dialog display gdbstub gxm ime io mem modules motion net ngs np patch regmgr renderer touch SDL3::SDL3 pugixml::pugixml compat packages http)
++target_link_libraries(app PRIVATE audio camera cheat config ctrl dialog display gdbstub gxm ime io mem modules motion net ngs np patch regmgr renderer touch SDL3::SDL3 pugixml::pugixml compat packages http)
+ if(WIN32)
+ 	target_link_libraries(app PRIVATE dwmapi)
+ endif()
+diff --git a/vita3k/app/src/app_init.cpp b/vita3k/app/src/app_init.cpp
+index 8411bfd8..6fb0cd25 100644
+--- a/vita3k/app/src/app_init.cpp
++++ b/vita3k/app/src/app_init.cpp
+@@ -20,6 +20,7 @@
+ 
+ #include <audio/state.h>
+ #include <camera/state.h>
++#include <cheat/functions.h>
+ #include <compat/state.h>
+ #include <config/settings.h>
+ #include <config/state.h>
+@@ -293,6 +294,7 @@ bool init_paths(Root &root_paths) {
+     root_paths.set_shared_path(internal_storage_path);
+     root_paths.set_cache_path(internal_storage_path / "cache");
+     root_paths.set_patch_path(internal_storage_path / "patch");
++    root_paths.set_cheat_path(internal_storage_path / "cheats");
+ #else
+     auto sdl_exe_path = SDL_GetBasePath();
+     auto exe_path = fs_utils::utf8_to_path(sdl_exe_path);
+@@ -326,6 +328,7 @@ bool init_paths(Root &root_paths) {
+         root_paths.set_shared_path(portable_path);
+         root_paths.set_cache_path(portable_path / "cache");
+         root_paths.set_patch_path(portable_path / "patch");
++        root_paths.set_cheat_path(portable_path / "cheats");
+     } else {
+         // SDL_GetPrefPath is deferred as it creates the directory.
+         // When using a portable directory, it is not needed.
+@@ -358,6 +361,7 @@ bool init_paths(Root &root_paths) {
+         root_paths.set_shared_path(exe_path);
+         root_paths.set_cache_path(exe_path / "cache");
+         root_paths.set_patch_path(exe_path / "patch");
++        root_paths.set_cheat_path(exe_path / "cheats");
+ 
+ #if defined(__linux__)
+         // XDG Data Dirs.
+@@ -431,6 +435,7 @@ bool init_paths(Root &root_paths) {
+         // These default to being in shared path
+         root_paths.set_vita_fs_path(root_paths.get_shared_path() / app_name);
+         root_paths.set_patch_path(root_paths.get_shared_path() / "patch");
++        root_paths.set_cheat_path(root_paths.get_shared_path() / "cheats");
+ #endif
+     }
+ #endif
+@@ -441,6 +446,7 @@ bool init_paths(Root &root_paths) {
+     fs::create_directories(root_paths.get_log_path() / "shaderlog");
+     fs::create_directories(root_paths.get_log_path() / "texturelog");
+     fs::create_directories(root_paths.get_patch_path());
++    fs::create_directories(root_paths.get_cheat_path());
+ 
+     return portable;
+ }
+@@ -455,6 +461,7 @@ bool init(EmuEnvState &state, Config &cfg, const Root &root_paths) {
+     state.shared_path = root_paths.get_shared_path();
+     state.static_assets_path = root_paths.get_static_assets_path();
+     state.patch_path = root_paths.get_patch_path();
++    state.cheat_path = root_paths.get_cheat_path();
+ 
+     // If configuration does not provide a VitaFS path, use SDL's default
+     if (state.cfg.vita_fs_path == root_paths.get_vita_fs_path() || state.cfg.vita_fs_path.empty()) {
+@@ -587,6 +594,7 @@ void reset_app_state(EmuEnvState &state) {
+     state.clear_app_launch_request();
+ 
+     state.ctrl.reset_runtime();
++    cheat::unload(state.cheat);
+     set_current_config(state, "");
+ 
+ #if USE_DISCORD
+diff --git a/vita3k/cheat/CMakeLists.txt b/vita3k/cheat/CMakeLists.txt
+new file mode 100644
+index 00000000..95153694
+--- /dev/null
++++ b/vita3k/cheat/CMakeLists.txt
+@@ -0,0 +1,14 @@
++add_library(
++	cheat
++	STATIC
++	include/cheat/cheat.h
++	include/cheat/functions.h
++	include/cheat/search.h
++	include/cheat/state.h
++	src/cheat.cpp
++	src/parser.cpp
++	src/search.cpp
++)
++
++target_include_directories(cheat PUBLIC include)
++target_link_libraries(cheat PUBLIC mem util)
+diff --git a/vita3k/cheat/include/cheat/cheat.h b/vita3k/cheat/include/cheat/cheat.h
+new file mode 100644
+index 00000000..a9fd3908
+--- /dev/null
++++ b/vita3k/cheat/include/cheat/cheat.h
+@@ -0,0 +1,117 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#pragma once
++
++#include <util/fs.h>
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++// FinalCheat / VitaCheat `*.psv` cheat database format, described in cheat/README.md.
++namespace cheat {
++
++// Code type identifier, the first hexadecimal digit of the `$XXXX` control word.
++enum class CodeType : uint8_t {
++    write = 0x0, //!< `$0X00 <address> <value>`
++    pointer_write = 0x3, //!< `$3X<level> <address> <offset>` ... `$33XX <offset> <value>`
++    compression = 0x4, //!< `$4X01 <address> <value>` + `$<count> <address gap> <value gap>`
++    mov = 0x5, //!< `$5X00 <destination> <source>`
++    pointer_compression = 0x7, //!< a `$3` block plus the count and gaps of a `$4` code
++    pointer_mov = 0x8, //!< `$8X<level> ... $88XX` (destination) then `$8<4|5|6><level> ... $89XX` (source)
++    arm_write = 0xA, //!< `$AX00 <address> <instruction>`, restored when the cheat is turned off
++    relative_base = 0xB, //!< `$B2<module> 0000000<segment> 00000000`
++    button_pad = 0xC, //!< `$C2<lines> <pad type> <button mask>`
++    condition = 0xD, //!< `$DX<lines> <address> <value>`
++};
++
++// Value width used by most code types, the second hexadecimal digit of the control word.
++enum class CodeWidth : uint8_t {
++    bits8 = 0,
++    bits16 = 1,
++    bits32 = 2,
++};
++
++// One `$XXXX AAAAAAAA BBBBBBBB` line.
++struct CodeLine {
++    uint16_t control = 0;
++    uint32_t first = 0;
++    uint32_t second = 0;
++
++    CodeType type() const {
++        return static_cast<CodeType>(control >> 12);
++    }
++    // Second digit: value width for most types, operator for conditions, direction for pointer MOV.
++    uint8_t op() const {
++        return (control >> 8) & 0xF;
++    }
++    // Last two digits: related line count, pointer level or block terminator depending on the type.
++    uint8_t param() const {
++        return control & 0xFF;
++    }
++};
++
++// Guest memory saved before an ARM write ($A) patched it, to restore it when the cheat goes off.
++struct SavedMemory {
++    uint32_t address = 0;
++    std::vector<uint8_t> bytes;
++};
++
++struct Cheat {
++    std::string name;
++    // `_V1`: the cheat is turned on automatically when the game boots.
++    bool enabled_on_boot = false;
++    bool enabled = false;
++    std::vector<CodeLine> lines;
++    bool broken = false;
++    std::vector<SavedMemory> saved_memory;
++    size_t line_number = 0;
++};
++
++struct CheatFile {
++    fs::path path;
++    std::string title_id;
++    // First comment line of the file, usually `# <title id> <game name>`.
++    std::string header;
++    std::vector<Cheat> cheats;
++};
++
++// A game the cheats folder holds cheats for, `path` is what find_cheat_file() picks for it.
++struct CheatGame {
++    std::string title_id;
++    // From the `_S` line or the first comment of the file, empty when neither names the game.
++    std::string name;
++    fs::path path;
++};
++
++fs::path find_cheat_file(const fs::path &cheats_dir, const std::string &title_id);
++
++std::vector<CheatGame> list_cheat_games(const fs::path &cheats_dir);
++
++// Parse a cheat file. A malformed line marks its cheat as broken, it never aborts the parsing.
++CheatFile parse_cheat_file(const fs::path &path, const std::string &title_id);
++
++// Rewrite only the `_V0`/`_V1` markers of `file`, so that cheats on now are on again at next boot.
++bool save_cheat_file(const CheatFile &file);
++
++// Add `cheat` after the other cheats of `title_id` in `path`, creating the file when it is missing.
++bool append_cheat(const fs::path &path, const std::string &title_id, const Cheat &cheat);
++
++std::string format_code_line(const CodeLine &code);
++
++} // namespace cheat
+diff --git a/vita3k/cheat/include/cheat/functions.h b/vita3k/cheat/include/cheat/functions.h
+new file mode 100644
+index 00000000..330dfa1d
+--- /dev/null
++++ b/vita3k/cheat/include/cheat/functions.h
+@@ -0,0 +1,67 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#pragma once
++
++#include <cheat/state.h>
++
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++#include <string>
++
++struct MemState;
++
++namespace cheat {
++
++// Lets an ARM write ($A) drop the recompiler blocks already translated for the patched range.
++using JitInvalidate = std::function<void(uint32_t address, size_t size)>;
++
++void unload(CheatState &state);
++
++// The `$B2` codes are checked against the modules added before this.
++bool load(CheatState &state, const fs::path &cheats_dir, const std::string &title_id);
++
++bool reload(CheatState &state, const fs::path &cheats_dir, const std::string &title_id, MemState &mem, const JitInvalidate &invalidate_jit);
++
++// Writes `cheat` to the cheat file of the game, and turns it on right away when that game is running.
++bool add_cheat(CheatState &state, const fs::path &cheats_dir, const std::string &title_id, const Cheat &cheat, MemState &mem, const JitInvalidate &invalidate_jit);
++
++// Module index 0 of a `$B2` code is whichever module is registered first.
++void add_module(CheatState &state, const CheatModule &module);
++
++void set_buttons(CheatState &state, uint32_t buttons);
++
++void apply(CheatState &state, MemState &mem, const JitInvalidate &invalidate_jit);
++
++void set_cheat_enabled(CheatState &state, size_t index, bool enabled, MemState &mem, const JitInvalidate &invalidate_jit);
++
++void set_all_cheats_enabled(CheatState &state, bool enabled, MemState &mem, const JitInvalidate &invalidate_jit);
++
++// Mirrors the `enable-cheats` setting, turning it off restores every ARM write.
++void set_enabled(CheatState &state, bool enabled, MemState &mem, const JitInvalidate &invalidate_jit);
++
++size_t enabled_cheat_count(const CheatState &state);
++
++// Title of the running game, empty when none is running.
++std::string loaded_title_id(const CheatState &state);
++
++CheatFile snapshot(const CheatState &state);
++
++bool save(CheatState &state);
++
++} // namespace cheat
+diff --git a/vita3k/cheat/include/cheat/search.h b/vita3k/cheat/include/cheat/search.h
+new file mode 100644
+index 00000000..83747cc1
+--- /dev/null
++++ b/vita3k/cheat/include/cheat/search.h
+@@ -0,0 +1,85 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#pragma once
++
++#include <cheat/cheat.h>
++
++#include <cstddef>
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <vector>
++
++struct MemState;
++
++namespace cheat {
++
++enum class SearchType : uint8_t {
++    u8,
++    s8,
++    u16,
++    s16,
++    u32,
++    s32,
++    f32,
++};
++
++uint32_t search_type_size(SearchType type);
++CodeWidth search_type_width(SearchType type);
++
++// Raw little-endian bits of `text` read as `type`, decimal or `0x` hexadecimal for the integers.
++std::optional<uint32_t> parse_search_value(const std::string &text, SearchType type);
++std::string format_search_value(uint32_t bits, SearchType type);
++
++// Scans guest memory for a value, then narrows the addresses down as the value changes in game.
++class MemorySearch {
++public:
++    // A first scan matching more than this keeps only the lowest addresses.
++    static constexpr size_t max_results = 10'000'000;
++
++    void new_search(MemState &mem, SearchType type, uint32_t value);
++    void filter(MemState &mem, uint32_t value);
++    void clear();
++
++    bool has_searched() const {
++        return m_searched;
++    }
++    bool truncated() const {
++        return m_truncated;
++    }
++    SearchType type() const {
++        return m_type;
++    }
++    const std::vector<uint32_t> &results() const {
++        return m_results;
++    }
++
++private:
++    SearchType m_type = SearchType::s32;
++    std::vector<uint32_t> m_results;
++    bool m_searched = false;
++    bool m_truncated = false;
++};
++
++std::optional<uint32_t> read_search_value(MemState &mem, uint32_t address, SearchType type);
++bool write_search_value(MemState &mem, uint32_t address, SearchType type, uint32_t bits);
++
++// A `$0X00` write code that keeps `address` at `bits`.
++CodeLine make_write_code(uint32_t address, SearchType type, uint32_t bits);
++
++} // namespace cheat
+diff --git a/vita3k/cheat/include/cheat/state.h b/vita3k/cheat/include/cheat/state.h
+new file mode 100644
+index 00000000..fcfd3c20
+--- /dev/null
++++ b/vita3k/cheat/include/cheat/state.h
+@@ -0,0 +1,67 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#pragma once
++
++#include <cheat/cheat.h>
++
++#include <array>
++#include <atomic>
++#include <mutex>
++#include <string>
++#include <vector>
++
++// Segment of a loaded module a `$B2` code makes addresses relative to, `size` 0 when absent.
++struct CheatModuleSegment {
++    uint32_t address = 0;
++    uint32_t size = 0;
++};
++
++struct CheatModule {
++    std::string name;
++    // As many as `SceKernelModuleInfo` has.
++    std::array<CheatModuleSegment, 4> segments;
++};
++
++struct CheatState {
++    // Guards every member below, the vblank thread reads while the GUI thread toggles cheats.
++    mutable std::mutex mutex;
++
++    bool enabled = false;
++
++    // Cheats usually write to memory the game has not set up yet, which corrupts its allocator.
++    // Waiting for the first frames is only a proxy for the game having finished its setup, a better signal is left to improve.
++    std::atomic<uint32_t> frames_presented{ 0 };
++    uint32_t launch_delay_frames = 60;
++
++    void count_frame() {
++        frames_presented.fetch_add(1, std::memory_order_relaxed);
++    }
++
++    // Title of the running game, set even when it has no cheat file.
++    std::string title_id;
++
++    // Buttons held at the last vblank, kept outside the mutex so that reading the pad stays cheap.
++    std::atomic<uint32_t> buttons{ 0 };
++
++    cheat::CheatFile file;
++    std::vector<CheatModule> modules;
++
++    bool has_cheats() const {
++        return !file.cheats.empty();
++    }
++};
+diff --git a/vita3k/cheat/src/cheat.cpp b/vita3k/cheat/src/cheat.cpp
+new file mode 100644
+index 00000000..1314779e
+--- /dev/null
++++ b/vita3k/cheat/src/cheat.cpp
+@@ -0,0 +1,741 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#include <cheat/functions.h>
++
++#include <mem/ptr.h>
++#include <mem/state.h>
++#include <util/log.h>
++#include <util/string_utils.h>
++
++#include <algorithm>
++#include <mutex>
++
++namespace cheat {
++
++namespace {
++
++// Bounds the lines the vblank thread walks for each cheat every frame.
++constexpr size_t max_lines = 4096;
++// A `$4` or `$7` code repeats its write up to 65535 times, this bounds all of them in one cheat.
++constexpr size_t max_repeated_writes = 0x10000;
++// The format allows at most five levels of indirection.
++constexpr uint8_t max_pointer_level = 5;
++
++uint32_t width_size(CodeWidth width) {
++    switch (width) {
++    case CodeWidth::bits8: return 1;
++    case CodeWidth::bits16: return 2;
++    default: return 4;
++    }
++}
++
++uint32_t width_mask(CodeWidth width) {
++    switch (width) {
++    case CodeWidth::bits8: return 0xFFu;
++    case CodeWidth::bits16: return 0xFFFFu;
++    default: return 0xFFFFFFFFu;
++    }
++}
++
++// `is_valid_addr_range()` takes an end that is one past the last byte of the access.
++bool is_accessible(const MemState &mem, uint32_t address, uint32_t size) {
++    return (address != 0) && is_valid_addr_range(mem, address, address + size);
++}
++
++// The guest pages a value spans are not necessarily contiguous in host memory, so go byte by byte.
++bool read_bytes(MemState &mem, uint32_t address, uint8_t *destination, uint32_t size) {
++    const std::lock_guard<std::mutex> lock(mem.generation_mutex);
++    if (!is_accessible(mem, address, size))
++        return false;
++
++    for (uint32_t i = 0; i < size; ++i)
++        destination[i] = *Ptr<uint8_t>(address + i).get(mem);
++
++    return true;
++}
++
++bool write_bytes(MemState &mem, uint32_t address, const uint8_t *source, uint32_t size) {
++    const std::lock_guard<std::mutex> lock(mem.generation_mutex);
++    if (!is_accessible(mem, address, size))
++        return false;
++
++    for (uint32_t i = 0; i < size; ++i)
++        *Ptr<uint8_t>(address + i).get(mem) = source[i];
++
++    return true;
++}
++
++bool read_value(MemState &mem, uint32_t address, CodeWidth width, uint32_t &value) {
++    uint8_t bytes[4] = {};
++    const uint32_t size = width_size(width);
++    if (!read_bytes(mem, address, bytes, size))
++        return false;
++
++    value = 0;
++    for (uint32_t i = 0; i < size; ++i)
++        value |= static_cast<uint32_t>(bytes[i]) << (i * 8);
++
++    return true;
++}
++
++bool write_value(MemState &mem, uint32_t address, CodeWidth width, uint32_t value) {
++    uint8_t bytes[4] = {};
++    const uint32_t size = width_size(width);
++    for (uint32_t i = 0; i < size; ++i)
++        bytes[i] = static_cast<uint8_t>((value >> (i * 8)) & 0xFF);
++
++    return write_bytes(mem, address, bytes, size);
++}
++
++size_t pointer_block_lines(const CodeLine &head) {
++    return std::min<size_t>(head.param(), max_pointer_level);
++}
++
++size_t code_line_count(const std::vector<CodeLine> &lines, size_t index) {
++    if (index >= lines.size())
++        return 0;
++
++    const CodeLine &line = lines[index];
++    switch (line.type()) {
++    case CodeType::compression:
++        return 2;
++    case CodeType::pointer_write:
++        return 1 + pointer_block_lines(line);
++    case CodeType::pointer_compression:
++        // The block, then the line holding the count and the gaps.
++        return 1 + pointer_block_lines(line) + 1;
++    case CodeType::pointer_mov: {
++        // A pointer MOV is a destination block followed by a source block.
++        const size_t destination = 1 + pointer_block_lines(line);
++        const size_t source_index = index + destination;
++        if ((source_index >= lines.size()) || (lines[source_index].type() != CodeType::pointer_mov))
++            return destination;
++        return destination + 1 + pointer_block_lines(lines[source_index]);
++    }
++    default:
++        return 1;
++    }
++}
++
++// Runs once per cheat when it is loaded, the interpreter then trusts every code to be complete.
++class Validator {
++public:
++    Validator(const Cheat &cheat, const std::vector<CheatModule> &modules)
++        : m_cheat(cheat)
++        , m_modules(modules) {}
++
++    bool validate() const {
++        if (m_cheat.lines.size() > max_lines) {
++            LOG_WARN("Cheat '{}' has more than {} lines", m_cheat.name, max_lines);
++            return false;
++        }
++
++        size_t index = 0;
++        size_t repeated_writes = 0;
++        while (index < m_cheat.lines.size()) {
++            if (!validate_code(index))
++                return false;
++            repeated_writes += repeat_count(index);
++            index += code_line_count(m_cheat.lines, index);
++        }
++
++        if (repeated_writes > max_repeated_writes) {
++            LOG_WARN("Cheat '{}' repeats its writes more than {} times", m_cheat.name, max_repeated_writes);
++            return false;
++        }
++
++        return true;
++    }
++
++private:
++    // The count is the whole control word of the line that follows the code.
++    size_t repeat_count(size_t index) const {
++        const CodeLine &line = m_cheat.lines[index];
++        if (line.type() == CodeType::compression)
++            return m_cheat.lines[index + 1].control;
++        if (line.type() == CodeType::pointer_compression)
++            return m_cheat.lines[index + 1 + pointer_block_lines(line)].control;
++        return 0;
++    }
++
++    bool validate_width(const CodeLine &line) const {
++        if (line.op() <= static_cast<uint8_t>(CodeWidth::bits32))
++            return true;
++
++        LOG_WARN("Cheat '{}' uses the invalid width of code ${:04X}", m_cheat.name, line.control);
++        return false;
++    }
++
++    bool validate_pointer_level(const CodeLine &line) const {
++        const uint8_t level = line.param();
++        if ((level > 0) && (level <= max_pointer_level))
++            return true;
++
++        LOG_WARN("Cheat '{}' uses the invalid pointer level {} of code ${:04X}", m_cheat.name, level, line.control);
++        return false;
++    }
++
++    bool validate_length(size_t index) const {
++        if (index + code_line_count(m_cheat.lines, index) <= m_cheat.lines.size())
++            return true;
++
++        LOG_WARN("Cheat '{}' ends with an incomplete code ${:04X}", m_cheat.name, m_cheat.lines[index].control);
++        return false;
++    }
++
++    bool validate_code(size_t index) const {
++        const CodeLine &line = m_cheat.lines[index];
++        switch (line.type()) {
++        case CodeType::write:
++        case CodeType::mov:
++            return validate_width(line);
++        case CodeType::compression:
++            return validate_width(line) && validate_length(index);
++        case CodeType::pointer_write:
++        case CodeType::pointer_compression:
++            return validate_width(line) && validate_pointer_level(line) && validate_length(index);
++        case CodeType::pointer_mov: {
++            if (!validate_width(line) || !validate_pointer_level(line))
++                return false;
++
++            const size_t source_index = index + 1 + line.param();
++            const CodeLine *source = (source_index < m_cheat.lines.size()) ? &m_cheat.lines[source_index] : nullptr;
++            if (!source || (source->type() != CodeType::pointer_mov) || (source->op() < 4) || (source->op() > 6)) {
++                LOG_WARN("Cheat '{}' has a pointer MOV code without a source block", m_cheat.name);
++                return false;
++            }
++
++            return validate_pointer_level(*source) && validate_length(index);
++        }
++        case CodeType::arm_write:
++            if ((line.op() == 1) || (line.op() == 2))
++                return true;
++            LOG_WARN("Cheat '{}' uses the invalid instruction size of code ${:04X}", m_cheat.name, line.control);
++            return false;
++        case CodeType::relative_base:
++            return validate_relative_base(line);
++        case CodeType::button_pad:
++            return true;
++        case CodeType::condition:
++            if (line.op() <= 0xB)
++                return true;
++            LOG_WARN("Cheat '{}' uses the unsupported condition ${:04X}", m_cheat.name, line.control);
++            return false;
++        default:
++            LOG_WARN("Cheat '{}' uses the unsupported code type ${:04X}", m_cheat.name, line.control);
++            return false;
++        }
++    }
++
++    // `$B2<module> 0000000<segment> 00000000`
++    bool validate_relative_base(const CodeLine &line) const {
++        if (line.op() != 2) {
++            LOG_WARN("Cheat '{}' uses the unsupported code type ${:04X}", m_cheat.name, line.control);
++            return false;
++        }
++
++        const uint8_t module_index = line.param();
++        const uint32_t segment_index = line.first & 0xF;
++        // How VitaCheat numbers the modules after the main executable is undocumented, so guessing could patch the wrong one.
++        if ((module_index != 0) || m_modules.empty()) {
++            LOG_WARN("Cheat '{}' refers to module {}, only module 0 (the main executable) is supported", m_cheat.name, module_index);
++            return false;
++        }
++
++        const CheatModule &module = m_modules[module_index];
++        if (segment_index >= module.segments.size()) {
++            LOG_WARN("Cheat '{}' refers to segment {}, which does not exist", m_cheat.name, segment_index);
++            return false;
++        }
++        if (module.segments[segment_index].size == 0) {
++            LOG_WARN("Cheat '{}' refers to module {} segment {}, which is empty", m_cheat.name, module_index, segment_index);
++            return false;
++        }
++
++        return true;
++    }
++
++    const Cheat &m_cheat;
++    const std::vector<CheatModule> &m_modules;
++};
++
++struct PointerBlock {
++    uint32_t address = 0;
++    std::vector<uint32_t> offsets;
++    // Closing line, it carries the value for a pointer write and nothing for a pointer MOV.
++    CodeLine closing;
++};
++
++class Interpreter {
++public:
++    Interpreter(const CheatState &state, Cheat &cheat, MemState &mem, uint32_t buttons, const JitInvalidate &invalidate_jit)
++        : m_state(state)
++        , m_cheat(cheat)
++        , m_mem(mem)
++        , m_buttons(buttons)
++        , m_invalidate_jit(invalidate_jit) {}
++
++    void run() {
++        while (m_index < m_cheat.lines.size())
++            execute(m_cheat.lines[m_index]);
++    }
++
++private:
++    // Addresses become relative to a module segment once a `$B2` code has been seen.
++    uint32_t resolve(uint32_t address) const {
++        return m_relative_base + address;
++    }
++
++    // The byte at `address` before any ARM write patched it, whatever the size of that write or its cheat.
++    uint8_t original_byte(uint32_t address, uint8_t current) const {
++        for (const Cheat &cheat : m_state.file.cheats) {
++            for (const SavedMemory &saved : cheat.saved_memory) {
++                if ((address >= saved.address) && ((address - saved.address) < saved.bytes.size()))
++                    return saved.bytes[address - saved.address];
++            }
++        }
++
++        return current;
++    }
++
++    // A related count is a number of codes, not of lines, and a pointer write spans several.
++    void skip_related_codes(uint8_t related) {
++        size_t remaining = std::max<size_t>(related, 1);
++        while ((remaining > 0) && (m_index < m_cheat.lines.size())) {
++            // The base is a directive for what follows, the codes it precedes must still find it set.
++            if (m_cheat.lines[m_index].type() == CodeType::relative_base) {
++                execute_relative_base(m_cheat.lines[m_index]);
++                continue;
++            }
++
++            m_index += std::max<size_t>(code_line_count(m_cheat.lines, m_index), 1);
++            --remaining;
++        }
++    }
++
++    void execute(const CodeLine &line) {
++        switch (line.type()) {
++        case CodeType::write:
++            execute_write(line);
++            break;
++        case CodeType::pointer_write:
++            execute_pointer_write(line);
++            break;
++        case CodeType::compression:
++            execute_compression(line);
++            break;
++        case CodeType::mov:
++            execute_mov(line);
++            break;
++        case CodeType::pointer_compression:
++            execute_pointer_compression(line);
++            break;
++        case CodeType::pointer_mov:
++            execute_pointer_mov(line);
++            break;
++        case CodeType::arm_write:
++            execute_arm_write(line);
++            break;
++        case CodeType::relative_base:
++            execute_relative_base(line);
++            break;
++        case CodeType::button_pad:
++            execute_button_pad(line);
++            break;
++        default:
++            execute_condition(line);
++            break;
++        }
++    }
++
++    // `$0X00 <address> <value>`
++    void execute_write(const CodeLine &line) {
++        ++m_index;
++        write_value(m_mem, resolve(line.first), static_cast<CodeWidth>(line.op()), line.second);
++    }
++
++    // `$5X00 <destination> <source>`
++    void execute_mov(const CodeLine &line) {
++        ++m_index;
++
++        const auto width = static_cast<CodeWidth>(line.op());
++        uint32_t value = 0;
++        if (read_value(m_mem, resolve(line.second), width, value))
++            write_value(m_mem, resolve(line.first), width, value);
++    }
++
++    // `$4X01 <address> <value>` followed by `$<count> <address gap> <value gap>`
++    void execute_compression(const CodeLine &line) {
++        const CodeLine gaps = m_cheat.lines[m_index + 1];
++        m_index += 2;
++
++        const auto width = static_cast<CodeWidth>(line.op());
++        // The whole control word of the second line is the iteration count.
++        const uint32_t count = gaps.control;
++        for (uint32_t i = 0; i < count; ++i)
++            write_value(m_mem, resolve(line.first) + (i * gaps.first), width, line.second + (i * gaps.second));
++    }
++
++    // `$3X<level> <address> <offset>`, one line per further offset, then the value.
++    void execute_pointer_write(const CodeLine &line) {
++        const PointerBlock block = parse_pointer_block(line);
++
++        uint32_t address = 0;
++        if (follow_pointers(block, address))
++            write_value(m_mem, address, static_cast<CodeWidth>(line.op()), block.closing.second);
++    }
++
++    // `$8X<level> ...` writes to `$8<4|5|6><level> ...`, both blocks closed by a `$88` / `$89` line.
++    void execute_pointer_mov(const CodeLine &line) {
++        const PointerBlock destination = parse_pointer_block(line);
++        const PointerBlock source = parse_pointer_block(m_cheat.lines[m_index]);
++
++        const auto width = static_cast<CodeWidth>(line.op());
++        uint32_t destination_address = 0;
++        uint32_t source_address = 0;
++        if (!follow_pointers(destination, destination_address) || !follow_pointers(source, source_address))
++            return;
++
++        uint32_t value = 0;
++        if (read_value(m_mem, source_address, width, value))
++            write_value(m_mem, destination_address, width, value);
++    }
++
++    // A `$3` block followed by the `$<count> <address gap> <value gap>` line of a `$4` code.
++    void execute_pointer_compression(const CodeLine &line) {
++        const PointerBlock block = parse_pointer_block(line);
++        const CodeLine gaps = m_cheat.lines[m_index];
++        ++m_index;
++
++        uint32_t address = 0;
++        if (!follow_pointers(block, address))
++            return;
++
++        const auto width = static_cast<CodeWidth>(line.op());
++        const uint32_t count = gaps.control;
++        for (uint32_t i = 0; i < count; ++i)
++            write_value(m_mem, address + (i * gaps.first), width, block.closing.second + (i * gaps.second));
++    }
++
++    // `$AX00 <address> <instruction>`, X is 1 for a 16-bit and 2 for a 32-bit instruction.
++    void execute_arm_write(const CodeLine &line) {
++        ++m_index;
++
++        const auto width = (line.op() == 1) ? CodeWidth::bits16 : CodeWidth::bits32;
++        const uint32_t size = width_size(width);
++        const uint32_t address = resolve(line.first);
++        const uint32_t value = line.second & width_mask(width);
++
++        uint32_t current = 0;
++        if (!read_value(m_mem, address, width, current))
++            return;
++
++        // Patching guest code once is enough, only pay for the recompiler flush when it changed.
++        if (current == value)
++            return;
++
++        const bool already_saved = std::any_of(m_cheat.saved_memory.begin(), m_cheat.saved_memory.end(),
++            [address, size](const SavedMemory &saved) { return (saved.address == address) && (saved.bytes.size() == size); });
++        if (!already_saved) {
++            // Saving the real original makes the order the cheats are turned off in irrelevant.
++            SavedMemory saved;
++            saved.address = address;
++            for (uint32_t i = 0; i < size; ++i)
++                saved.bytes.push_back(original_byte(address + i, static_cast<uint8_t>(current >> (i * 8))));
++            m_cheat.saved_memory.push_back(std::move(saved));
++        }
++
++        if (write_value(m_mem, address, width, value) && m_invalidate_jit)
++            m_invalidate_jit(address, size);
++    }
++
++    void execute_relative_base(const CodeLine &line) {
++        ++m_index;
++        m_relative_base = m_state.modules[line.param()].segments[line.first & 0xF].address;
++    }
++
++    // `$C2<lines> <pad type> <button mask>`
++    void execute_button_pad(const CodeLine &line) {
++        ++m_index;
++
++        // The pad type selects between the Vita pad and a DualShock, Vita3K only exposes one pad.
++        const uint32_t mask = line.second;
++        if ((m_buttons & mask) != mask)
++            skip_related_codes(line.param());
++    }
++
++    // `$DX<lines> <address> <value>`
++    void execute_condition(const CodeLine &line) {
++        ++m_index;
++
++        const uint8_t op = line.op();
++        const auto width = static_cast<CodeWidth>(op % 3);
++        const uint32_t mask = width_mask(width);
++        const uint32_t expected = line.second & mask;
++
++        uint32_t value = 0;
++        bool satisfied = read_value(m_mem, resolve(line.first), width, value);
++        if (satisfied) {
++            switch (op / 3) {
++            case 0: satisfied = value == expected; break;
++            case 1: satisfied = value != expected; break;
++            case 2: satisfied = value > expected; break;
++            default: satisfied = value < expected; break;
++            }
++        }
++
++        if (!satisfied)
++            skip_related_codes(line.param());
++    }
++
++    // Databases word the control field of the follow-up lines freely, so only `second` is read.
++    PointerBlock parse_pointer_block(const CodeLine &head) {
++        const uint8_t level = head.param();
++
++        PointerBlock block;
++        block.address = head.first;
++        block.offsets.reserve(level);
++        block.offsets.push_back(head.second);
++        for (uint8_t i = 1; i < level; i++)
++            block.offsets.push_back(m_cheat.lines[m_index + i].second);
++
++        block.closing = m_cheat.lines[m_index + level];
++        m_index += level + 1;
++
++        return block;
++    }
++
++    bool follow_pointers(const PointerBlock &block, uint32_t &address) {
++        address = resolve(block.address);
++        for (const uint32_t offset : block.offsets) {
++            uint32_t pointer = 0;
++            if (!read_value(m_mem, address, CodeWidth::bits32, pointer))
++                return false;
++            address = pointer + offset;
++        }
++
++        return true;
++    }
++
++    const CheatState &m_state;
++    Cheat &m_cheat;
++    MemState &m_mem;
++    const uint32_t m_buttons;
++    const JitInvalidate &m_invalidate_jit;
++
++    size_t m_index = 0;
++    uint32_t m_relative_base = 0;
++};
++
++bool overlaps(const SavedMemory &a, const SavedMemory &b) {
++    return (a.address < b.address + b.bytes.size()) && (b.address < a.address + a.bytes.size());
++}
++
++void restore_cheat(Cheat &cheat, MemState &mem, const JitInvalidate &invalidate_jit) {
++    for (auto it = cheat.saved_memory.rbegin(); it != cheat.saved_memory.rend(); ++it) {
++        const uint32_t size = static_cast<uint32_t>(it->bytes.size());
++        if (write_bytes(mem, it->address, it->bytes.data(), size) && invalidate_jit)
++            invalidate_jit(it->address, size);
++    }
++
++    cheat.saved_memory.clear();
++}
++
++} // namespace
++
++void unload(CheatState &state) {
++    const std::lock_guard<std::mutex> lock(state.mutex);
++
++    state.title_id.clear();
++    state.file = {};
++    state.modules.clear();
++    state.frames_presented.store(0, std::memory_order_relaxed);
++    state.buttons.store(0, std::memory_order_relaxed);
++}
++
++bool load(CheatState &state, const fs::path &cheats_dir, const std::string &title_id) {
++    CheatFile file;
++    const auto path = find_cheat_file(cheats_dir, title_id);
++    if (path.empty()) {
++        LOG_DEBUG("No cheat file found for {} in {}", title_id, cheats_dir);
++    } else {
++        file = parse_cheat_file(path, title_id);
++        for (auto &cheat : file.cheats)
++            cheat.enabled = cheat.enabled_on_boot;
++    }
++
++    const std::lock_guard<std::mutex> lock(state.mutex);
++
++    // Checked here rather than when they run, so that the cheat manager flags a broken cheat before it is turned on.
++    for (auto &cheat : file.cheats) {
++        if (!cheat.broken)
++            cheat.broken = !Validator(cheat, state.modules).validate();
++    }
++
++    state.title_id = title_id;
++    state.file = std::move(file);
++
++    return !state.file.cheats.empty();
++}
++
++bool reload(CheatState &state, const fs::path &cheats_dir, const std::string &title_id, MemState &mem, const JitInvalidate &invalidate_jit) {
++    // The saved originals go away with the old cheats, so undo the ARM writes first.
++    set_all_cheats_enabled(state, false, mem, invalidate_jit);
++
++    return load(state, cheats_dir, title_id);
++}
++
++bool add_cheat(CheatState &state, const fs::path &cheats_dir, const std::string &title_id, const Cheat &cheat, MemState &mem, const JitInvalidate &invalidate_jit) {
++    auto path = find_cheat_file(cheats_dir, title_id);
++    if (path.empty())
++        path = cheats_dir / (string_utils::toupper(title_id) + ".psv");
++    if (!append_cheat(path, title_id, cheat))
++        return false;
++
++    if (loaded_title_id(state) != title_id)
++        return true;
++
++    // Reloading puts every cheat back to its boot state, carry over what was toggled since.
++    const CheatFile before = snapshot(state);
++    reload(state, cheats_dir, title_id, mem, invalidate_jit);
++
++    const std::lock_guard<std::mutex> lock(state.mutex);
++    auto &cheats = state.file.cheats;
++    for (size_t i = 0; i < std::min(cheats.size(), before.cheats.size()); ++i) {
++        if (cheats[i].name == before.cheats[i].name)
++            cheats[i].enabled = before.cheats[i].enabled;
++    }
++    if (cheats.size() == before.cheats.size() + 1)
++        cheats.back().enabled = cheat.enabled;
++
++    return true;
++}
++
++void add_module(CheatState &state, const CheatModule &module) {
++    const std::lock_guard<std::mutex> lock(state.mutex);
++
++    state.modules.push_back(module);
++}
++
++void set_buttons(CheatState &state, uint32_t buttons) {
++    state.buttons.store(buttons, std::memory_order_relaxed);
++}
++
++void apply(CheatState &state, MemState &mem, const JitInvalidate &invalidate_jit) {
++    const std::lock_guard<std::mutex> lock(state.mutex);
++
++    if (state.frames_presented.load(std::memory_order_relaxed) < state.launch_delay_frames)
++        return;
++
++    const uint32_t buttons = state.buttons.load(std::memory_order_relaxed);
++
++    for (auto &cheat : state.file.cheats) {
++        if (state.enabled && cheat.enabled && !cheat.broken) {
++            Interpreter(state, cheat, mem, buttons, invalidate_jit).run();
++        } else if (!cheat.saved_memory.empty()) {
++            restore_cheat(cheat, mem, invalidate_jit);
++        }
++    }
++}
++
++void set_cheat_enabled(CheatState &state, size_t index, bool enabled, MemState &mem, const JitInvalidate &invalidate_jit) {
++    const std::lock_guard<std::mutex> lock(state.mutex);
++
++    if (index >= state.file.cheats.size())
++        return;
++
++    Cheat &cheat = state.file.cheats[index];
++    if (cheat.enabled == enabled)
++        return;
++
++    cheat.enabled = enabled;
++    if (enabled)
++        return;
++
++    const std::vector<SavedMemory> restored = cheat.saved_memory;
++    restore_cheat(cheat, mem, invalidate_jit);
++
++    // The game keeps running, so a patch another cheat still wants must not wait for the next vblank.
++    const uint32_t buttons = state.buttons.load(std::memory_order_relaxed);
++    for (auto &other : state.file.cheats) {
++        if (!state.enabled || !other.enabled || other.broken || (&other == &cheat))
++            continue;
++
++        const bool shares_memory = std::any_of(other.saved_memory.begin(), other.saved_memory.end(), [&restored](const SavedMemory &saved) {
++            return std::any_of(restored.begin(), restored.end(), [&saved](const SavedMemory &old) { return overlaps(saved, old); });
++        });
++        if (shares_memory)
++            Interpreter(state, other, mem, buttons, invalidate_jit).run();
++    }
++}
++
++void set_all_cheats_enabled(CheatState &state, bool enabled, MemState &mem, const JitInvalidate &invalidate_jit) {
++    const std::lock_guard<std::mutex> lock(state.mutex);
++
++    for (auto &cheat : state.file.cheats) {
++        cheat.enabled = enabled;
++        if (!enabled)
++            restore_cheat(cheat, mem, invalidate_jit);
++    }
++}
++
++void set_enabled(CheatState &state, bool enabled, MemState &mem, const JitInvalidate &invalidate_jit) {
++    const std::lock_guard<std::mutex> lock(state.mutex);
++
++    if (state.enabled == enabled)
++        return;
++
++    state.enabled = enabled;
++    if (!enabled) {
++        for (auto &cheat : state.file.cheats)
++            restore_cheat(cheat, mem, invalidate_jit);
++    }
++}
++
++size_t enabled_cheat_count(const CheatState &state) {
++    const std::lock_guard<std::mutex> lock(state.mutex);
++
++    return std::count_if(state.file.cheats.begin(), state.file.cheats.end(),
++        [](const Cheat &cheat) { return cheat.enabled; });
++}
++
++std::string loaded_title_id(const CheatState &state) {
++    const std::lock_guard<std::mutex> lock(state.mutex);
++
++    return state.title_id;
++}
++
++CheatFile snapshot(const CheatState &state) {
++    const std::lock_guard<std::mutex> lock(state.mutex);
++
++    return state.file;
++}
++
++bool save(CheatState &state) {
++    const std::lock_guard<std::mutex> lock(state.mutex);
++
++    if (!save_cheat_file(state.file))
++        return false;
++
++    for (auto &cheat : state.file.cheats)
++        cheat.enabled_on_boot = cheat.enabled;
++
++    return true;
++}
++
++} // namespace cheat
+diff --git a/vita3k/cheat/src/parser.cpp b/vita3k/cheat/src/parser.cpp
+new file mode 100644
+index 00000000..89ad4e3a
+--- /dev/null
++++ b/vita3k/cheat/src/parser.cpp
+@@ -0,0 +1,467 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#include <cheat/cheat.h>
++
++#include <util/log.h>
++#include <util/string_utils.h>
++
++#include <algorithm>
++#include <cctype>
++#include <fstream>
++#include <map>
++#include <optional>
++#include <sstream>
++
++namespace cheat {
++
++namespace {
++
++constexpr std::string_view utf8_bom = "\xEF\xBB\xBF";
++
++std::string clean_line(std::string_view line) {
++    if (line.starts_with(utf8_bom))
++        line.remove_prefix(utf8_bom.size());
++
++    return string_utils::trim_copy(line);
++}
++
++bool is_comment(std::string_view line) {
++    return line.starts_with('#') || line.starts_with(';') || line.starts_with("//");
++}
++
++// `_S <title id>` opens the section of one game inside a combined database.
++bool is_section_declaration(std::string_view line) {
++    return (line.size() > 2) && (line[0] == '_') && ((line[1] == 'S') || (line[1] == 's'))
++        && ((line[2] == ' ') || (line[2] == '\t'));
++}
++
++// Title id of a `_S` line, the rest of the line is a game name some databases add.
++std::string section_title_id(std::string_view line) {
++    const std::string rest = string_utils::trim_copy(line.substr(2));
++    return string_utils::toupper(rest.substr(0, rest.find_first_of(" \t")));
++}
++
++// A cheat declaration is `_V0 <name>` (off) or `_V1 <name>` (on when the game boots).
++bool is_cheat_declaration(std::string_view line) {
++    return line.size() >= 3 && line[0] == '_' && (line[1] == 'V' || line[1] == 'v')
++        && (line[2] == '0' || line[2] == '1');
++}
++
++bool parse_hex(std::string_view token, uint32_t &value) {
++    if (token.starts_with('$'))
++        token.remove_prefix(1);
++    else if (token.starts_with("0x") || token.starts_with("0X"))
++        token.remove_prefix(2);
++
++    if (token.empty() || token.size() > 8)
++        return false;
++
++    uint32_t result = 0;
++    for (const char c : token) {
++        uint32_t digit;
++        if (c >= '0' && c <= '9')
++            digit = c - '0';
++        else if (c >= 'a' && c <= 'f')
++            digit = c - 'a' + 10;
++        else if (c >= 'A' && c <= 'F')
++            digit = c - 'A' + 10;
++        else
++            return false;
++
++        result = (result << 4) | digit;
++    }
++
++    value = result;
++    return true;
++}
++
++// `$XXXX AAAAAAAA BBBBBBBB`
++bool parse_code_line(const std::string &line, CodeLine &code) {
++    std::istringstream stream(line);
++    std::string control_token;
++    std::string first_token;
++    std::string second_token;
++    if (!(stream >> control_token >> first_token >> second_token))
++        return false;
++
++    uint32_t control = 0;
++    if (!parse_hex(control_token, control) || (control > 0xFFFF))
++        return false;
++    if (!parse_hex(first_token, code.first) || !parse_hex(second_token, code.second))
++        return false;
++
++    code.control = static_cast<uint16_t>(control);
++    return true;
++}
++
++// `PCSA00147` and the like, as cheat files named after a game spell it.
++bool is_title_id(std::string_view name) {
++    return (name.size() == 9) && std::all_of(name.begin(), name.begin() + 4, [](char c) { return std::isalpha(static_cast<unsigned char>(c)); })
++        && std::all_of(name.begin() + 4, name.end(), [](char c) { return std::isdigit(static_cast<unsigned char>(c)); });
++}
++
++// The game name of a `_S` line or a `# <title id> <name>` comment, without the title id.
++std::string name_after_title_id(std::string_view text, const std::string &title_id) {
++    std::string rest = string_utils::trim_copy(text);
++    if (string_utils::toupper(rest.substr(0, title_id.size())) == title_id)
++        rest = string_utils::trim_copy(std::string_view(rest).substr(title_id.size()));
++    return rest;
++}
++
++bool is_database_name(const std::string &filename) {
++    return filename.ends_with(".DB") || filename.ends_with(".TXT");
++}
++
++std::vector<std::string> read_lines(const fs::path &path) {
++    std::vector<std::string> lines;
++    std::ifstream stream(path.c_str(), std::ios::binary);
++    std::string raw;
++    while (std::getline(stream, raw))
++        lines.push_back(std::move(raw));
++    return lines;
++}
++
++// Written next to the file then renamed over it, so that a failed write never truncates the database.
++bool write_lines(const fs::path &path, const std::vector<std::string> &lines) {
++    fs::path temporary = path;
++    temporary += ".tmp";
++    {
++        std::ofstream out(temporary.c_str(), std::ios::binary | std::ios::trunc);
++        if (!out.is_open()) {
++            LOG_ERROR("Failed to open cheat file {} for writing", temporary);
++            return false;
++        }
++
++        for (const auto &line : lines)
++            out << line << '\n';
++
++        out.close();
++        if (out.fail()) {
++            LOG_ERROR("Failed to write cheat file {}", temporary);
++            std::error_code error;
++            fs::remove(temporary, error);
++            return false;
++        }
++    }
++
++    std::error_code error;
++    fs::rename(temporary, path, error);
++    if (error) {
++        LOG_ERROR("Failed to replace cheat file {}: {}", path, error.message());
++        fs::remove(temporary, error);
++        return false;
++    }
++
++    return true;
++}
++
++} // namespace
++
++// True when `path` is a combined database holding a section for this game.
++static bool has_section(const fs::path &path, const std::string &wanted) {
++    std::ifstream stream(path.c_str());
++    if (!stream.is_open())
++        return false;
++
++    std::string raw;
++    while (std::getline(stream, raw)) {
++        const std::string line = clean_line(raw);
++        if (is_section_declaration(line) && (section_title_id(line) == wanted))
++            return true;
++    }
++
++    return false;
++}
++
++fs::path find_cheat_file(const fs::path &cheats_dir, const std::string &title_id) {
++    // Runs during boot, so a folder that cannot be read must mean "no cheats" rather than throw.
++    std::error_code ec;
++    if (title_id.empty() || !fs::is_directory(cheats_dir, ec))
++        return {};
++
++    const auto wanted = string_utils::toupper(title_id);
++    std::vector<fs::path> databases;
++
++    fs::directory_iterator it(cheats_dir, ec);
++    for (; !ec && (it != fs::directory_iterator()); it.increment(ec)) {
++        const fs::path &path = it->path();
++        std::error_code status_ec;
++        if (!fs::is_regular_file(path, status_ec))
++            continue;
++
++        const auto filename = string_utils::toupper(fs_utils::path_to_utf8(path.filename()));
++        // The databases ship `<title id>.psv`, but plain `.txt` files are common too.
++        if ((filename == wanted + ".PSV") || (filename == wanted + ".TXT"))
++            return path;
++
++        // `cheat.db` and the like hold every game in one file, keyed by `_S <title id>`.
++        if (is_database_name(filename))
++            databases.push_back(path);
++    }
++    if (ec)
++        LOG_WARN("Failed to list cheat folder {}: {}", cheats_dir, ec.message());
++
++    // Reading those is only worth it once no file is named after the title.
++    for (const auto &database : databases) {
++        if (has_section(database, wanted))
++            return database;
++    }
++
++    return {};
++}
++
++std::vector<CheatGame> list_cheat_games(const fs::path &cheats_dir) {
++    std::error_code ec;
++    if (!fs::is_directory(cheats_dir, ec))
++        return {};
++
++    std::vector<fs::path> files;
++    for (fs::directory_iterator it(cheats_dir, ec); !ec && (it != fs::directory_iterator()); it.increment(ec)) {
++        std::error_code status_ec;
++        if (fs::is_regular_file(it->path(), status_ec))
++            files.push_back(it->path());
++    }
++    if (ec)
++        LOG_WARN("Failed to list cheat folder {}: {}", cheats_dir, ec.message());
++
++    std::map<std::string, CheatGame> games;
++
++    // Same precedence as find_cheat_file(): a file named after the game first, then the first database.
++    for (const auto &path : files) {
++        const auto filename = string_utils::toupper(fs_utils::path_to_utf8(path.filename()));
++        const auto stem = string_utils::toupper(fs_utils::path_to_utf8(path.stem()));
++        if (!(filename.ends_with(".PSV") || filename.ends_with(".TXT")) || !is_title_id(stem))
++            continue;
++
++        CheatGame game{ .title_id = stem, .path = path };
++        for (const auto &raw : read_lines(path)) {
++            const std::string line = clean_line(raw);
++            if (is_comment(line)) {
++                game.name = name_after_title_id(std::string_view(line).substr(line.starts_with("//") ? 2 : 1), stem);
++                break;
++            }
++            if (!line.empty())
++                break;
++        }
++        games.emplace(stem, std::move(game));
++    }
++
++    for (const auto &path : files) {
++        if (!is_database_name(string_utils::toupper(fs_utils::path_to_utf8(path.filename()))))
++            continue;
++
++        for (const auto &raw : read_lines(path)) {
++            const std::string line = clean_line(raw);
++            if (!is_section_declaration(line))
++                continue;
++
++            const auto title_id = section_title_id(line);
++            if (!title_id.empty() && !games.contains(title_id))
++                games.emplace(title_id, CheatGame{ .title_id = title_id, .name = name_after_title_id(std::string_view(line).substr(2), title_id), .path = path });
++        }
++    }
++
++    std::vector<CheatGame> result;
++    result.reserve(games.size());
++    for (auto &[_, game] : games)
++        result.push_back(std::move(game));
++    return result;
++}
++
++CheatFile parse_cheat_file(const fs::path &path, const std::string &title_id) {
++    CheatFile file;
++    file.path = path;
++    file.title_id = title_id;
++
++    std::ifstream stream(path.c_str());
++    if (!stream.is_open()) {
++        LOG_ERROR("Failed to open cheat file {}", path);
++        return file;
++    }
++
++    std::optional<size_t> current;
++    std::string raw;
++    size_t line_number = 0;
++    size_t code_count = 0;
++    const std::string wanted = string_utils::toupper(title_id);
++    // A file without any `_S` line holds the cheats of a single game, so all of them count.
++    bool in_section = true;
++    while (std::getline(stream, raw)) {
++        ++line_number;
++
++        const std::string line = clean_line(raw);
++        if (line.empty())
++            continue;
++
++        if (is_section_declaration(line)) {
++            in_section = section_title_id(line) == wanted;
++            current.reset();
++            // Whatever came before the section belongs to the database, not to this game.
++            file.header.clear();
++            continue;
++        }
++
++        if (!in_section)
++            continue;
++
++        if (is_comment(line)) {
++            if (file.header.empty())
++                file.header = string_utils::trim_copy(std::string_view(line).substr(line.starts_with("//") ? 2 : 1));
++            continue;
++        }
++
++        if (is_cheat_declaration(line)) {
++            Cheat cheat;
++            cheat.enabled_on_boot = line[2] == '1';
++            cheat.name = string_utils::trim_copy(std::string_view(line).substr(3));
++            cheat.line_number = line_number;
++            if (cheat.name.empty())
++                cheat.name = fmt::format("Cheat {}", file.cheats.size() + 1);
++
++            file.cheats.push_back(std::move(cheat));
++            current = file.cheats.size() - 1;
++            continue;
++        }
++
++        if (line[0] != '$') {
++            LOG_DEBUG("Ignoring unknown line {} of cheat file {}: {}", line_number, path, line);
++            continue;
++        }
++
++        if (!current) {
++            LOG_WARN("Ignoring code line {} of cheat file {}, it does not belong to any cheat", line_number, path);
++            continue;
++        }
++
++        CodeLine code;
++        if (!parse_code_line(line, code)) {
++            LOG_ERROR("Failed to parse code line {} of cheat file {}: {}", line_number, path, line);
++            file.cheats[*current].broken = true;
++            continue;
++        }
++
++        file.cheats[*current].lines.push_back(code);
++        ++code_count;
++    }
++
++    // A declaration without any code line would silently do nothing, drop it.
++    std::erase_if(file.cheats, [&](const Cheat &cheat) {
++        if (!cheat.lines.empty())
++            return false;
++        LOG_WARN("Cheat '{}' of {} has no code line, ignoring it", cheat.name, path);
++        return true;
++    });
++
++    LOG_INFO("Loaded {} cheats ({} codes) for {} from {}", file.cheats.size(), code_count, title_id, path);
++
++    return file;
++}
++
++bool save_cheat_file(const CheatFile &file) {
++    if (file.path.empty())
++        return false;
++
++    std::error_code error;
++    if (!fs::is_regular_file(file.path, error)) {
++        LOG_ERROR("Failed to open cheat file {} for reading", file.path);
++        return false;
++    }
++
++    // Read the file as it is, only the digit of the `_V` markers is rewritten.
++    std::vector<std::string> lines = read_lines(file.path);
++
++    // Declaration line numbers stay valid even though empty cheats were dropped while parsing.
++    for (const auto &cheat : file.cheats) {
++        if ((cheat.line_number == 0) || (cheat.line_number > lines.size())) {
++            LOG_WARN("Cheat file {} changed on disk since it was loaded, not saving", file.path);
++            return false;
++        }
++
++        std::string &line = lines[cheat.line_number - 1];
++        // Only a BOM or blanks precede the marker, which may be spelled `_v` too.
++        const auto marker = line.find('_');
++        if ((marker == std::string::npos) || !is_cheat_declaration(std::string_view(line).substr(marker))) {
++            LOG_WARN("Cheat file {} changed on disk since it was loaded, not saving", file.path);
++            return false;
++        }
++
++        line[marker + 2] = cheat.enabled ? '1' : '0';
++    }
++
++    if (!write_lines(file.path, lines))
++        return false;
++
++    LOG_INFO("Saved the state of {} cheats to {}", file.cheats.size(), file.path);
++
++    return true;
++}
++
++std::string format_code_line(const CodeLine &code) {
++    return fmt::format("${:04X} {:08X} {:08X}", code.control, code.first, code.second);
++}
++
++bool append_cheat(const fs::path &path, const std::string &title_id, const Cheat &cheat) {
++    std::error_code error;
++    const bool exists = fs::exists(path, error);
++    std::vector<std::string> lines = exists ? read_lines(path) : std::vector<std::string>{};
++
++    // Keep the line endings the file already uses.
++    const std::string eol = (!lines.empty() && lines.front().ends_with('\r')) ? "\r" : "";
++
++    std::vector<std::string> added;
++    added.push_back(fmt::format("_V{} {}", cheat.enabled_on_boot ? 1 : 0, cheat.name) + eol);
++    for (const auto &code : cheat.lines)
++        added.push_back(format_code_line(code) + eol);
++
++    const std::string wanted = string_utils::toupper(title_id);
++    bool has_sections = false;
++    std::optional<size_t> section_end;
++    for (size_t i = 0; i < lines.size(); ++i) {
++        const std::string line = clean_line(lines[i]);
++        if (!is_section_declaration(line))
++            continue;
++
++        has_sections = true;
++        if (section_title_id(line) == wanted) {
++            section_end = i + 1;
++            while ((*section_end < lines.size()) && !is_section_declaration(clean_line(lines[*section_end])))
++                ++*section_end;
++        }
++    }
++
++    if (!exists)
++        lines.push_back(fmt::format("# {}", wanted));
++    else if (has_sections && !section_end)
++        lines.push_back(fmt::format("_S {}", wanted) + eol);
++
++    size_t position = section_end.value_or(lines.size());
++    // Right after the last code of the game, not after the blank lines that part it from the next one.
++    while ((position > 0) && clean_line(lines[position - 1]).empty())
++        --position;
++    lines.insert(lines.begin() + position, added.begin(), added.end());
++
++    if (!exists)
++        fs::create_directories(path.parent_path(), error);
++    if (!write_lines(path, lines))
++        return false;
++
++    LOG_INFO("Added cheat '{}' for {} to {}", cheat.name, wanted, path);
++    return true;
++}
++
++} // namespace cheat
+diff --git a/vita3k/cheat/src/search.cpp b/vita3k/cheat/src/search.cpp
+new file mode 100644
+index 00000000..dbae98ab
+--- /dev/null
++++ b/vita3k/cheat/src/search.cpp
+@@ -0,0 +1,223 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#include <cheat/search.h>
++
++#include <mem/functions.h>
++#include <mem/ptr.h>
++#include <mem/state.h>
++#include <mem/util.h>
++#include <util/string_utils.h>
++
++#include <fmt/format.h>
++
++#include <algorithm>
++#include <bit>
++#include <charconv>
++#include <cmath>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++
++namespace cheat {
++
++namespace {
++
++constexpr uint32_t page_size = KiB(4);
++// Pages checked per allocator query and per lock, most of the address space is never allocated.
++constexpr uint32_t pages_per_block = 32;
++
++bool is_signed(SearchType type) {
++    return (type == SearchType::s8) || (type == SearchType::s16) || (type == SearchType::s32);
++}
++
++uint32_t type_mask(SearchType type) {
++    const uint32_t size = search_type_size(type);
++    return (size == 4) ? 0xFFFFFFFFu : ((1u << (size * 8)) - 1);
++}
++
++uint32_t load(const uint8_t *data, uint32_t size) {
++    uint32_t value = 0;
++    std::memcpy(&value, data, size);
++    return value;
++}
++
++bool matches(uint32_t bits, uint32_t wanted, SearchType type) {
++    if (type != SearchType::f32)
++        return bits == wanted;
++
++    // Games rarely hold exactly the decimal that was typed, compare with a small tolerance.
++    const float actual = std::bit_cast<float>(bits);
++    const float expected = std::bit_cast<float>(wanted);
++    if (!std::isfinite(actual) || !std::isfinite(expected))
++        return bits == wanted;
++    return std::fabs(actual - expected) <= std::max(1e-5f, std::fabs(expected) * 1e-5f);
++}
++
++} // namespace
++
++uint32_t search_type_size(SearchType type) {
++    switch (type) {
++    case SearchType::u8:
++    case SearchType::s8: return 1;
++    case SearchType::u16:
++    case SearchType::s16: return 2;
++    default: return 4;
++    }
++}
++
++CodeWidth search_type_width(SearchType type) {
++    switch (search_type_size(type)) {
++    case 1: return CodeWidth::bits8;
++    case 2: return CodeWidth::bits16;
++    default: return CodeWidth::bits32;
++    }
++}
++
++std::optional<uint32_t> parse_search_value(const std::string &text, SearchType type) {
++    const std::string trimmed = string_utils::trim_copy(text);
++    if (trimmed.empty())
++        return std::nullopt;
++
++    if (type == SearchType::f32) {
++        // libc++ only gained floating point from_chars recently.
++        char *end = nullptr;
++        const float value = std::strtof(trimmed.c_str(), &end);
++        if (end != trimmed.c_str() + trimmed.size())
++            return std::nullopt;
++        return std::bit_cast<uint32_t>(value);
++    }
++
++    std::string_view digits = trimmed;
++    const bool negative = digits.starts_with('-');
++    if (negative)
++        digits.remove_prefix(1);
++    int base = 10;
++    if (digits.starts_with("0x") || digits.starts_with("0X")) {
++        digits.remove_prefix(2);
++        base = 16;
++    }
++
++    uint64_t magnitude = 0;
++    const auto [end, error] = std::from_chars(digits.data(), digits.data() + digits.size(), magnitude, base);
++    if (digits.empty() || (error != std::errc()) || (end != digits.data() + digits.size()))
++        return std::nullopt;
++
++    // Either the signed or the unsigned reading of the bits is accepted, whichever type is picked.
++    const uint64_t bits = uint64_t(search_type_size(type)) * 8;
++    if (negative ? (magnitude > (uint64_t(1) << (bits - 1))) : (magnitude > (uint64_t(1) << bits) - 1))
++        return std::nullopt;
++
++    const uint64_t value = negative ? (0 - magnitude) : magnitude;
++    return static_cast<uint32_t>(value) & type_mask(type);
++}
++
++std::string format_search_value(uint32_t bits, SearchType type) {
++    switch (type) {
++    case SearchType::s8: return std::to_string(static_cast<int8_t>(bits));
++    case SearchType::s16: return std::to_string(static_cast<int16_t>(bits));
++    case SearchType::s32: return std::to_string(static_cast<int32_t>(bits));
++    case SearchType::f32: return fmt::format("{}", std::bit_cast<float>(bits));
++    default: return std::to_string(bits & type_mask(type));
++    }
++}
++
++void MemorySearch::new_search(MemState &mem, SearchType type, uint32_t value) {
++    m_type = type;
++    m_results.clear();
++    m_searched = true;
++    m_truncated = false;
++
++    const uint32_t size = search_type_size(type);
++    const auto page_count = static_cast<uint32_t>(std::min<size_t>(mem.allocator.max_offset, 0x100000000ull / page_size));
++
++    // Page 0 is never handed out, an address of 0 would read as "no result" anyway.
++    for (uint32_t block = 0; block < page_count; block += pages_per_block) {
++        const uint32_t block_end = std::min(block + pages_per_block, page_count);
++
++        const std::lock_guard<std::mutex> lock(mem.generation_mutex);
++        if (mem.allocator.free_slot_count(block, block_end) == static_cast<int>(block_end - block))
++            continue;
++
++        for (uint32_t page = std::max(block, 1u); page < block_end; ++page) {
++            if (mem.allocator.free_slot_count(page, page + 1) != 0)
++                continue;
++
++            const uint32_t base = page * page_size;
++            const uint8_t *data = Ptr<uint8_t>(base).get(mem);
++            for (uint32_t offset = 0; offset < page_size; offset += size) {
++                if (!matches(load(data + offset, size), value, type))
++                    continue;
++
++                if (m_results.size() == max_results) {
++                    m_truncated = true;
++                    return;
++                }
++                m_results.push_back(base + offset);
++            }
++        }
++    }
++}
++
++void MemorySearch::filter(MemState &mem, uint32_t value) {
++    if (!m_searched)
++        return;
++
++    std::erase_if(m_results, [&](uint32_t address) {
++        const auto bits = read_search_value(mem, address, m_type);
++        return !bits || !matches(*bits, value, m_type);
++    });
++}
++
++void MemorySearch::clear() {
++    m_results.clear();
++    m_searched = false;
++    m_truncated = false;
++}
++
++std::optional<uint32_t> read_search_value(MemState &mem, uint32_t address, SearchType type) {
++    const uint32_t size = search_type_size(type);
++    const std::lock_guard<std::mutex> lock(mem.generation_mutex);
++    if ((address == 0) || !is_valid_addr_range(mem, address, address + size))
++        return std::nullopt;
++
++    uint8_t bytes[4] = {};
++    for (uint32_t i = 0; i < size; ++i)
++        bytes[i] = *Ptr<uint8_t>(address + i).get(mem);
++    return load(bytes, size);
++}
++
++bool write_search_value(MemState &mem, uint32_t address, SearchType type, uint32_t bits) {
++    const uint32_t size = search_type_size(type);
++    const std::lock_guard<std::mutex> lock(mem.generation_mutex);
++    if ((address == 0) || !is_valid_addr_range(mem, address, address + size))
++        return false;
++
++    for (uint32_t i = 0; i < size; ++i)
++        *Ptr<uint8_t>(address + i).get(mem) = static_cast<uint8_t>(bits >> (i * 8));
++    return true;
++}
++
++CodeLine make_write_code(uint32_t address, SearchType type, uint32_t bits) {
++    CodeLine code;
++    code.control = static_cast<uint16_t>((uint32_t(CodeType::write) << 12) | (uint32_t(search_type_width(type)) << 8));
++    code.first = address;
++    code.second = bits & type_mask(type);
++    return code;
++}
++
++} // namespace cheat
+diff --git a/vita3k/config/include/config/config.h b/vita3k/config/include/config/config.h
+index dc41ec1e..69ff709d 100644
+--- a/vita3k/config/include/config/config.h
++++ b/vita3k/config/include/config/config.h
+@@ -163,6 +163,7 @@ using PhysicalKeyCode = input::PhysicalKeyCode;
+     code(bool, "export-as-png", true, export_as_png)                                                    \
+     code(std::string, "memory-mapping", "double-buffer", memory_mapping)                                \
+     code(bool, "boot-apps-full-screen", false, boot_apps_full_screen)                                   \
++    code(bool, "enable-cheats", true, enable_cheats)                                                    \
+     code(bool, "show-live-area-screen", false, show_live_area_screen)                                   \
+     code(std::string, "audio-backend", "SDL", audio_backend)                                            \
+     code(int, "audio-volume", 100, audio_volume)                                                        \
+diff --git a/vita3k/ctrl/include/ctrl/functions.h b/vita3k/ctrl/include/ctrl/functions.h
+index a8eb771e..723a09aa 100644
+--- a/vita3k/ctrl/include/ctrl/functions.h
++++ b/vita3k/ctrl/include/ctrl/functions.h
+@@ -26,6 +26,8 @@
+ 
+ std::array<ControllerBinding, 15> get_controller_bindings_ext(EmuEnvState &emuenv);
+ SceCtrlExternalInputMode get_type_of_controller(CtrlState &state, int port);
++// Reads the pad the way sceCtrlPeekBufferPositive does, without a guest call.
++SceUInt32 ctrl_peek_buttons(EmuEnvState &emuenv, int port);
+ int ctrl_get(const SceUID thread_id, EmuEnvState &emuenv, int port, SceCtrlData2 *pData, SceUInt32 count, bool negative, bool is_peek, bool is_v2, bool from_ext);
+ void refresh_controllers(CtrlState &state, EmuEnvState &emuenv);
+ void update_keyboard_state(EmuEnvState &emuenv, const std::function<bool(input::PhysicalKeyCode)> &key_held);
+diff --git a/vita3k/ctrl/src/ctrl.cpp b/vita3k/ctrl/src/ctrl.cpp
+index 525994a5..6a48a8dc 100644
+--- a/vita3k/ctrl/src/ctrl.cpp
++++ b/vita3k/ctrl/src/ctrl.cpp
+@@ -463,6 +463,13 @@ static void retrieve_ctrl_data(EmuEnvState &emuenv, int port, bool is_v2, bool n
+     reset_axes();
+ }
+ 
++SceUInt32 ctrl_peek_buttons(EmuEnvState &emuenv, int port) {
++    SceUInt32 buttons = 0;
++    SceUInt8 lx, ly, rx, ry;
++    retrieve_ctrl_data(emuenv, port, false, false, false, buttons, lx, ly, rx, ry);
++    return buttons;
++}
++
+ int ctrl_get(const SceUID thread_id, EmuEnvState &emuenv, int port, SceCtrlData2 *pData, SceUInt32 count, bool negative, bool is_peek, bool is_v2, bool from_ext) {
+     if (port > 1 && !emuenv.cfg.current_config.pstv_mode) {
+         const char *export_name = "sceCtrl*Buffer*";
+diff --git a/vita3k/display/CMakeLists.txt b/vita3k/display/CMakeLists.txt
+index a3bdf82f..e2e42e7b 100644
+--- a/vita3k/display/CMakeLists.txt
++++ b/vita3k/display/CMakeLists.txt
+@@ -8,4 +8,4 @@ add_library(
+ 
+ target_include_directories(display PUBLIC include)
+ target_link_libraries(display PUBLIC emuenv kernel)
+-target_link_libraries(display PRIVATE touch renderer dialog motion)
++target_link_libraries(display PRIVATE cheat ctrl touch renderer dialog motion)
+diff --git a/vita3k/display/src/display.cpp b/vita3k/display/src/display.cpp
+index b04fe5ab..937bf3e5 100644
+--- a/vita3k/display/src/display.cpp
++++ b/vita3k/display/src/display.cpp
+@@ -17,6 +17,8 @@
+ 
+ #include <display/functions.h>
+ 
++#include <cheat/functions.h>
++#include <ctrl/functions.h>
+ #include <dialog/state.h>
+ #include <display/state.h>
+ #include <emuenv/state.h>
+@@ -38,14 +40,21 @@ static constexpr int max_expected_swapchain_size = 6;
+ static void vblank_sync_thread(EmuEnvState &emuenv) {
+     DisplayState &display = emuenv.display;
+ 
++    const cheat::JitInvalidate invalidate_jit = [&emuenv](uint32_t address, size_t size) {
++        emuenv.kernel.invalidate_jit_cache(address, size);
++    };
++
+     while (!display.abort.load()) {
+         {
+             const std::lock_guard<std::mutex> guard(display.mutex);
+ 
++            bool has_frame = false;
+             {
+                 const std::lock_guard<std::mutex> guard_info(display.display_info_mutex);
+                 ++display.vblank_count;
+ 
++                has_frame = static_cast<bool>(display.sce_frame.base);
++
+                 // in this case, even though no new game frames are being rendered, we still need to update the screen
+                 if (emuenv.kernel.is_threads_paused() || (emuenv.common_dialog.status == SCE_COMMON_DIALOG_STATUS_RUNNING))
+                     // only display the UI/common dialog at 30 fps
+@@ -59,6 +68,14 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
+             touch_vsync_update(emuenv);
+             refresh_motion(emuenv.motion, emuenv.ctrl);
+ 
++            if (has_frame)
++                emuenv.cheat.count_frame();
++
++            // Cheat codes are re-applied on every vblank, the same way the Vita cheat plugins do.
++            // The pad is read here rather than taken from the game, which may stop reading it while a button is held.
++            cheat::set_buttons(emuenv.cheat, ctrl_peek_buttons(emuenv, 1));
++            cheat::apply(emuenv.cheat, emuenv.mem, invalidate_jit);
++
+             // Notify Vblank callback in each VBLANK start
+             for (auto &[_, cb] : display.vblank_callbacks)
+                 cb->event_notify(cb->get_notifier_id());
+@@ -102,6 +119,22 @@ void libretro_vblank_tick(EmuEnvState &emuenv) {
+     touch_vsync_update(emuenv);
+     refresh_motion(emuenv.motion, emuenv.ctrl);
+ 
++    // Cheat codes, re-applied every vblank as the Vita cheat plugins do
++    {
++        bool has_frame = false;
++        {
++            const std::lock_guard<std::mutex> guard_info(display.display_info_mutex);
++            has_frame = static_cast<bool>(display.sce_frame.base);
++        }
++        if (has_frame)
++            emuenv.cheat.count_frame();
++        const cheat::JitInvalidate invalidate_jit = [&emuenv](uint32_t address, size_t size) {
++            emuenv.kernel.invalidate_jit_cache(address, size);
++        };
++        cheat::set_buttons(emuenv.cheat, ctrl_peek_buttons(emuenv, 1));
++        cheat::apply(emuenv.cheat, emuenv.mem, invalidate_jit);
++    }
++
+     // Notify Vblank callback in each VBLANK start
+     for (auto &[_, cb] : display.vblank_callbacks)
+         cb->event_notify(cb->get_notifier_id());
+diff --git a/vita3k/emuenv/CMakeLists.txt b/vita3k/emuenv/CMakeLists.txt
+index 454aecb7..f80f5527 100644
+--- a/vita3k/emuenv/CMakeLists.txt
++++ b/vita3k/emuenv/CMakeLists.txt
+@@ -5,4 +5,4 @@ add_library(
+ 
+ target_include_directories(emuenv INTERFACE include)
+ target_link_libraries(emuenv PUBLIC mem)
+-target_link_libraries(emuenv PRIVATE app audio camera compat config ctrl dialog display ime io kernel motion net ngs nids np overlay regmgr renderer touch gdbstub packages http)
++target_link_libraries(emuenv PRIVATE app audio camera cheat compat config ctrl dialog display ime io kernel motion net ngs nids np overlay regmgr renderer touch gdbstub packages http)
+diff --git a/vita3k/emuenv/include/emuenv/state.h b/vita3k/emuenv/include/emuenv/state.h
+index 5e9c9239..4bec2950 100644
+--- a/vita3k/emuenv/include/emuenv/state.h
++++ b/vita3k/emuenv/include/emuenv/state.h
+@@ -44,6 +44,7 @@ struct State;
+ };
+ 
+ struct Config;
++struct CheatState;
+ struct CompatState;
+ struct MemState;
+ struct CtrlState;
+@@ -114,6 +115,7 @@ private:
+     std::unique_ptr<HTTPState> _http;
+     std::unique_ptr<CameraState> _camera;
+     std::unique_ptr<CompatState> _compat;
++    std::unique_ptr<CheatState> _cheat;
+     mutable std::mutex _launch_request_mutex;
+     std::optional<AppLaunchRequest> _pending_launch_request;
+     // The URI the running app was launched with, until sceAppMgrGetAppParam takes it
+@@ -135,6 +137,7 @@ public:
+     fs::path static_assets_path{}; // Path for static assets (shaders, icons, etc)
+     fs::path shared_path{}; // Path for files (UI themes, textures, etc)
+     fs::path patch_path{}; // Path for patch files
++    fs::path cheat_path{}; // Path for cheat files
+     std::string self_name{};
+     std::string self_path{};
+     Config &cfg;
+@@ -178,6 +181,7 @@ public:
+     HTTPState &http;
+     CameraState &camera;
+     CompatState &compat;
++    CheatState &cheat;
+     int max_font_level = 0;
+     int current_font_level = 0;
+ 
+@@ -223,6 +227,7 @@ public:
+         Root r;
+         r.set_vita_fs_path(vita_fs_path);
+         r.set_patch_path(patch_path);
++        r.set_cheat_path(cheat_path);
+         r.set_log_path(log_path);
+         r.set_config_path(config_path);
+         r.set_shared_path(shared_path);
+diff --git a/vita3k/emuenv/src/emuenv.cpp b/vita3k/emuenv/src/emuenv.cpp
+index 3fec134c..ba4ce915 100644
+--- a/vita3k/emuenv/src/emuenv.cpp
++++ b/vita3k/emuenv/src/emuenv.cpp
+@@ -20,6 +20,7 @@
+ #include <app/state.h>
+ #include <audio/state.h>
+ #include <camera/state.h>
++#include <cheat/state.h>
+ #include <compat/state.h>
+ #include <config/state.h>
+ #include <ctrl/state.h>
+@@ -100,7 +101,9 @@ EmuEnvState::EmuEnvState()
+     , _camera(new CameraState)
+     , camera(*_camera)
+     , _compat(new CompatState)
+-    , compat(*_compat) {
++    , compat(*_compat)
++    , _cheat(new CheatState)
++    , cheat(*_cheat) {
+ }
+ DISABLE_WARNING_END;
+ 
+diff --git a/vita3k/interface.cpp b/vita3k/interface.cpp
+index 9cab4a01..512107c6 100644
+--- a/vita3k/interface.cpp
++++ b/vita3k/interface.cpp
+@@ -21,6 +21,7 @@
+ 
+ #include "module/load_module.h"
+ 
++#include <cheat/functions.h>
+ #include <config/state.h>
+ #include <ctime>
+ #include <ctrl/state.h>
+@@ -438,6 +439,30 @@ static void do_patches(MemState &mem, const Patches &patches, const SceKernelMod
+     }
+ }
+ 
++// Registers the modules a `$B2` code can pick from along with the cheat file of the title.
++static void load_cheats(EmuEnvState &emuenv, const SceKernelModuleInfo &module_info) {
++    cheat::unload(emuenv.cheat);
++
++    const cheat::JitInvalidate invalidate_jit = [&emuenv](uint32_t address, size_t size) {
++        emuenv.kernel.invalidate_jit_cache(address, size);
++    };
++    cheat::set_enabled(emuenv.cheat, emuenv.cfg.enable_cheats, emuenv.mem, invalidate_jit);
++
++    // A `$B2` code with module index 0 refers to the main executable.
++    CheatModule main_module;
++    main_module.name = std::string(module_info.module_name, strnlen(module_info.module_name, sizeof(module_info.module_name)));
++    static_assert(main_module.segments.size() == MODULE_INFO_NUM_SEGMENTS);
++    for (size_t i = 0; i < main_module.segments.size(); i++) {
++        main_module.segments[i].address = module_info.segments[i].vaddr.address();
++        main_module.segments[i].size = module_info.segments[i].memsz;
++    }
++    cheat::add_module(emuenv.cheat, main_module);
++
++    if (cheat::load(emuenv.cheat, emuenv.cheat_path, emuenv.io.title_id)) {
++        LOG_INFO("{} cheats are turned on for {}", cheat::enabled_cheat_count(emuenv.cheat), emuenv.io.title_id);
++    }
++}
++
+ static ExitCode load_app_impl(SceUID &main_module_id, EmuEnvState &emuenv, const AppLaunchRequest &launch_request) {
+     const auto call_import = [&emuenv](CPUState &cpu, uint32_t nid, SceUID thread_id) {
+         ::call_import(emuenv, cpu, nid, thread_id);
+@@ -526,6 +551,7 @@ static ExitCode load_app_impl(SceUID &main_module_id, EmuEnvState &emuenv, const
+         patches.insert(patches.end(), xml_patches.begin(), xml_patches.end());
+         if (!patches.empty())
+             do_patches(emuenv.mem, patches, module->info);
++        load_cheats(emuenv, module->info);
+     } else
+         return FileNotFound;
+     // Set self name from self path, can contain folder, get file name only
+diff --git a/vita3k/libretro/libretro_vita3k.cpp b/vita3k/libretro/libretro_vita3k.cpp
+index 3d84aa50..d078d8f7 100644
+--- a/vita3k/libretro/libretro_vita3k.cpp
++++ b/vita3k/libretro/libretro_vita3k.cpp
+@@ -2330,6 +2330,8 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game) {
+     root.set_cache_path(pref_path / "cache");
+     root.set_shared_path(pref_path);
+     root.set_patch_path(pref_path / "patch");
++    root.set_cheat_path(pref_path / "cheats");
++    fs::create_directories(pref_path / "cheats");
+ 
+     install_bundled_files(pref_path);
+     root.set_static_assets_path(pref_path);
+diff --git a/vita3k/modules/CMakeLists.txt b/vita3k/modules/CMakeLists.txt
+index bdc79217..74b3ef11 100644
+--- a/vita3k/modules/CMakeLists.txt
++++ b/vita3k/modules/CMakeLists.txt
+@@ -226,7 +226,7 @@ endif()
+ add_library(modules STATIC ${SOURCE_LIST})
+ target_include_directories(modules PUBLIC include)
+ target_include_directories(modules PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/taiHEN)
+-target_link_libraries(modules PRIVATE app audio camera codec ctrl dialog lang display dlmalloc gxm ime kernel mem motion net ngs np patch regmgr ssl packages printf renderer rtc SDL3::SDL3 substitute touch xxHash::xxhash)
++target_link_libraries(modules PRIVATE app audio camera cheat codec ctrl dialog lang display dlmalloc gxm ime kernel mem motion net ngs np patch regmgr ssl packages printf renderer rtc SDL3::SDL3 substitute touch xxHash::xxhash)
+ target_link_libraries(modules PUBLIC module)
+ source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${SOURCE_LIST})
+ 
+diff --git a/vita3k/patch/src/patch_xml.cpp b/vita3k/patch/src/patch_xml.cpp
+index f45b4ba1..54d0fce0 100644
+--- a/vita3k/patch/src/patch_xml.cpp
++++ b/vita3k/patch/src/patch_xml.cpp
+@@ -136,6 +136,10 @@ bool patch_entry_matches(const PatchEntry &entry, const std::string &titleid, co
+     if (!entry.app_ver.empty() && !patch_versions_equal(entry.app_ver, app_ver))
+         return false;
+ 
++    // most of the list leaves NID empty: title ID, game version and executable
++    // already have to match, so an empty NID matches any build of that version
++    if (entry.nid.empty())
++        return true;
+     const auto expected = parse_hex(entry.nid);
+     return expected && *expected == nid;
+ }
+diff --git a/vita3k/util/include/util/fs.h b/vita3k/util/include/util/fs.h
+index 7e20ee4b..c0a4580b 100644
+--- a/vita3k/util/include/util/fs.h
++++ b/vita3k/util/include/util/fs.h
+@@ -121,6 +121,7 @@ bool copy_directory_contents(const fs::path &src_path, const fs::path &dst_path,
+ class Root {
+     fs::path vita_fs_path;
+     fs::path patch_path;
++    fs::path cheat_path;
+     fs::path log_path;
+     fs::path config_path;
+     fs::path shared_path;
+@@ -142,6 +143,13 @@ public:
+         return patch_path;
+     }
+ 
++    void set_cheat_path(const fs::path &p) {
++        cheat_path = p;
++    }
++    fs::path get_cheat_path() const {
++        return cheat_path;
++    }
++
+     void set_log_path(const fs::path &p) {
+         log_path = p;
+     }

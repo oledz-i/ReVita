@@ -175,6 +175,18 @@ private:
     int librarySort_ = 0;    // 0 A-Z, 1 recently played
     int libraryFilter_ = 0;  // 0 all, 1 folders, 2 archives and packages
     int settingsTab_ = 0;
+    // Mods: cheats (VitaCheat database) and patches (Vita3K's patch list) per game
+    int modsGame_ = -1;
+    bool modsBusy_ = false;
+    std::wstring modsMessage_;
+    void Mods();
+    void FetchMods(size_t index, bool force);
+    void ToggleCheat(const std::wstring& titleId, size_t cheatIndex);
+    void TogglePatch(const std::string& key);
+    // Settings: the category list on the left (part of the navigation layer)
+    std::vector<Windows::UI::Xaml::Controls::Button^> settingsRail_;
+    void StyleSettingsRail();
+    void FocusSettingsRail();
     void UpdateSpotlight(int index);
     void HideSpotlight();
     std::vector<size_t> RecentGames();
