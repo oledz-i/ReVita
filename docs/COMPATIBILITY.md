@@ -1,6 +1,6 @@
-# Compatibility (alpha)
+# ReVita compatibility (beta)
 
-Results from hands-on testing on an Xbox Series S in Dev Mode. This is a snapshot, not a promise: builds change quickly. "Vulkan" is Mesa Dozen on D3D12; "OpenGL" is Mesa on D3D12.
+Results from hands-on testing of ReVita on an Xbox Series S in Dev Mode. This is a snapshot, not a promise: builds change quickly. "Vulkan" is Mesa Dozen on D3D12; "OpenGL" is Mesa on D3D12.
 
 | Game | Vulkan | OpenGL | Notes |
 | --- | --- | --- | --- |

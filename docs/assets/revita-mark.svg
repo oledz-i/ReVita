@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="ribbon" x1="150" y1="420" x2="420" y2="90" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2FE6FF"/>
+      <stop offset="0.48" stop-color="#7C5CFF"/>
+      <stop offset="1" stop-color="#FF4FB4"/>
+    </linearGradient>
+    <radialGradient id="bg" cx="0.38" cy="0.34" r="0.85">
+      <stop offset="0" stop-color="#241A4A"/>
+      <stop offset="0.55" stop-color="#110D24"/>
+      <stop offset="1" stop-color="#07060F"/>
+    </radialGradient>
+    <radialGradient id="core" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#7C5CFF" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#7C5CFF" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="spark" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="0.45" stop-color="#FFD3F1"/>
+      <stop offset="1" stop-color="#FF4FB4" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="14" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect class="plate" x="0" y="0" width="512" height="512" rx="116" fill="url(#bg)"/>
+  <circle cx="236" cy="232" r="150" fill="url(#core)"/>
+  <!-- inner faint orbit -->
+  <circle cx="256" cy="256" r="200" fill="none" stroke="#FFFFFF" stroke-opacity="0.06" stroke-width="2"/>
+  <!-- orbit: opens at the lower right where the R breaks out, closes in a spark -->
+  <path filter="url(#glow)" fill="none" stroke="url(#ribbon)" stroke-width="20" stroke-linecap="round"
+        d="M235 455 A200 200 0 1 1 385 103"/>
+  <path fill="none" stroke="url(#ribbon)" stroke-opacity="0.35" stroke-width="10" stroke-linecap="round"
+        d="M452 298 A200 200 0 0 1 414 379"/>
+  <!-- the R, leaning forward; its leg breaks out of the orbit -->
+  <g transform="translate(256 256) skewX(-12) translate(-256 -256)">
+    <path filter="url(#glow)" fill="none" stroke="url(#ribbon)" stroke-width="44" stroke-linecap="round" stroke-linejoin="round"
+          d="M196 366 V156 H282 A62 62 0 0 1 282 280 H230 M266 288 L404 444"/>
+  </g>
+  <!-- the spark where the loop closes -->
+  <circle cx="385" cy="103" r="46" fill="url(#spark)"/>
+  <path fill="#FFFFFF" d="M385 69 L392 96 L419 103 L392 110 L385 137 L378 110 L351 103 L378 96 Z"/>
+</svg>

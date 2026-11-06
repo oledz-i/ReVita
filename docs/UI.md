@@ -1,12 +1,14 @@
 # Frontend
 
-A native UWP interface made for a controller on a TV. Everything is reachable with the Xbox controller; **B** goes back.
+ReVita's interface is native UWP, made for a controller on a TV. Everything is reachable with the Xbox controller; **B** goes back.
+
+The frame: the ReVita mark and the time float at the top, and the tabs (Home, Library, Settings) sit in a glass dock at the bottom. **LB** and **RB** move between tabs from anywhere. Soft veils fade the page out under the header and the dock, so content scrolls behind the glass.
 
 ## Home layouts
 
 **Settings → Appearance → Home screen** switches between:
 
-- **Cinematic** (default): a hero for the game you last played, shelves, and a left rail with Home, Library and Settings.
+- **Cover flow** (default): every game as a poster in one row, played games first. The poster you are on faces you, larger and centred; the others turn toward it and step back, and its artwork fills the screen behind the page. Left and right browse, **A** opens the game page, **Up** reaches **Play**.
 - **PS3 XMB**: a cross-bar in the style of the PS3. Categories run along the top (Settings, Music, Game, Network), items run down beneath the selected one, and animated waves sit over the background. A clock shows the date and time. D-pad or stick to move, **A** to select, **Y** for a game's page, **B** to back out.
 
 The XMB has eleven colours: Monthly (the PS3's colour of the month, darker at night), Classic Blue (default), Vita Blue, Crimson, Emerald, Royal Purple, Ocean, Rose, Sunset, Silver and Midnight. Pick one under **Settings → Appearance → XMB colour**, or press A on the **Theme** item in the XMB's Settings column to cycle through them.
@@ -15,10 +17,10 @@ The XMB has eleven colours: Monthly (the PS3's colour of the month, darker at ni
 
 | Page | What it does |
 | --- | --- |
-| Home | Continue playing, collection shelves, quick actions, a Get started card until storage, firmware and games are set |
-| Library | Search, add individual files or scan a folder, validate files, find missing covers |
+| Home | The cover flow with Play, Game page and Library for the poster in the middle, and a Get started card until storage, firmware and games are set |
+| Library | Full-bleed posters with the name on the art; search, sort, filter, add files or scan a folder, find missing covers |
 | Game page | Backdrop, cover, Play, artwork, per-game settings, detected format and title ID |
-| Settings | Firmware, storage, emulation, appearance, music and sounds, artwork, diagnostics |
+| Settings | Firmware (including a download from PlayStation's update server), storage, emulation, appearance, music and sounds, artwork, help and About |
 | Tools | Development builds only: CPU, memory, JIT, Vulkan and D3D12 diagnostics |
 
 ## Artwork and backdrops
@@ -30,7 +32,7 @@ The XMB has eleven colours: Monthly (the PS3's colour of the month, darker at ni
 
 ## Themes, music and sounds
 
-Five themes (Onyx, Aurora, Ember, Glacier, Orbit). Four original home soundtracks (Afterglow, Neon Arcade, Stardust, Tidal), composed for this project by `scripts/music/compose.py`, or your own file, or off. Original interface cues for focus, select, back and shelf swipes, played through XAudio2 so they never hold up the menu. Music and cues each have their own volume.
+Twelve themes: ReVita (default, violet night with the mark's cyan-violet-pink ribbon), Aurora, Ember, Glacier, Orbit, Sakura, Synthwave, Verdant, Gilded, Abyss, Crimson and Prism, each with its own living scene. Nine original home soundtracks (Afterglow, Neon Arcade, Stardust, Tidal, Sakura, Night Drive, Golden Hour, Abyss, Crimson), composed for this project by `scripts/music/compose.py`, or your own file, or off. Original interface cues for focus, select, back and shelf swipes, played through XAudio2 so they never hold up the menu. Music and cues each have their own volume.
 
 ## In a game
 
