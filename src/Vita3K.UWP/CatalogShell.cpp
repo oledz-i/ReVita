@@ -1075,12 +1075,15 @@ bool CatalogShell::FocusContent() {
         }
     return false;
 }
-void CatalogShell::FocusContentSoon(int attempts) {
+void CatalogShell::FocusContentSoon(int attempts, bool fromMenu) {
     // A page that was just drawn is not laid out yet, and a control that is
     // not laid out cannot take focus. Try again shortly instead of giving up,
     // so the controller is never left with nothing to move from.
+    // Something already holds the focus: leave it alone. The exception is a
+    // call that comes from the dock itself (Down on a tab or a pill): the dock
+    // holds the focus, and that is exactly what this call is here to move.
     auto focused = dynamic_cast<DependencyObject^>(Windows::UI::Xaml::Input::FocusManager::GetFocusedElement());
-    if (focused != nullptr && InWindow(focused)) return;
+    if (focused != nullptr && InWindow(focused) && !(fromMenu && MenuKeyOf(focused) >= 0)) return;
     if (FocusContent()) return;
     if (attempts <= 0) {
         libretro_.LogLine("nav: no control on this page could take the focus; using the dock");
@@ -1091,7 +1094,7 @@ void CatalogShell::FocusContentSoon(int attempts) {
     timer->Interval = Millis(60);
     timer->Tick += ref new EventHandler<Platform::Object^>([this,timer,attempts](Platform::Object^, Platform::Object^) {
         timer->Stop();
-        FocusContentSoon(attempts - 1);
+        FocusContentSoon(attempts - 1, fromMenu);
     });
     timer->Start();
 }
@@ -1243,7 +1246,7 @@ bool CatalogShell::Navigate(int dir) {
                 return true;
             }
             libretro_.LogLine("nav: down from " + NameOf(current) + " enters the page");
-            FocusContentSoon(8);
+            FocusContentSoon(8, true);
         }
         return true;   // the dock's ends hold the controller; it never falls off
     }

@@ -202,7 +202,7 @@ private:
     bool Navigate(int direction);
     bool HandleNavKey(Windows::System::VirtualKey code);
     void EnsureVisible(Windows::UI::Xaml::Controls::Control^ control);
-    void FocusContentSoon(int attempts);
+    void FocusContentSoon(int attempts, bool fromMenu = false);
     void CollectNavStops(Windows::UI::Xaml::DependencyObject^ node, std::vector<Windows::UI::Xaml::Controls::Control^>& out);
     void UpdateSpotlight(int index);
     void HideSpotlight();
