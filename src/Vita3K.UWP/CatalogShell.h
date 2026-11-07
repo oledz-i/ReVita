@@ -193,12 +193,16 @@ private:
     std::vector<std::pair<int, Windows::UI::Xaml::Controls::Button^>> menuItems_;
     int pendingMenuFocus_ = -1;
     unsigned navigationRevision_ = 0;
-    bool NavigateDirection(Windows::System::VirtualKey key);
     int MenuKeyOf(Platform::Object^ element) const;
     void FocusMenu(int key);
     bool FocusContent();
     bool InWindow(Windows::UI::Xaml::DependencyObject^ element) const;
     int CurrentMenuKey() const;
+    bool Navigate(int direction);
+    bool HandleNavKey(Windows::System::VirtualKey code);
+    void EnsureVisible(Windows::UI::Xaml::Controls::Control^ control);
+    void FocusContentSoon(int attempts);
+    void CollectNavStops(Windows::UI::Xaml::DependencyObject^ node, std::vector<Windows::UI::Xaml::Controls::Control^>& out);
     void UpdateSpotlight(int index);
     void HideSpotlight();
     std::vector<size_t> RecentGames();

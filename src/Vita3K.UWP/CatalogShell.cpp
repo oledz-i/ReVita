@@ -164,7 +164,6 @@ const XmbTheme kXmbThemes[] = {
     { L"Ice", { 12, 30, 48 }, { 164, 214, 246 }, false },
 };
 constexpr int kXmbThemeCount = static_cast<int>(sizeof(kXmbThemes) / sizeof(kXmbThemes[0]));
-constexpr double kMenuWidth = 196;   // the side menu
 Platform::String^ StringOf(const std::wstring& value) {
     return ref new Platform::String(value.c_str());
 }
@@ -525,7 +524,7 @@ CatalogShell::CatalogShell() {
     root_->XYFocusRightNavigationStrategy = Windows::UI::Xaml::Input::XYFocusNavigationStrategy::NavigationDirectionDistance;
     root_->Background = Solid(Bg());
     auto railColumn = ref new ColumnDefinition();
-    railColumn->Width = GridLength(kMenuWidth);   // the side menu
+    railColumn->Width = GridLength(0);   // kept at no width so every full-screen layer spans both columns
     auto contentColumn = ref new ColumnDefinition();
     contentColumn->Width = GridLength(1, GridUnitType::Star);
     root_->ColumnDefinitions->Append(railColumn);
@@ -537,8 +536,8 @@ CatalogShell::CatalogShell() {
     root_->RowDefinitions->Append(mainRow);
     root_->RowDefinitions->Append(footerRow);
 
-    // ReVita: the side menu on the left and the time at the top right. The
-    // layer itself has no background, so the page beside it takes input.
+    // ReVita: the bar across the top (mark, dock, time). The page starts
+    // under it, so the bar never covers anything.
     navigation_ = ref new Border();
     navigation_->Background = nullptr;
     Grid::SetColumn(navigation_, 0);
@@ -551,10 +550,10 @@ CatalogShell::CatalogShell() {
     scroll->VerticalScrollBarVisibility = ScrollBarVisibility::Hidden;
     scroll->HorizontalScrollBarVisibility = ScrollBarVisibility::Disabled;
     content_ = Vertical();
-    content_->Margin = Thickness(36, 6, 40, 28);
+    content_->Margin = Thickness(56, 10, 56, 28);
     scroll->Content = content_;
-    // under the time; nothing covers the page
-    scroll->Margin = Thickness(0, 48, 0, 0);
+    // under the bar (BuildNavigation sets the height for the page)
+    scroll->Margin = Thickness(0, 70, 0, 0);
     Grid::SetColumn(scroll, 1);
     Grid::SetRow(scroll, 0);
     root_->Children->Append(scroll);
@@ -673,10 +672,6 @@ CatalogShell::CatalogShell() {
             });
         });
     Content = root_;
-    root_->PreviewKeyDown += ref new Windows::UI::Xaml::Input::KeyEventHandler(
-        [this](Platform::Object^, Windows::UI::Xaml::Input::KeyRoutedEventArgs^ e) {
-            if (!e->Handled && NavigateDirection(e->Key)) e->Handled = true;
-        });
     Window::Current->CoreWindow->KeyDown +=
         ref new TypedEventHandler<Windows::UI::Core::CoreWindow^, Windows::UI::Core::KeyEventArgs^>(
             [this](Windows::UI::Core::CoreWindow^, Windows::UI::Core::KeyEventArgs^ e) {
@@ -728,12 +723,12 @@ CatalogShell::CatalogShell() {
                     }
                     return;
                 }
-                auto popupFocus = dynamic_cast<DependencyObject^>(Windows::UI::Xaml::Input::FocusManager::GetFocusedElement());
-                if (popupFocus != nullptr && !InWindow(popupFocus)) return;
                 if (page_ == 0 && xmb_ != nullptr && xmb_->Visibility == Windows::UI::Xaml::Visibility::Visible) {
                     if (XmbKey(e->VirtualKey)) e->Handled = true;
                     return;
                 }
+                // A dialog, a drop-down or a flyout is open: it owns the controller.
+                if (Windows::UI::Xaml::Media::VisualTreeHelper::GetOpenPopups(Window::Current)->Size > 0) return;
                 // LB and RB move between the tabs, from any page.
                 if (e->VirtualKey == Windows::System::VirtualKey::GamepadLeftShoulder ||
                     e->VirtualKey == Windows::System::VirtualKey::GamepadRightShoulder) {
@@ -741,70 +736,9 @@ CatalogShell::CatalogShell() {
                     e->Handled = true;
                     return;
                 }
-                const auto code = e->VirtualKey;
-                using Windows::System::VirtualKey;
-                const bool steer = code == VirtualKey::GamepadDPadUp || code == VirtualKey::GamepadDPadDown ||
-                    code == VirtualKey::GamepadDPadLeft || code == VirtualKey::GamepadDPadRight ||
-                    code == VirtualKey::GamepadLeftThumbstickUp || code == VirtualKey::GamepadLeftThumbstickDown ||
-                    code == VirtualKey::GamepadLeftThumbstickLeft || code == VirtualKey::GamepadLeftThumbstickRight ||
-                    code == VirtualKey::GamepadA || code == VirtualKey::Up || code == VirtualKey::Down ||
-                    code == VirtualKey::Left || code == VirtualKey::Right;
-                auto focused = Windows::UI::Xaml::Input::FocusManager::GetFocusedElement();
-                // Nothing focused (a page was just drawn again, or opened with
-                // LB/RB): the first press picks up the page instead of doing
-                // nothing.
-                if (steer && !InWindow(dynamic_cast<DependencyObject^>(focused))) {
-                    if (!FocusContent()) FocusMenu(CurrentMenuKey());
-                    e->Handled = true;
-                    return;
-                }
-                if (code == VirtualKey::GamepadB || code == VirtualKey::Escape) {
-                    PlayCue(2);
-                    e->Handled = true;
-                    if (MenuKeyOf(focused) < 0) {
-                        // in the page: a game's page goes back to the Library,
-                        // everything else goes back to its place in the menu
-                        if (page_ == 4) { ShowPage(1); return; }
-                        FocusMenu(CurrentMenuKey());
-                        return;
-                    }
-                    // in the menu: back Home
-                    if (page_ != 0) {
-                        pendingMenuFocus_ = 0;
-                        ShowPage(0);
-                    }
-                }
+                // everything else that moves around the menus
+                if (HandleNavKey(e->VirtualKey)) e->Handled = true;
             });
-    // When the D-pad finds nothing in that direction: Left from the page goes
-    // to the menu, Right from the menu goes into the page, and Up/Down at the
-    // end of what can be focused scroll the page so all of it can be read.
-    root_->NoFocusCandidateFound += ref new TypedEventHandler<UIElement^, Windows::UI::Xaml::Input::NoFocusCandidateFoundEventArgs^>(
-        [this](UIElement^, Windows::UI::Xaml::Input::NoFocusCandidateFoundEventArgs^ e) {
-            if (inGame_ || artPicker_ != nullptr) return;
-            auto activeFocus = dynamic_cast<DependencyObject^>(Windows::UI::Xaml::Input::FocusManager::GetFocusedElement());
-            if (activeFocus != nullptr && !InWindow(activeFocus)) return;
-            using Windows::UI::Xaml::Input::FocusNavigationDirection;
-            const bool inMenu = MenuKeyOf(Windows::UI::Xaml::Input::FocusManager::GetFocusedElement()) >= 0;
-            switch (e->Direction) {
-            case FocusNavigationDirection::Left:
-                if (!inMenu) { FocusMenu(CurrentMenuKey()); e->Handled = true; }
-                break;
-            case FocusNavigationDirection::Right:
-                if (inMenu && FocusContent()) e->Handled = true;
-                break;
-            case FocusNavigationDirection::Up:
-            case FocusNavigationDirection::Down:
-                if (!inMenu && contentScroll_ != nullptr) {
-                    const double step = e->Direction == FocusNavigationDirection::Down ? 180.0 : -180.0;
-                    const double to = std::max(0.0, std::min(contentScroll_->ScrollableHeight, contentScroll_->VerticalOffset + step));
-                    contentScroll_->ChangeView(nullptr, ref new Platform::Box<double>(to), nullptr, false);
-                    e->Handled = true;
-                }
-                break;
-            default:
-                break;
-            }
-        });
     // B on Xbox also raises a system back request; one left unhandled closes
     // the app (B at Home, or B in a game, dropped you to the dashboard). The
     // key handler above does all the going back, so every request is taken.
@@ -834,26 +768,166 @@ CatalogShell::CatalogShell() {
     });
 }
 void CatalogShell::BuildNavigation() {
-    // ReVita's frame: a menu down the left with every page in it (and, on
-    // Settings, every category under it), and the time at the top right.
-    // Nothing floats over the page and nothing dims it. The menu is part of
-    // the page for the controller: Left from the page reaches it, Right from
-    // it goes back into the page, B from the page lands on it.
+    // ReVita's frame: the mark, the tabs in a glass dock, and the time, in a
+    // bar across the top. The page starts under the bar (it is not laid over
+    // the page), so nothing is ever hidden behind it. On Settings a second
+    // row of pills under the dock holds its categories.
+    // The controller treats the bar as one zone and the page as another:
+    // Down from the bar enters the page, Up from the top of the page returns
+    // to the bar, B always lands on the bar. See Navigate().
     int keepKey = pendingMenuFocus_;
     pendingMenuFocus_ = -1;
-    if (keepKey < 0) keepKey = MenuKeyOf(Windows::UI::Xaml::Input::FocusManager::GetFocusedElement());
+    if (pendingContentFocus_) {
+        pendingContentFocus_ = false;
+        keepKey = -2;   // the page takes the focus once it is drawn
+    } else if (keepKey < 0) {
+        keepKey = MenuKeyOf(Windows::UI::Xaml::Input::FocusManager::GetFocusedElement());
+    }
     if (keepKey >= 100 && page_ != 2) keepKey = 2;
 
     menuItems_.clear();
     settingsRail_.clear();
     auto layer = ref new Grid();
+    layer->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Top;
 
-    // The time, top right over the page column.
+    auto header = ref new Grid();
+    header->Height = 64;
+    header->Margin = Thickness(44, 4, 48, 0);
+    header->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Top;
+    for (int c = 0; c < 3; ++c) {
+        auto column = ref new ColumnDefinition();
+        column->Width = c == 1 ? GridLength(1, GridUnitType::Star) : GridLength(1, GridUnitType::Auto);
+        header->ColumnDefinitions->Append(column);
+    }
+
+    // mark + wordmark
+    auto brand = ref new StackPanel();
+    brand->Orientation = Orientation::Horizontal;
+    brand->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
+    brand->IsHitTestVisible = false;
+    auto mark = ref new Image();
+    mark->Width = 34;
+    mark->Height = 34;
+    mark->Stretch = Stretch::Uniform;
+    mark->Source = ref new BitmapImage(ref new Uri(L"ms-appx:///Assets/ReVitaMark.png"));
+    brand->Children->Append(mark);
+    auto word = ref new Image();
+    word->Height = 20;
+    word->Stretch = Stretch::Uniform;
+    word->Margin = Thickness(9, 1, 0, 0);
+    word->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
+    word->Source = ref new BitmapImage(ref new Uri(L"ms-appx:///Assets/ReVitaWordmark.png"));
+    brand->Children->Append(word);
+    auto badge = ref new Border();
+    badge->CornerRadius = Windows::UI::Xaml::CornerRadius(8);
+    badge->Padding = Thickness(6, 1, 6, 2);
+    badge->Margin = Thickness(9, 2, 0, 0);
+    badge->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
+    badge->BorderBrush = BrandBrush(0.9);
+    badge->BorderThickness = Thickness(1);
+    auto badgeText = Text(L"BETA", 9, true);
+    badgeText->CharacterSpacing = 140;
+    badge->Child = badgeText;
+    brand->Children->Append(badge);
+    Grid::SetColumn(brand, 0);
+    header->Children->Append(brand);
+
+    // the dock
+    auto dock = ref new Border();
+    dock->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Center;
+    dock->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
+    dock->Padding = Thickness(6, 5, 6, 5);
+    dock->CornerRadius = Windows::UI::Xaml::CornerRadius(28);
+    {
+        const Color card = Card();
+        dock->Background = Solid(Alpha(232, card.R, card.G, card.B));
+    }
+    dock->BorderBrush = BrandBrush(0.55);
+    dock->BorderThickness = Thickness(1);
+    auto tabs = ref new StackPanel();
+    tabs->Orientation = Orientation::Horizontal;
+    auto bumper = [this](const wchar_t* label) {
+        auto hint = ref new Border();
+        hint->CornerRadius = Windows::UI::Xaml::CornerRadius(7);
+        hint->Padding = Thickness(7, 2, 7, 3);
+        hint->Margin = Thickness(6, 0, 6, 0);
+        hint->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
+        hint->Background = Solid(Alpha(26, 255, 255, 255));
+        hint->IsHitTestVisible = false;
+        hint->Child = Text(ref new Platform::String(label), 9, true, true);
+        return hint;
+    };
+    tabs->Children->Append(bumper(L"LB"));
+    const wchar_t* glyphs[] = { L"\xE80F", L"\xE8F1", L"\xE945", L"\xE713", L"\xE90F" };
+    const wchar_t* labels[] = { L"Home", L"Library", L"Mods", L"Settings", L"Tools" };
+    const int tabPage[] = { 0, 1, 5, 2, 3 };
+    // Tools holds developer diagnostics. Release builds (VITA3K_RELEASE_BUILD)
+    // leave it out; development builds keep it. See docs/RELEASING.md.
+#if defined(VITA3K_RELEASE_BUILD)
+    constexpr int visibleTabs = 4;
+#else
+    constexpr int visibleTabs = 5;
+#endif
+    const Color dim = RgbColor(176, 178, 194);
+    for (int tab = 0; tab < visibleTabs; ++tab) {
+        const int i = tabPage[tab];
+        const bool selected = page_ == i || (i == 1 && page_ == 4);
+        auto nav = ref new Windows::UI::Xaml::Controls::Button();
+        nav->Margin = Thickness(2, 0, 2, 0);
+        nav->Height = 44;
+        nav->Padding = Thickness(15, 0, 15, 0);
+        nav->BorderThickness = Thickness(0);
+        nav->Background = selected ? static_cast<Brush^>(BrandBrush(0.92)) : Solid(Colors::Transparent);
+        Skin(nav, 22, selected);
+        Windows::UI::Xaml::Automation::AutomationProperties::SetName(nav, ref new Platform::String(labels[tab]));
+        auto inside = ref new StackPanel();
+        inside->Orientation = Orientation::Horizontal;
+        auto symbol = Text(ref new Platform::String(glyphs[tab]), 16, false);
+        symbol->FontFamily = ref new Windows::UI::Xaml::Media::FontFamily(L"Segoe MDL2 Assets");
+        symbol->Foreground = Solid(selected ? Colors::White : dim);
+        symbol->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
+        inside->Children->Append(symbol);
+        // The tab you are on, and the one the controller is on, spell their name.
+        auto name = Text(ref new Platform::String(labels[tab]), 14, true);
+        name->Foreground = Solid(Colors::White);
+        name->Margin = Thickness(9, 0, 0, 0);
+        name->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
+        name->Visibility = selected ? Windows::UI::Xaml::Visibility::Visible : Windows::UI::Xaml::Visibility::Collapsed;
+        inside->Children->Append(name);
+        nav->Content = inside;
+        nav->GotFocus += ref new RoutedEventHandler([this,name](Platform::Object^, RoutedEventArgs^) {
+            PlayCue(0);
+            name->Visibility = Windows::UI::Xaml::Visibility::Visible;
+        });
+        nav->LostFocus += ref new RoutedEventHandler([name,selected](Platform::Object^, RoutedEventArgs^) {
+            if (!selected) name->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
+        });
+        nav->Click += ref new RoutedEventHandler([this,i](Platform::Object^, RoutedEventArgs^) {
+            PlayCue(1);
+            const int shown = page_ == 4 ? 1 : page_;
+            if (shown == i) {
+                // A on the tab you are on goes into the page
+                FocusContent();
+                return;
+            }
+            // switching pages: the controller stays on the dock, so the next
+            // press (Down) goes into the new page
+            pendingMenuFocus_ = i;
+            ShowPage(i);
+        });
+        menuItems_.push_back({ i, nav });
+        tabs->Children->Append(nav);
+    }
+    tabs->Children->Append(bumper(L"RB"));
+    dock->Child = tabs;
+    Grid::SetColumn(dock, 1);
+    header->Children->Append(dock);
+
+    // the time
     auto time = ref new StackPanel();
     time->Orientation = Orientation::Horizontal;
-    time->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Top;
+    time->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
     time->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Right;
-    time->Margin = Thickness(0, 14, 40, 0);
     time->IsHitTestVisible = false;
     topDate_ = Text(L"", 10, true, true);
     topDate_->CharacterSpacing = 140;
@@ -867,162 +941,73 @@ void CatalogShell::BuildNavigation() {
     topClock_->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
     topClock_->TextWrapping = TextWrapping::NoWrap;
     time->Children->Append(topClock_);
-    layer->Children->Append(time);
+    Grid::SetColumn(time, 2);
+    header->Children->Append(time);
+    layer->Children->Append(header);
 
-    // The menu.
-    auto menu = ref new Border();
-    menu->Width = kMenuWidth;
-    menu->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Left;
-    menu->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Stretch;
-    menu->Padding = Thickness(14, 16, 14, 12);
-    {
-        const Color card = Card();
-        menu->Background = Solid(Alpha(205, card.R, card.G, card.B));
-    }
-    menu->BorderBrush = BrandBrush(0.35);
-    menu->BorderThickness = Thickness(0, 0, 1, 0);
-    auto frame = ref new Grid();
-    for (int r = 0; r < 3; ++r) {
-        auto row = ref new RowDefinition();
-        row->Height = r == 1 ? GridLength(1, GridUnitType::Star) : GridLength(1, GridUnitType::Auto);
-        frame->RowDefinitions->Append(row);
-    }
-
-    auto brand = ref new StackPanel();
-    brand->Orientation = Orientation::Horizontal;
-    brand->Margin = Thickness(6, 0, 0, 18);
-    brand->IsHitTestVisible = false;
-    auto mark = ref new Image();
-    mark->Width = 30;
-    mark->Height = 30;
-    mark->Stretch = Stretch::Uniform;
-    mark->Source = ref new BitmapImage(ref new Uri(L"ms-appx:///Assets/ReVitaMark.png"));
-    brand->Children->Append(mark);
-    auto word = ref new Image();
-    word->Height = 18;
-    word->MaxWidth = 86;
-    word->Stretch = Stretch::Uniform;
-    word->Margin = Thickness(8, 1, 0, 0);
-    word->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
-    word->Source = ref new BitmapImage(ref new Uri(L"ms-appx:///Assets/ReVitaWordmark.png"));
-    brand->Children->Append(word);
-    auto badge = ref new Border();
-    badge->CornerRadius = Windows::UI::Xaml::CornerRadius(7);
-    badge->Padding = Thickness(5, 0, 5, 1);
-    badge->Margin = Thickness(7, 2, 0, 0);
-    badge->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
-    badge->BorderBrush = BrandBrush(0.9);
-    badge->BorderThickness = Thickness(1);
-    auto badgeText = Text(L"BETA", 8, true);
-    badgeText->CharacterSpacing = 120;
-    badge->Child = badgeText;
-    brand->Children->Append(badge);
-    Grid::SetRow(brand, 0);
-    frame->Children->Append(brand);
-
-    auto list = ref new StackPanel();
-    const Color dim = RgbColor(176, 178, 194);
-    auto makeItem = [&](int key, const wchar_t* glyph, const wchar_t* label, bool sub, bool selected) {
-        auto item = ref new Windows::UI::Xaml::Controls::Button();
-        item->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Stretch;
-        item->HorizontalContentAlignment = Windows::UI::Xaml::HorizontalAlignment::Left;
-        item->Height = sub ? 36 : 44;
-        item->Margin = Thickness(sub ? 16 : 0, sub ? 1 : 3, 0, sub ? 1 : 3);
-        item->Padding = Thickness(sub ? 12 : 14, 0, 10, 0);
-        item->BorderThickness = Thickness(0);
-        Skin(item, sub ? 18 : 22, selected);
-        item->Background = selected ? static_cast<Brush^>(BrandBrush(sub ? 0.7 : 0.92)) : Solid(Colors::Transparent);
-        Windows::UI::Xaml::Automation::AutomationProperties::SetName(item, ref new Platform::String(label));
-        auto inside = ref new StackPanel();
-        inside->Orientation = Orientation::Horizontal;
-        auto symbol = Text(ref new Platform::String(glyph), sub ? 13 : 16, false);
-        symbol->FontFamily = ref new Windows::UI::Xaml::Media::FontFamily(L"Segoe MDL2 Assets");
-        symbol->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
-        symbol->Margin = Thickness(0, 1, 12, 0);
-        symbol->Foreground = Solid(selected ? Colors::White : dim);
-        inside->Children->Append(symbol);
-        auto name = Text(ref new Platform::String(label), sub ? 13 : 15, !sub || selected);
-        name->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
-        name->Foreground = Solid(selected ? Colors::White : dim);
-        inside->Children->Append(name);
-        item->Content = inside;
-        menuItems_.push_back({ key, item });
-        list->Children->Append(item);
-        return item;
-    };
-
-    const wchar_t* glyphs[] = { L"\xE80F", L"\xE8F1", L"\xE945", L"\xE713", L"\xE90F" };
-    const wchar_t* labels[] = { L"Home", L"Library", L"Mods", L"Settings", L"Tools" };
-    const int tabPage[] = { 0, 1, 5, 2, 3 };
-    // Tools holds developer diagnostics. Release builds (VITA3K_RELEASE_BUILD)
-    // leave it out; development builds keep it. See docs/RELEASING.md.
-#if defined(VITA3K_RELEASE_BUILD)
-    constexpr int visibleTabs = 4;
-#else
-    constexpr int visibleTabs = 5;
-#endif
-    for (int tab = 0; tab < visibleTabs; ++tab) {
-        const int i = tabPage[tab];
-        const bool selected = page_ == i || (i == 1 && page_ == 4);
-        auto nav = makeItem(i, glyphs[tab], labels[tab], false, selected);
-        nav->GotFocus += ref new RoutedEventHandler([this](Platform::Object^, RoutedEventArgs^) {
-            PlayCue(0);
-        });
-        nav->Click += ref new RoutedEventHandler([this,i](Platform::Object^, RoutedEventArgs^) {
-            PlayCue(1);
-            if (page_ == i) {
-                // A on the page you are on goes into it
-                FocusContent();
-                return;
-            }
-            pendingMenuFocus_ = i;
-            ShowPage(i);
-        });
-
-        // Settings: its categories sit right under it. Moving onto one shows
-        // it at once; A or Right goes into its options.
-        if (i == 2 && page_ == 2) {
-            const wchar_t* groups[] = { L"System", L"Emulation", L"Look", L"Sound", L"Artwork", L"Help" };
-            const wchar_t* groupGlyphs[] = { L"\xE7F8", L"\xE7FC", L"\xE790", L"\xE767", L"\xEB9F", L"\xE897" };
-            for (int g = 0; g < 6; ++g) {
-                auto item = makeItem(100 + g, groupGlyphs[g], groups[g], true, g == settingsTab_);
-                item->GotFocus += ref new RoutedEventHandler([this,g](Platform::Object^, RoutedEventArgs^) {
-                    PlayCue(0);
-                    if (settingsTab_ == g) return;
-                    settingsTab_ = g;
-                    PutPref(L"settings.tab", StringOf(std::to_wstring(g)));
-                    StyleSettingsRail();
-                    Render();   // only the page on the right is drawn again
-                });
-                item->Click += ref new RoutedEventHandler([this](Platform::Object^, RoutedEventArgs^) {
-                    PlayCue(1);
-                    FocusContent();
-                });
-                settingsRail_.push_back(item);
-            }
+    // Settings: its categories in a second row under the dock. Moving onto one
+    // shows it at once; A or Down goes into its options.
+    if (page_ == 2) {
+        auto sub = ref new Border();
+        sub->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Center;
+        sub->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Top;
+        sub->Margin = Thickness(0, 72, 0, 0);
+        sub->Padding = Thickness(6, 4, 6, 4);
+        sub->CornerRadius = Windows::UI::Xaml::CornerRadius(24);
+        {
+            const Color card = Card();
+            sub->Background = Solid(Alpha(225, card.R, card.G, card.B));
         }
+        sub->BorderBrush = BrandBrush(0.4);
+        sub->BorderThickness = Thickness(1);
+        auto row = ref new StackPanel();
+        row->Orientation = Orientation::Horizontal;
+        const wchar_t* groups[] = { L"System", L"Emulation", L"Look", L"Sound", L"Artwork", L"Help" };
+        const wchar_t* groupGlyphs[] = { L"\xE7F8", L"\xE7FC", L"\xE790", L"\xE767", L"\xEB9F", L"\xE897" };
+        for (int g = 0; g < 6; ++g) {
+            auto item = ref new Windows::UI::Xaml::Controls::Button();
+            item->Height = 38;
+            item->Margin = Thickness(2, 0, 2, 0);
+            item->Padding = Thickness(14, 0, 14, 0);
+            item->BorderThickness = Thickness(0);
+            Skin(item, 19);
+            Windows::UI::Xaml::Automation::AutomationProperties::SetName(item, ref new Platform::String(groups[g]));
+            auto inside = ref new StackPanel();
+            inside->Orientation = Orientation::Horizontal;
+            auto symbol = Text(ref new Platform::String(groupGlyphs[g]), 14, false);
+            symbol->FontFamily = ref new Windows::UI::Xaml::Media::FontFamily(L"Segoe MDL2 Assets");
+            symbol->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
+            symbol->Margin = Thickness(0, 1, 9, 0);
+            inside->Children->Append(symbol);
+            auto label = Text(ref new Platform::String(groups[g]), 13, true);
+            label->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
+            inside->Children->Append(label);
+            item->Content = inside;
+            item->GotFocus += ref new RoutedEventHandler([this,g](Platform::Object^, RoutedEventArgs^) {
+                PlayCue(0);
+                if (settingsTab_ == g) return;
+                settingsTab_ = g;
+                PutPref(L"settings.tab", StringOf(std::to_wstring(g)));
+                StyleSettingsRail();
+                Render();   // only the page under the pills is drawn again
+            });
+            item->Click += ref new RoutedEventHandler([this](Platform::Object^, RoutedEventArgs^) {
+                PlayCue(1);
+                FocusContent();
+            });
+            menuItems_.push_back({ 100 + g, item });
+            settingsRail_.push_back(item);
+            row->Children->Append(item);
+        }
+        sub->Child = row;
+        layer->Children->Append(sub);
     }
-    auto listScroll = ref new ScrollViewer();
-    listScroll->IsTabStop = false;
-    listScroll->VerticalScrollBarVisibility = ScrollBarVisibility::Hidden;
-    listScroll->HorizontalScrollBarVisibility = ScrollBarVisibility::Disabled;
-    listScroll->Padding = Thickness(0, 2, 6, 2);   // room for the focus lift
-    listScroll->Content = list;
-    Grid::SetRow(listScroll, 1);
-    frame->Children->Append(listScroll);
-
-    auto hint = Text(L"LB / RB  pages     B  menu", 10, true, true);
-    hint->CharacterSpacing = 60;
-    hint->Margin = Thickness(8, 10, 0, 0);
-    hint->TextWrapping = TextWrapping::NoWrap;
-    Grid::SetRow(hint, 2);
-    frame->Children->Append(hint);
-
-    menu->Child = frame;
-    layer->Children->Append(menu);
     StyleSettingsRail();
 
     navigation_->Child = layer;
+    // the page begins under the bar
+    if (contentScroll_ != nullptr)
+        contentScroll_->Margin = Thickness(0, page_ == 2 ? 124 : 70, 0, 0);
     UpdateClock();
     if (keepKey >= 0) FocusMenu(keepKey);
 }
@@ -1077,117 +1062,41 @@ void CatalogShell::FocusMenu(int key) {
 }
 bool CatalogShell::FocusContent() {
     if (content_ == nullptr) return false;
-    std::vector<Control^> stops;
-    CollectFocusable(content_, stops);
     // Home starts on the poster in the middle
     if (page_ == 0 && flowFocus_ >= 0 && static_cast<size_t>(flowFocus_) < flowCards_.size()
         && flowCards_[flowFocus_]->Focus(Windows::UI::Xaml::FocusState::Keyboard))
         return true;
+    std::vector<Control^> stops;
+    CollectFocusable(content_, stops);
     for (auto stop : stops)
-        if (stop->Focus(Windows::UI::Xaml::FocusState::Keyboard)) return true;
+        if (stop->Focus(Windows::UI::Xaml::FocusState::Keyboard)) {
+            EnsureVisible(stop);
+            return true;
+        }
     return false;
 }
-bool CatalogShell::NavigateDirection(Windows::System::VirtualKey key) {
-    using Windows::System::VirtualKey;
-    using namespace Windows::UI::Xaml::Input;
-    FocusNavigationDirection direction;
-    switch (key) {
-    case VirtualKey::Up: case VirtualKey::GamepadDPadUp: case VirtualKey::GamepadLeftThumbstickUp:
-        direction = FocusNavigationDirection::Up; break;
-    case VirtualKey::Down: case VirtualKey::GamepadDPadDown: case VirtualKey::GamepadLeftThumbstickDown:
-        direction = FocusNavigationDirection::Down; break;
-    case VirtualKey::Left: case VirtualKey::GamepadDPadLeft: case VirtualKey::GamepadLeftThumbstickLeft:
-        direction = FocusNavigationDirection::Left; break;
-    case VirtualKey::Right: case VirtualKey::GamepadDPadRight: case VirtualKey::GamepadLeftThumbstickRight:
-        direction = FocusNavigationDirection::Right; break;
-    default: return false;
-    }
-    if (inGame_ && !quickMenuOpen_) return false;
-    if (!inGame_ && artPicker_ == nullptr && page_ == 0 && xmb_ != nullptr &&
-        xmb_->Visibility == Windows::UI::Xaml::Visibility::Visible) return false;
-    auto focused = dynamic_cast<DependencyObject^>(FocusManager::GetFocusedElement());
-    if (focused != nullptr && !InWindow(focused)) return false; // native popup/dialog
-    const bool horizontal = direction == FocusNavigationDirection::Left || direction == FocusNavigationDirection::Right;
-    auto reader = dynamic_cast<ScrollViewer^>(focused);
-    if (reader != nullptr && !horizontal) {
-        const double step = direction == FocusNavigationDirection::Down ? 180.0 : -180.0;
-        const double offset = std::max(0.0, std::min(reader->ScrollableHeight, reader->VerticalOffset + step));
-        if (std::abs(offset - reader->VerticalOffset) > 0.5) {
-            reader->ChangeView(nullptr, ref new Platform::Box<double>(offset), nullptr, true);
-            return true;
-        }
-        // At the end of a read-only pane, continue to the next page control.
-    }
-    // These controls use directions to edit values, select text or operate a
-    // dropdown. Do not turn their editing keys into shell navigation.
-    if (dynamic_cast<TextBox^>(focused) != nullptr || dynamic_cast<PasswordBox^>(focused) != nullptr ||
-        dynamic_cast<ComboBox^>(focused) != nullptr ||
-        (horizontal && dynamic_cast<Slider^>(focused) != nullptr)) return false;
-    auto focus = [this](Control^ target) {
-        if (target == nullptr || !target->Focus(Windows::UI::Xaml::FocusState::Keyboard)) return false;
-        if (dynamic_cast<Windows::UI::Xaml::Controls::Button^>(target) == nullptr ||
-            std::find(flowCards_.begin(), flowCards_.end(), dynamic_cast<Windows::UI::Xaml::Controls::Button^>(target)) == flowCards_.end())
-            target->StartBringIntoView();
-        return true;
-    };
-    const bool overlay = artPicker_ != nullptr || quickMenuOpen_;
-    const int menu = overlay ? -1 : MenuKeyOf(focused);
-    if (menu >= 0) {
-        if (direction == FocusNavigationDirection::Right) { FocusContent(); return true; }
-        if (horizontal) return true;
-        for (size_t i = 0; i < menuItems_.size(); ++i) {
-            if (menuItems_[i].first != menu) continue;
-            const int step = direction == FocusNavigationDirection::Down ? 1 : -1;
-            const int next = static_cast<int>(i) + step;
-            if (next >= 0 && next < static_cast<int>(menuItems_.size()))
-                focus(menuItems_[next].second);
-            return true;
-        }
-    }
-    DependencyObject^ scope = artPicker_ != nullptr ? static_cast<DependencyObject^>(artPicker_) :
-        quickMenuOpen_ ? static_cast<DependencyObject^>(quickMenu_) : static_cast<DependencyObject^>(content_);
-    if (scope == nullptr) return false;
-    std::vector<Control^> stops;
-    CollectFocusable(scope, stops);
-    if (stops.empty()) return false;
-    int index = -1;
-    for (size_t i = 0; i < stops.size(); ++i)
-        if (stops[i] == focused) { index = static_cast<int>(i); break; }
-    if (index < 0) { focus(stops.front()); return true; }
-    // Cover-flow transforms must not change the left/right order of posters.
-    if (!overlay && page_ == 0 && horizontal) {
-        for (size_t i = 0; i < flowCards_.size(); ++i) {
-            if (flowCards_[i] != focused) continue;
-            const int next = static_cast<int>(i) + (direction == FocusNavigationDirection::Right ? 1 : -1);
-            if (next >= 0 && next < static_cast<int>(flowCards_.size())) focus(flowCards_[next]);
-            else if (next < 0) FocusMenu(CurrentMenuKey());
-            return true;
-        }
-    }
-    auto options = ref new FindNextElementOptions();
-    options->SearchRoot = scope;
-    auto next = dynamic_cast<Control^>(FocusManager::FindNextElement(direction, options));
-    // Only actual controls from the active scope are candidates. ScrollViewer
-    // template buttons and controls behind overlays are never destinations.
-    if (next != nullptr && std::find(stops.begin(), stops.end(), next) != stops.end() && focus(next)) return true;
-    if (!horizontal) {
-        // Reach controls whose layout has no geometric neighbour (wrapped
-        // settings rows, narrow screens and offscreen sections).
-        const int nextIndex = index + (direction == FocusNavigationDirection::Down ? 1 : -1);
-        if (nextIndex >= 0 && nextIndex < static_cast<int>(stops.size())) focus(stops[nextIndex]);
-        else if (!overlay && contentScroll_ != nullptr) {
-            const double step = direction == FocusNavigationDirection::Down ? 180.0 : -180.0;
-            const double offset = std::max(0.0, std::min(contentScroll_->ScrollableHeight, contentScroll_->VerticalOffset + step));
-            contentScroll_->ChangeView(nullptr, ref new Platform::Box<double>(offset), nullptr, false);
-        }
-    } else if (!overlay && direction == FocusNavigationDirection::Left) {
+void CatalogShell::FocusContentSoon(int attempts) {
+    // A page that was just drawn is not laid out yet, and a control that is
+    // not laid out cannot take focus. Try again shortly instead of giving up,
+    // so the controller is never left with nothing to move from.
+    auto focused = dynamic_cast<DependencyObject^>(Windows::UI::Xaml::Input::FocusManager::GetFocusedElement());
+    if (focused != nullptr && InWindow(focused)) return;
+    if (FocusContent()) return;
+    if (attempts <= 0) {
+        libretro_.LogLine("nav: no control on this page could take the focus; using the dock");
         FocusMenu(CurrentMenuKey());
+        return;
     }
-    return true; // never let the default search escape the active scope
+    auto timer = ref new DispatcherTimer();
+    timer->Interval = Millis(60);
+    timer->Tick += ref new EventHandler<Platform::Object^>([this,timer,attempts](Platform::Object^, Platform::Object^) {
+        timer->Stop();
+        FocusContentSoon(attempts - 1);
+    });
+    timer->Start();
 }
 bool CatalogShell::InWindow(DependencyObject^ element) const {
-    // Attached to the window (the page, or a popup over it) or left behind
-    // by a page that was drawn again?
+    // Attached to the window, or left behind by a page that was drawn again?
     if (element == nullptr || root_ == nullptr) return false;
     auto top = [](DependencyObject^ node) {
         for (;;) {
@@ -1198,8 +1107,249 @@ bool CatalogShell::InWindow(DependencyObject^ element) const {
     };
     return Platform::Object::ReferenceEquals(top(element), top(root_));
 }
+void CatalogShell::CollectNavStops(DependencyObject^ node, std::vector<Control^>& out) {
+    const int count = Windows::UI::Xaml::Media::VisualTreeHelper::GetChildrenCount(node);
+    for (int i = 0; i < count; ++i) {
+        auto child = Windows::UI::Xaml::Media::VisualTreeHelper::GetChild(node, i);
+        auto element = dynamic_cast<UIElement^>(child);
+        if (element != nullptr && (element->Visibility != Windows::UI::Xaml::Visibility::Visible || !element->IsHitTestVisible)) continue;
+        auto control = dynamic_cast<Control^>(child);
+        if (control != nullptr && control->IsTabStop) {
+            if (control->IsEnabled && control->ActualWidth > 1 && control->ActualHeight > 1)
+                out.push_back(control);
+            continue;   // a control's own insides are not separate stops
+        }
+        CollectNavStops(child, out);
+    }
+}
+namespace {
+bool BoundsIn(UIElement^ element, UIElement^ relativeTo, Windows::Foundation::Rect& out) {
+    try {
+        auto sized = dynamic_cast<FrameworkElement^>(element);
+        if (sized == nullptr) return false;
+        out = element->TransformToVisual(relativeTo)->TransformBounds(Windows::Foundation::Rect(
+            0.0f, 0.0f, static_cast<float>(sized->ActualWidth), static_cast<float>(sized->ActualHeight)));
+        return true;
+    } catch (Platform::Exception^) {
+        return false;
+    }
+}
+std::string NameOf(Control^ control) {
+    if (control == nullptr) return "none";
+    auto name = Windows::UI::Xaml::Automation::AutomationProperties::GetName(control);
+    if (name != nullptr && !name->IsEmpty()) return NarrowUtf8(name->Data());
+    auto type = control->GetType();
+    return type != nullptr ? NarrowUtf8(type->FullName->Data()) : std::string("?");
+}
+}
+void CatalogShell::EnsureVisible(Control^ control) {
+    // Scrolls the page just enough that the focused control, and a little
+    // above it (its heading), is on screen.
+    if (control == nullptr || contentScroll_ == nullptr || MenuKeyOf(control) >= 0) return;
+    Windows::Foundation::Rect box;
+    if (!BoundsIn(control, contentScroll_, box)) return;
+    const double view = contentScroll_->ViewportHeight;
+    const double offset = contentScroll_->VerticalOffset;
+    double want = offset;
+    if (box.Y < 96.0)
+        want = offset + box.Y - 96.0;
+    else if (box.Y + box.Height > view - 48.0)
+        want = offset + (box.Y + box.Height) - (view - 48.0);
+    // near the top of the page: show its heading too
+    if (offset + box.Y < 240.0) want = 0.0;
+    want = std::max(0.0, std::min(contentScroll_->ScrollableHeight, want));
+    if (std::abs(want - offset) > 1.0)
+        contentScroll_->ChangeView(nullptr, ref new Platform::Box<double>(want), nullptr, false);
+}
+bool CatalogShell::Navigate(int dir) {
+    // dir: 0 up, 1 down, 2 left, 3 right.
+    // The nearest control in that direction wins; controls that line up with
+    // the one you are on count for more than ones off to the side.
+    static const char* const names[] = { "up", "down", "left", "right" };
+    auto current = dynamic_cast<Control^>(Windows::UI::Xaml::Input::FocusManager::GetFocusedElement());
+    if (current == nullptr || !InWindow(current)) {
+        libretro_.LogLine(std::string("nav: ") + names[dir] + " with nothing focused; entering the page");
+        FocusContentSoon(8);
+        return true;
+    }
+    const bool inMenu = MenuKeyOf(current) >= 0;
+    Windows::Foundation::Rect from;
+    if (!BoundsIn(current, root_, from)) {
+        libretro_.LogLine("nav: could not measure " + NameOf(current));
+        return true;
+    }
+    Control^ pick = nullptr;
+    // a page may name where a direction goes (Home: Down from Play is the poster in the middle)
+    {
+        DependencyObject^ hint = dir == 0 ? current->XYFocusUp : dir == 1 ? current->XYFocusDown
+            : dir == 2 ? current->XYFocusLeft : current->XYFocusRight;
+        auto named = dynamic_cast<Control^>(hint);
+        if (named != nullptr && named->IsTabStop && named->IsEnabled &&
+            named->Visibility == Windows::UI::Xaml::Visibility::Visible && InWindow(named))
+            pick = named;
+    }
+    int considered = 0;
+    if (pick == nullptr) {
+        std::vector<Control^> stops;
+        CollectNavStops(root_, stops);
+        const float fx = from.X + from.Width / 2.0f;
+        const float fy = from.Y + from.Height / 2.0f;
+        float best = 1e9f;
+        for (auto candidate : stops) {
+            if (candidate == current) continue;
+            if ((MenuKeyOf(candidate) >= 0) != inMenu) continue;   // the dock and the page are separate
+            Windows::Foundation::Rect r;
+            if (!BoundsIn(candidate, root_, r)) continue;
+            ++considered;
+            const float cx = r.X + r.Width / 2.0f;
+            const float cy = r.Y + r.Height / 2.0f;
+            float primary, secondary, overlap;
+            if (dir <= 1) {
+                primary = dir == 0 ? fy - cy : cy - fy;
+                secondary = cx - fx;
+                overlap = std::min(from.X + from.Width, r.X + r.Width) - std::max(from.X, r.X);
+            } else {
+                primary = dir == 2 ? fx - cx : cx - fx;
+                secondary = cy - fy;
+                overlap = std::min(from.Y + from.Height, r.Y + r.Height) - std::max(from.Y, r.Y);
+            }
+            if (primary < 6.0f) continue;   // not in that direction
+            const bool aligned = overlap > 0.0f;
+            const float score = primary + std::abs(secondary) * (aligned ? 1.0f : 3.0f) + (aligned ? 0.0f : 240.0f);
+            if (score < best) {
+                best = score;
+                pick = candidate;
+            }
+        }
+    }
+    if (pick != nullptr) {
+        const bool moved = pick->Focus(Windows::UI::Xaml::FocusState::Keyboard);
+        if (moved) EnsureVisible(pick);
+        libretro_.LogLine(std::string("nav: ") + names[dir] + " " + NameOf(current) + " -> " + NameOf(pick) +
+            (moved ? "" : " (could not focus)"));
+        return true;
+    }
+
+    // Nothing further that way.
+    const int menuKey = MenuKeyOf(current);
+    if (inMenu) {
+        if (dir == 1) {
+            const int shown = page_ == 4 ? 1 : page_;
+            if (menuKey < 100 && menuKey != shown) {
+                // Down from a tab you are not on: open it and go in
+                libretro_.LogLine("nav: down from the " + NameOf(current) + " tab opens it");
+                pendingContentFocus_ = true;
+                ShowPage(menuKey);
+                return true;
+            }
+            libretro_.LogLine("nav: down from " + NameOf(current) + " enters the page");
+            FocusContentSoon(8);
+        }
+        return true;   // the dock's ends hold the controller; it never falls off
+    }
+    if (contentScroll_ != nullptr) {
+        const double offset = contentScroll_->VerticalOffset;
+        if (dir == 0) {
+            if (offset > 1.0) {
+                // read what is above the first control before leaving the page
+                contentScroll_->ChangeView(nullptr, ref new Platform::Box<double>(std::max(0.0, offset - 260.0)), nullptr, false);
+                return true;
+            }
+            libretro_.LogLine("nav: up from " + NameOf(current) + " goes to the dock");
+            FocusMenu(CurrentMenuKey());
+            return true;
+        }
+        if (dir == 1 && offset < contentScroll_->ScrollableHeight - 1.0) {
+            contentScroll_->ChangeView(nullptr, ref new Platform::Box<double>(
+                std::min(contentScroll_->ScrollableHeight, offset + 260.0)), nullptr, false);
+            return true;
+        }
+    }
+    libretro_.LogLine(std::string("nav: ") + names[dir] + " from " + NameOf(current) + " has nowhere to go (" +
+        std::to_string(considered) + " controls considered)");
+    return true;
+}
+bool CatalogShell::HandleNavKey(Windows::System::VirtualKey code) {
+    using Windows::System::VirtualKey;
+    auto focused = Windows::UI::Xaml::Input::FocusManager::GetFocusedElement();
+    const bool typing = dynamic_cast<TextBox^>(focused) != nullptr || dynamic_cast<PasswordBox^>(focused) != nullptr;
+    const bool adjusting = dynamic_cast<Slider^>(focused) != nullptr;
+    // a read-only pane (the log) takes Up and Down to scroll itself, then lets go
+    auto pane = dynamic_cast<ScrollViewer^>(focused);
+    int dir = -1;
+    bool arrowKey = false;
+    switch (code) {
+    case VirtualKey::GamepadDPadUp: case VirtualKey::GamepadLeftThumbstickUp: dir = 0; break;
+    case VirtualKey::GamepadDPadDown: case VirtualKey::GamepadLeftThumbstickDown: dir = 1; break;
+    case VirtualKey::GamepadDPadLeft: case VirtualKey::GamepadLeftThumbstickLeft: dir = 2; break;
+    case VirtualKey::GamepadDPadRight: case VirtualKey::GamepadLeftThumbstickRight: dir = 3; break;
+    case VirtualKey::Up: dir = 0; arrowKey = true; break;
+    case VirtualKey::Down: dir = 1; arrowKey = true; break;
+    case VirtualKey::Left: dir = 2; arrowKey = true; break;
+    case VirtualKey::Right: dir = 3; arrowKey = true; break;
+    default: break;
+    }
+    if (dir >= 0) {
+        // a slider takes Left and Right to change its value; a text box takes
+        // the keyboard's arrows to move the cursor
+        if (dir >= 2 && (adjusting || (typing && arrowKey))) return false;
+        if (pane != nullptr && dir <= 1) {
+            const double step = dir == 1 ? 180.0 : -180.0;
+            const double to = std::max(0.0, std::min(pane->ScrollableHeight, pane->VerticalOffset + step));
+            if (std::abs(to - pane->VerticalOffset) > 0.5) {
+                pane->ChangeView(nullptr, ref new Platform::Box<double>(to), nullptr, true);
+                return true;
+            }
+        }
+        return Navigate(dir);
+    }
+    switch (code) {
+    case VirtualKey::GamepadA: {
+        // with nothing focused, A picks up the page instead of doing nothing
+        auto control = dynamic_cast<Control^>(focused);
+        if (control == nullptr || !InWindow(control)) {
+            libretro_.LogLine("nav: A with nothing focused; entering the page");
+            FocusContentSoon(8);
+            return true;
+        }
+        return false;
+    }
+    case VirtualKey::GamepadB:
+    case VirtualKey::Escape: {
+        PlayCue(2);
+        if (MenuKeyOf(focused) < 0) {
+            // in the page: a game's page goes back to the Library, everything
+            // else goes up to the dock
+            if (page_ == 4) { ShowPage(1); return true; }
+            libretro_.LogLine("nav: B goes to the dock");
+            FocusMenu(CurrentMenuKey());
+            return true;
+        }
+        // on the dock: back Home
+        if (page_ != 0) {
+            pendingMenuFocus_ = 0;
+            ShowPage(0);
+        }
+        return true;
+    }
+    case VirtualKey::GamepadLeftTrigger:
+    case VirtualKey::GamepadRightTrigger:
+    case VirtualKey::PageUp:
+    case VirtualKey::PageDown: {
+        // a page at a time
+        if (contentScroll_ == nullptr) return false;
+        const bool up = code == VirtualKey::GamepadLeftTrigger || code == VirtualKey::PageUp;
+        const double step = contentScroll_->ViewportHeight * 0.85 * (up ? -1.0 : 1.0);
+        const double to = std::max(0.0, std::min(contentScroll_->ScrollableHeight, contentScroll_->VerticalOffset + step));
+        contentScroll_->ChangeView(nullptr, ref new Platform::Box<double>(to), nullptr, false);
+        return true;
+    }
+    default:
+        return false;
+    }
+}
 void CatalogShell::SwitchTab(int delta) {
-    // the menu's order: Home, Library, Mods, Settings, Tools
+    // the dock's order: Home, Library, Mods, Settings, Tools
     static const int order[] = { 0, 1, 5, 2, 3 };
 #if defined(VITA3K_RELEASE_BUILD)
     constexpr int tabCount = 4;
@@ -1213,7 +1363,8 @@ void CatalogShell::SwitchTab(int delta) {
     const int next = (current + delta + tabCount) % tabCount;
     if (next == current) return;
     PlayCue(4);
-    // in the menu, the controller follows to the new page's entry
+    // on the dock, the controller follows to the new page's tab; in a page,
+    // it lands in the new page
     if (MenuKeyOf(Windows::UI::Xaml::Input::FocusManager::GetFocusedElement()) >= 0)
         pendingMenuFocus_ = order[next];
     ShowPage(order[next]);
@@ -1747,7 +1898,7 @@ void CatalogShell::MakeFlow(const std::vector<size_t>& items, size_t focus) {
     flowScroll_ = ref new ScrollViewer();
     flowScroll_->IsTabStop = false;
     flowScroll_->Height = kFlowCardHeight * 1.22;
-    flowScroll_->Margin = Thickness(-36, 2, -40, 0);   // edge to edge
+    flowScroll_->Margin = Thickness(-56, 2, -56, 0);   // edge to edge
     flowScroll_->HorizontalScrollBarVisibility = ScrollBarVisibility::Hidden;
     flowScroll_->HorizontalScrollMode = ScrollMode::Enabled;
     flowScroll_->VerticalScrollBarVisibility = ScrollBarVisibility::Disabled;
@@ -2865,7 +3016,7 @@ void CatalogShell::Render() {
     const unsigned revision = ++navigationRevision_;
     // Settings keeps its category list on the left; its page sits beside it
     if (content_ != nullptr)
-        content_->Margin = Thickness(36, 6, 40, 28);
+        content_->Margin = Thickness(56, 10, 56, 28);
     // Drawing the same page again (a toggle, a theme, a sort) keeps the
     // controller on the control it was on instead of throwing it to the top.
     int keepFocus = -1;
@@ -2921,7 +3072,7 @@ void CatalogShell::Render() {
     }
     // The controller always has somewhere to be: if the page that was just
     // drawn took the focused control with it, the new page's first control
-    // (or its entry in the menu) takes over.
+    // takes over (tried again for a moment while the page is laid out).
     Dispatcher->RunAsync(Windows::UI::Core::CoreDispatcherPriority::Low,
         ref new Windows::UI::Core::DispatchedHandler([this,revision,keepFocus,keepOffset]() {
             if (revision != navigationRevision_ || inGame_ || artPicker_ != nullptr || content_ == nullptr) return;
@@ -2932,15 +3083,12 @@ void CatalogShell::Render() {
                     contentScroll_->ChangeView(nullptr, ref new Platform::Box<double>(keepOffset), nullptr, true);
                 std::vector<Control^> stops;
                 CollectFocusable(content_, stops);
-                if (!stops.empty()) {
-                    stops[std::min(static_cast<size_t>(keepFocus), stops.size() - 1)]->Focus(Windows::UI::Xaml::FocusState::Keyboard);
+                if (!stops.empty() &&
+                    stops[std::min(static_cast<size_t>(keepFocus), stops.size() - 1)]->Focus(Windows::UI::Xaml::FocusState::Keyboard))
                     return;
-                }
             }
             if (xmb_ != nullptr && xmb_->Visibility == Windows::UI::Xaml::Visibility::Visible) return;
-            auto focused = dynamic_cast<DependencyObject^>(Windows::UI::Xaml::Input::FocusManager::GetFocusedElement());
-            if (InWindow(focused)) return;
-            if (!FocusContent()) FocusMenu(CurrentMenuKey());
+            FocusContentSoon(8);
         }));
 }
 
