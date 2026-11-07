@@ -1191,37 +1191,68 @@ bool CatalogShell::Navigate(int dir) {
             named->Visibility == Windows::UI::Xaml::Visibility::Visible && InWindow(named))
             pick = named;
     }
+    // The controls on this side of the screen, in rows. Controls on the same
+    // line are one row. Left and Right step along the row one control at a
+    // time; Up and Down go to the next row and land on the control closest
+    // above or below. Every control is in a row and every row has a
+    // neighbour, so nothing can be skipped or left out of reach.
     int considered = 0;
     if (pick == nullptr) {
-        std::vector<Control^> stops;
-        CollectNavStops(root_, stops);
-        const float fx = from.X + from.Width / 2.0f;
-        const float fy = from.Y + from.Height / 2.0f;
-        float best = 1e9f;
-        for (auto candidate : stops) {
-            if (candidate == current) continue;
+        struct Stop {
+            Control^ control;
+            float cx;
+            float cy;
+            float height;
+        };
+        std::vector<Control^> found;
+        CollectNavStops(root_, found);
+        std::vector<Stop> stops;
+        for (auto candidate : found) {
             if ((MenuKeyOf(candidate) >= 0) != inMenu) continue;   // the dock and the page are separate
             Windows::Foundation::Rect r;
-            if (!BoundsIn(candidate, root_, r)) continue;
-            ++considered;
-            const float cx = r.X + r.Width / 2.0f;
-            const float cy = r.Y + r.Height / 2.0f;
-            float primary, secondary, overlap;
-            if (dir <= 1) {
-                primary = dir == 0 ? fy - cy : cy - fy;
-                secondary = cx - fx;
-                overlap = std::min(from.X + from.Width, r.X + r.Width) - std::max(from.X, r.X);
-            } else {
-                primary = dir == 2 ? fx - cx : cx - fx;
-                secondary = cy - fy;
-                overlap = std::min(from.Y + from.Height, r.Y + r.Height) - std::max(from.Y, r.Y);
+            if (candidate == current) r = from;
+            else if (!BoundsIn(candidate, root_, r)) continue;
+            stops.push_back({ candidate, r.X + r.Width / 2.0f, r.Y + r.Height / 2.0f, r.Height });
+        }
+        considered = static_cast<int>(stops.size());
+        std::stable_sort(stops.begin(), stops.end(), [](const Stop& l, const Stop& r) { return l.cy < r.cy; });
+        std::vector<std::vector<Stop>> rows;
+        for (const auto& stop : stops) {
+            if (!rows.empty()) {
+                auto& row = rows.back();
+                float sum = 0.0f, tallest = 0.0f;
+                for (const auto& member : row) {
+                    sum += member.cy;
+                    tallest = std::max(tallest, member.height);
+                }
+                if (std::abs(stop.cy - sum / static_cast<float>(row.size())) <= std::max(tallest, stop.height) * 0.5f) {
+                    row.push_back(stop);
+                    continue;
+                }
             }
-            if (primary < 6.0f) continue;   // not in that direction
-            const bool aligned = overlap > 0.0f;
-            const float score = primary + std::abs(secondary) * (aligned ? 1.0f : 3.0f) + (aligned ? 0.0f : 240.0f);
-            if (score < best) {
-                best = score;
-                pick = candidate;
+            rows.push_back(std::vector<Stop>{ stop });
+        }
+        for (auto& row : rows)
+            std::stable_sort(row.begin(), row.end(), [](const Stop& l, const Stop& r) { return l.cx < r.cx; });
+        int rowIndex = -1, column = -1;
+        for (size_t r = 0; r < rows.size() && rowIndex < 0; ++r)
+            for (size_t c = 0; c < rows[r].size(); ++c)
+                if (rows[r][c].control == current) { rowIndex = static_cast<int>(r); column = static_cast<int>(c); break; }
+        if (rowIndex >= 0) {
+            if (dir >= 2) {
+                const int next = column + (dir == 3 ? 1 : -1);
+                if (next >= 0 && next < static_cast<int>(rows[rowIndex].size()))
+                    pick = rows[rowIndex][next].control;
+            } else {
+                const int next = rowIndex + (dir == 1 ? 1 : -1);
+                if (next >= 0 && next < static_cast<int>(rows.size())) {
+                    const float fx = from.X + from.Width / 2.0f;
+                    float best = 1e9f;
+                    for (const auto& stop : rows[next]) {
+                        const float d = std::abs(stop.cx - fx);
+                        if (d < best) { best = d; pick = stop.control; }
+                    }
+                }
             }
         }
     }
