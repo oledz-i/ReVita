@@ -681,6 +681,16 @@ CatalogShell::CatalogShell() {
         ref new TypedEventHandler<Windows::UI::Core::CoreWindow^, Windows::UI::Core::KeyEventArgs^>(
             [this](Windows::UI::Core::CoreWindow^, Windows::UI::Core::KeyEventArgs^ e) {
                 if (inGame_) {
+                    // A failed load shows a normal Back button, not an active
+                    // game. Let XAML activate it and let B leave this screen.
+                    if (loadFailed_) {
+                        if (e->VirtualKey == Windows::System::VirtualKey::GamepadB ||
+                            e->VirtualKey == Windows::System::VirtualKey::Escape) {
+                            ExitGameView();
+                            e->Handled = true;
+                        }
+                        return;
+                    }
                     if (quickMenuOpen_) {
                         // The menu's buttons take the controller; B (or Escape)
                         // goes back to the game.
@@ -2671,11 +2681,7 @@ void CatalogShell::Mods() {
         Dispatcher->RunAsync(Windows::UI::Core::CoreDispatcherPriority::Low,
             ref new Windows::UI::Core::DispatchedHandler([this, index]() { FetchMods(index, false); }));
     }
-    if (current != nullptr && shownPage_ != 5) {
-        current->Loaded += ref new RoutedEventHandler([current](Platform::Object^, RoutedEventArgs^) {
-            current->Focus(Windows::UI::Xaml::FocusState::Programmatic);
-        });
-    }
+
 }
 
 std::wstring CatalogShell::GameTitleId(size_t index) const {
@@ -2909,6 +2915,8 @@ void CatalogShell::Render() {
     Dispatcher->RunAsync(Windows::UI::Core::CoreDispatcherPriority::Low,
         ref new Windows::UI::Core::DispatchedHandler([this,revision,keepFocus,keepOffset]() {
             if (revision != navigationRevision_ || inGame_ || artPicker_ != nullptr || content_ == nullptr) return;
+            auto active = dynamic_cast<DependencyObject^>(Windows::UI::Xaml::Input::FocusManager::GetFocusedElement());
+            if (InWindow(active)) return; // the user already moved since this render
             if (keepFocus >= 0) {
                 if (contentScroll_ != nullptr)
                     contentScroll_->ChangeView(nullptr, ref new Platform::Box<double>(keepOffset), nullptr, true);
@@ -6679,7 +6687,8 @@ void CatalogShell::ArtPickerSearch(size_t index, Platform::String^ term) {
                 if (!first) first = pick;
                 if (!exactId && LowerOf(name) == wanted) { exactId = id; exactName = name; }
             }
-            if (first) first->Focus(Windows::UI::Xaml::FocusState::Programmatic);
+            if (first && !InWindow(dynamic_cast<DependencyObject^>(Windows::UI::Xaml::Input::FocusManager::GetFocusedElement())))
+                first->Focus(Windows::UI::Xaml::FocusState::Programmatic);
             // The game's own name matched: its art comes up straight away.
             if (exactId) ArtPickerLoad(index, exactId, exactName);
         } catch (Platform::Exception^ e) {
