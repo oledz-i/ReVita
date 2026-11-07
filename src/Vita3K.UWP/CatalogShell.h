@@ -192,7 +192,8 @@ private:
     // reachable with the D-pad. Keys: a page number, or 100 + a settings tab.
     std::vector<std::pair<int, Windows::UI::Xaml::Controls::Button^>> menuItems_;
     int pendingMenuFocus_ = -1;
-    bool pendingContentFocus_ = false;
+    unsigned navigationRevision_ = 0;
+    bool NavigateDirection(Windows::System::VirtualKey key);
     int MenuKeyOf(Platform::Object^ element) const;
     void FocusMenu(int key);
     bool FocusContent();

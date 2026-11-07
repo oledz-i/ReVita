@@ -546,6 +546,7 @@ CatalogShell::CatalogShell() {
     Grid::SetRow(navigation_, 0);
 
     auto scroll = ref new ScrollViewer();
+    scroll->IsTabStop = false;
     contentScroll_ = scroll;
     scroll->VerticalScrollBarVisibility = ScrollBarVisibility::Hidden;
     scroll->HorizontalScrollBarVisibility = ScrollBarVisibility::Disabled;
@@ -672,6 +673,10 @@ CatalogShell::CatalogShell() {
             });
         });
     Content = root_;
+    root_->PreviewKeyDown += ref new Windows::UI::Xaml::Input::KeyEventHandler(
+        [this](Platform::Object^, Windows::UI::Xaml::Input::KeyRoutedEventArgs^ e) {
+            if (!e->Handled && NavigateDirection(e->Key)) e->Handled = true;
+        });
     Window::Current->CoreWindow->KeyDown +=
         ref new TypedEventHandler<Windows::UI::Core::CoreWindow^, Windows::UI::Core::KeyEventArgs^>(
             [this](Windows::UI::Core::CoreWindow^, Windows::UI::Core::KeyEventArgs^ e) {
@@ -713,6 +718,8 @@ CatalogShell::CatalogShell() {
                     }
                     return;
                 }
+                auto popupFocus = dynamic_cast<DependencyObject^>(Windows::UI::Xaml::Input::FocusManager::GetFocusedElement());
+                if (popupFocus != nullptr && !InWindow(popupFocus)) return;
                 if (page_ == 0 && xmb_ != nullptr && xmb_->Visibility == Windows::UI::Xaml::Visibility::Visible) {
                     if (XmbKey(e->VirtualKey)) e->Handled = true;
                     return;
@@ -763,6 +770,9 @@ CatalogShell::CatalogShell() {
     // end of what can be focused scroll the page so all of it can be read.
     root_->NoFocusCandidateFound += ref new TypedEventHandler<UIElement^, Windows::UI::Xaml::Input::NoFocusCandidateFoundEventArgs^>(
         [this](UIElement^, Windows::UI::Xaml::Input::NoFocusCandidateFoundEventArgs^ e) {
+            if (inGame_ || artPicker_ != nullptr) return;
+            auto activeFocus = dynamic_cast<DependencyObject^>(Windows::UI::Xaml::Input::FocusManager::GetFocusedElement());
+            if (activeFocus != nullptr && !InWindow(activeFocus)) return;
             using Windows::UI::Xaml::Input::FocusNavigationDirection;
             const bool inMenu = MenuKeyOf(Windows::UI::Xaml::Input::FocusManager::GetFocusedElement()) >= 0;
             switch (e->Direction) {
@@ -983,6 +993,7 @@ void CatalogShell::BuildNavigation() {
         }
     }
     auto listScroll = ref new ScrollViewer();
+    listScroll->IsTabStop = false;
     listScroll->VerticalScrollBarVisibility = ScrollBarVisibility::Hidden;
     listScroll->HorizontalScrollBarVisibility = ScrollBarVisibility::Disabled;
     listScroll->Padding = Thickness(0, 2, 6, 2);   // room for the focus lift
@@ -1048,7 +1059,8 @@ void CatalogShell::FocusMenu(int key) {
     if (target == nullptr) return;
     if (!target->Focus(Windows::UI::Xaml::FocusState::Keyboard)) {
         // not in the window yet: as soon as it is
-        target->Loaded += ref new RoutedEventHandler([target](Platform::Object^, RoutedEventArgs^) {
+        target->Loaded += ref new RoutedEventHandler([this,target](Platform::Object^, RoutedEventArgs^) {
+            if (!InWindow(target)) return;
             target->Focus(Windows::UI::Xaml::FocusState::Keyboard);
         });
     }
@@ -1064,6 +1076,94 @@ bool CatalogShell::FocusContent() {
     for (auto stop : stops)
         if (stop->Focus(Windows::UI::Xaml::FocusState::Keyboard)) return true;
     return false;
+}
+bool CatalogShell::NavigateDirection(Windows::System::VirtualKey key) {
+    using Windows::System::VirtualKey;
+    using namespace Windows::UI::Xaml::Input;
+    FocusNavigationDirection direction;
+    switch (key) {
+    case VirtualKey::Up: case VirtualKey::GamepadDPadUp: case VirtualKey::GamepadLeftThumbstickUp:
+        direction = FocusNavigationDirection::Up; break;
+    case VirtualKey::Down: case VirtualKey::GamepadDPadDown: case VirtualKey::GamepadLeftThumbstickDown:
+        direction = FocusNavigationDirection::Down; break;
+    case VirtualKey::Left: case VirtualKey::GamepadDPadLeft: case VirtualKey::GamepadLeftThumbstickLeft:
+        direction = FocusNavigationDirection::Left; break;
+    case VirtualKey::Right: case VirtualKey::GamepadDPadRight: case VirtualKey::GamepadLeftThumbstickRight:
+        direction = FocusNavigationDirection::Right; break;
+    default: return false;
+    }
+    if (inGame_ && !quickMenuOpen_) return false;
+    if (!inGame_ && artPicker_ == nullptr && page_ == 0 && xmb_ != nullptr &&
+        xmb_->Visibility == Windows::UI::Xaml::Visibility::Visible) return false;
+    auto focused = dynamic_cast<DependencyObject^>(FocusManager::GetFocusedElement());
+    if (focused != nullptr && !InWindow(focused)) return false; // native popup/dialog
+    const bool horizontal = direction == FocusNavigationDirection::Left || direction == FocusNavigationDirection::Right;
+    // These controls use directions to edit values, select text or operate a
+    // dropdown. Do not turn their editing keys into shell navigation.
+    if (dynamic_cast<TextBox^>(focused) != nullptr || dynamic_cast<PasswordBox^>(focused) != nullptr ||
+        dynamic_cast<ComboBox^>(focused) != nullptr ||
+        (horizontal && dynamic_cast<Slider^>(focused) != nullptr)) return false;
+    auto focus = [this](Control^ target) {
+        if (target == nullptr || !target->Focus(Windows::UI::Xaml::FocusState::Keyboard)) return false;
+        if (dynamic_cast<Button^>(target) == nullptr ||
+            std::find(flowCards_.begin(), flowCards_.end(), dynamic_cast<Button^>(target)) == flowCards_.end())
+            target->StartBringIntoView();
+        return true;
+    };
+    const bool overlay = artPicker_ != nullptr || quickMenuOpen_;
+    const int menu = overlay ? -1 : MenuKeyOf(focused);
+    if (menu >= 0) {
+        if (direction == FocusNavigationDirection::Right) { FocusContent(); return true; }
+        if (horizontal) return true;
+        for (size_t i = 0; i < menuItems_.size(); ++i) {
+            if (menuItems_[i].first != menu) continue;
+            const int step = direction == FocusNavigationDirection::Down ? 1 : -1;
+            const int next = static_cast<int>(i) + step;
+            if (next >= 0 && next < static_cast<int>(menuItems_.size()))
+                focus(menuItems_[next].second);
+            return true;
+        }
+    }
+    DependencyObject^ scope = artPicker_ != nullptr ? static_cast<DependencyObject^>(artPicker_) :
+        quickMenuOpen_ ? static_cast<DependencyObject^>(quickMenu_) : static_cast<DependencyObject^>(content_);
+    if (scope == nullptr) return false;
+    std::vector<Control^> stops;
+    CollectFocusable(scope, stops);
+    if (stops.empty()) return false;
+    int index = -1;
+    for (size_t i = 0; i < stops.size(); ++i)
+        if (stops[i] == focused) { index = static_cast<int>(i); break; }
+    if (index < 0) { focus(stops.front()); return true; }
+    // Cover-flow transforms must not change the left/right order of posters.
+    if (!overlay && page_ == 0 && horizontal) {
+        for (size_t i = 0; i < flowCards_.size(); ++i) {
+            if (flowCards_[i] != focused) continue;
+            const int next = static_cast<int>(i) + (direction == FocusNavigationDirection::Right ? 1 : -1);
+            if (next >= 0 && next < static_cast<int>(flowCards_.size())) focus(flowCards_[next]);
+            else if (next < 0) FocusMenu(CurrentMenuKey());
+            return true;
+        }
+    }
+    auto options = ref new FindNextElementOptions();
+    options->SearchRoot = scope;
+    auto next = dynamic_cast<Control^>(FocusManager::FindNextElement(direction, options));
+    // Only actual controls from the active scope are candidates. ScrollViewer
+    // template buttons and controls behind overlays are never destinations.
+    if (next != nullptr && std::find(stops.begin(), stops.end(), next) != stops.end() && focus(next)) return true;
+    if (!horizontal) {
+        // Reach controls whose layout has no geometric neighbour (wrapped
+        // settings rows, narrow screens and offscreen sections).
+        const int nextIndex = index + (direction == FocusNavigationDirection::Down ? 1 : -1);
+        if (nextIndex >= 0 && nextIndex < static_cast<int>(stops.size())) focus(stops[nextIndex]);
+        else if (!overlay && contentScroll_ != nullptr) {
+            const double step = direction == FocusNavigationDirection::Down ? 180.0 : -180.0;
+            const double offset = std::max(0.0, std::min(contentScroll_->ScrollableHeight, contentScroll_->VerticalOffset + step));
+            contentScroll_->ChangeView(nullptr, ref new Platform::Box<double>(offset), nullptr, false);
+        }
+    } else if (!overlay && direction == FocusNavigationDirection::Left) {
+        FocusMenu(CurrentMenuKey());
+    }
+    return true; // never let the default search escape the active scope
 }
 bool CatalogShell::InWindow(DependencyObject^ element) const {
     // Attached to the window (the page, or a popup over it) or left behind
@@ -1302,6 +1402,7 @@ void CatalogShell::MakeShelf(Platform::String^ heading,
         Reveal(tile, 140.0 + 38.0 * std::min(order++, 9u), 16);
     }
     auto scroller = ref new ScrollViewer();
+    scroller->IsTabStop = false;
     scroller->Height = 212;
     scroller->HorizontalScrollBarVisibility = ScrollBarVisibility::Hidden;
     scroller->HorizontalScrollMode = ScrollMode::Enabled;
@@ -1624,6 +1725,7 @@ void CatalogShell::MakeFlow(const std::vector<size_t>& items, size_t focus) {
         if (items[i] == focus) start = static_cast<int>(i);
     }
     flowScroll_ = ref new ScrollViewer();
+    flowScroll_->IsTabStop = false;
     flowScroll_->Height = kFlowCardHeight * 1.22;
     flowScroll_->Margin = Thickness(-36, 2, -40, 0);   // edge to edge
     flowScroll_->HorizontalScrollBarVisibility = ScrollBarVisibility::Hidden;
@@ -1770,13 +1872,7 @@ void CatalogShell::Home() {
     MakeFlow(order, featured);
 
 
-    // The controller starts on the poster in the middle.
-    if (!flowCards_.empty() && flowFocus_ >= 0) {
-        auto first = flowCards_[flowFocus_];
-        first->Loaded += ref new RoutedEventHandler([first](Platform::Object^, RoutedEventArgs^) {
-            first->Focus(Windows::UI::Xaml::FocusState::Programmatic);
-        });
-    }
+
 }
 void CatalogShell::Library() {
     auto header = ref new Grid();
@@ -2075,10 +2171,7 @@ void CatalogShell::GameDetails() {
     layout->Children->Append(right);
     content_->Children->Append(layout);
     AppendGameInfo(index);
-    // The controller lands on Play.
-    play->Loaded += ref new RoutedEventHandler([play](Platform::Object^, RoutedEventArgs^) {
-        play->Focus(Windows::UI::Xaml::FocusState::Programmatic);
-    });
+
 }
 // ── Mods: cheats and patches ────────────────────────────────────────────────
 // Cheats come from the VitaCheat database (one .psv file per title ID) and run
@@ -2441,6 +2534,7 @@ void CatalogShell::Mods() {
         strip->Children->Append(pick);
     }
     auto stripScroll = ref new ScrollViewer();
+    stripScroll->IsTabStop = false;
     stripScroll->HorizontalScrollBarVisibility = ScrollBarVisibility::Hidden;
     stripScroll->HorizontalScrollMode = ScrollMode::Enabled;
     stripScroll->VerticalScrollBarVisibility = ScrollBarVisibility::Disabled;
@@ -2736,19 +2830,23 @@ void CatalogShell::AppendGameInfo(size_t index) {
     content_->Children->Append(panel);
 }
 void CatalogShell::CollectFocusable(DependencyObject^ node, std::vector<Control^>& out) {
-    const int count = Windows::UI::Xaml::Media::VisualTreeHelper::GetChildrenCount(node);
-    for (int i = 0; i < count; ++i) {
-        auto child = Windows::UI::Xaml::Media::VisualTreeHelper::GetChild(node, i);
-        auto control = dynamic_cast<Control^>(child);
-        if (control != nullptr && control->IsTabStop) {
-            if (control->IsEnabled && control->Visibility == Windows::UI::Xaml::Visibility::Visible)
-                out.push_back(control);
-            continue;   // a control's own insides are not separate stops
+    if (node == nullptr) return;
+    auto element = dynamic_cast<UIElement^>(node);
+    if (element != nullptr && (element->Visibility != Windows::UI::Xaml::Visibility::Visible || !element->IsHitTestVisible)) return;
+    auto control = dynamic_cast<Control^>(node);
+    if (control != nullptr) {
+        if (!control->IsEnabled) return;
+        if (control->IsTabStop && dynamic_cast<ScrollViewer^>(control) == nullptr) {
+            out.push_back(control);
+            return; // a control's template is not a second set of navigation stops
         }
-        CollectFocusable(child, out);
     }
+    const int count = Windows::UI::Xaml::Media::VisualTreeHelper::GetChildrenCount(node);
+    for (int i = 0; i < count; ++i)
+        CollectFocusable(Windows::UI::Xaml::Media::VisualTreeHelper::GetChild(node, i), out);
 }
 void CatalogShell::Render() {
+    const unsigned revision = ++navigationRevision_;
     // Settings keeps its category list on the left; its page sits beside it
     if (content_ != nullptr)
         content_->Margin = Thickness(36, 6, 40, 28);
@@ -2764,21 +2862,7 @@ void CatalogShell::Render() {
                 if (stops[i] == focused) { keepFocus = static_cast<int>(i); break; }
         }
     }
-    if (keepFocus >= 0) {
-        // the page keeps its scroll position too
-        const double keepOffset = contentScroll_ != nullptr ? contentScroll_->VerticalOffset : 0.0;
-        Dispatcher->RunAsync(Windows::UI::Core::CoreDispatcherPriority::Low,
-            ref new Windows::UI::Core::DispatchedHandler([this,keepFocus,keepOffset]() {
-                if (content_ == nullptr) return;
-                if (contentScroll_ != nullptr)
-                    contentScroll_->ChangeView(nullptr, ref new Platform::Box<double>(keepOffset), nullptr, true);
-                std::vector<Control^> stops;
-                CollectFocusable(content_, stops);
-                if (stops.empty()) return;
-                stops[std::min(static_cast<size_t>(keepFocus), stops.size() - 1)]->Focus(
-                    Windows::UI::Xaml::FocusState::Programmatic);
-            }));
-    }
+    const double keepOffset = contentScroll_ != nullptr ? contentScroll_->VerticalOffset : 0.0;
     content_->Children->Clear();
     clock_ = nullptr;
     greeting_ = nullptr;
@@ -2823,8 +2907,18 @@ void CatalogShell::Render() {
     // drawn took the focused control with it, the new page's first control
     // (or its entry in the menu) takes over.
     Dispatcher->RunAsync(Windows::UI::Core::CoreDispatcherPriority::Low,
-        ref new Windows::UI::Core::DispatchedHandler([this]() {
-            if (inGame_ || content_ == nullptr) return;
+        ref new Windows::UI::Core::DispatchedHandler([this,revision,keepFocus,keepOffset]() {
+            if (revision != navigationRevision_ || inGame_ || artPicker_ != nullptr || content_ == nullptr) return;
+            if (keepFocus >= 0) {
+                if (contentScroll_ != nullptr)
+                    contentScroll_->ChangeView(nullptr, ref new Platform::Box<double>(keepOffset), nullptr, true);
+                std::vector<Control^> stops;
+                CollectFocusable(content_, stops);
+                if (!stops.empty()) {
+                    stops[std::min(static_cast<size_t>(keepFocus), stops.size() - 1)]->Focus(Windows::UI::Xaml::FocusState::Keyboard);
+                    return;
+                }
+            }
             if (xmb_ != nullptr && xmb_->Visibility == Windows::UI::Xaml::Visibility::Visible) return;
             auto focused = dynamic_cast<DependencyObject^>(Windows::UI::Xaml::Input::FocusManager::GetFocusedElement());
             if (InWindow(focused)) return;
@@ -3111,6 +3205,7 @@ void CatalogShell::Settings() {
     logView->TextWrapping = TextWrapping::Wrap;
     logView->TextTrimming = TextTrimming::None;
     auto logScroll = ref new ScrollViewer();
+    logScroll->IsTabStop = false;
     logScroll->MaxHeight = 320;
     logScroll->Margin = Thickness(0, 12, 0, 0);
     logScroll->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
@@ -6454,6 +6549,7 @@ void CatalogShell::ShowArtPicker(size_t index) {
     Grid::SetRowSpan(layer, 2);
     Canvas::SetZIndex(layer, 40);
     auto scroll = ref new ScrollViewer();
+    scroll->IsTabStop = false;
     scroll->VerticalScrollBarVisibility = ScrollBarVisibility::Hidden;
     scroll->HorizontalScrollBarVisibility = ScrollBarVisibility::Disabled;
     auto body = Vertical(10);
@@ -6499,6 +6595,7 @@ void CatalogShell::ShowArtPicker(size_t index) {
 
     body->Children->Append(label(L"COVERS"));
     auto coverScroll = ref new ScrollViewer();
+    coverScroll->IsTabStop = false;
     coverScroll->HorizontalScrollMode = ScrollMode::Enabled;
     coverScroll->VerticalScrollMode = ScrollMode::Disabled;
     coverScroll->HorizontalScrollBarVisibility = ScrollBarVisibility::Hidden;
@@ -6510,6 +6607,7 @@ void CatalogShell::ShowArtPicker(size_t index) {
 
     body->Children->Append(label(L"BACKGROUNDS"));
     auto heroScroll = ref new ScrollViewer();
+    heroScroll->IsTabStop = false;
     heroScroll->HorizontalScrollMode = ScrollMode::Enabled;
     heroScroll->VerticalScrollMode = ScrollMode::Disabled;
     heroScroll->HorizontalScrollBarVisibility = ScrollBarVisibility::Hidden;
