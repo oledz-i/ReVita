@@ -50,7 +50,7 @@ index 65979730..4d9d13f6 100644
  // Direct3D 12 cannot bind the render target itself as one while drawing to
  // it. A few copies are kept, one per size and format.
 +// set by any draw that writes the target without reading it, and at a new scene
-+bool uwp_render_target_dirty = true;
++bool uwp_render_target_dirty = true; int uwp_blend_copies = 0;
 +
  static GLuint uwp_color_attachment_copy(GLuint attachment) {
      struct Copy {
@@ -88,11 +88,11 @@ index 65979730..4d9d13f6 100644
 +        static GLuint copied_from = 0;
 +        static GLuint copy_texture = 0;
 +        static int reuses_left = 0;
-+        if (uwp_render_target_dirty || copied_from != context.current_color_attachment || reuses_left <= 0 || !copy_texture) {
++        if (uwp_blend_copies < 300 || uwp_render_target_dirty || copied_from != context.current_color_attachment || reuses_left <= 0 || !copy_texture) {
 +            copy_texture = uwp_color_attachment_copy(context.current_color_attachment);
 +            copied_from = context.current_color_attachment;
-+            reuses_left = 32;
-+            uwp_render_target_dirty = false;
++            reuses_left = uwp_blend_copies < 300 ? 0 : 16; // exact first, a cheaper copy shared only in a scene with hundreds
++            uwp_render_target_dirty = false; uwp_blend_copies++;
 +        } else {
 +            reuses_left--;
 +        }
@@ -130,7 +130,7 @@ index 9d4320e4..585edca2 100644
  
  namespace renderer::gl {
 +#ifdef VITA3K_UWP
-+extern bool uwp_render_target_dirty; // draw.cpp
++extern bool uwp_render_target_dirty; extern int uwp_blend_copies; // draw.cpp
 +#endif
  
  GLContext::GLContext()
@@ -140,7 +140,7 @@ index 9d4320e4..585edca2 100644
  
      glBindFramebuffer(GL_FRAMEBUFFER, context.current_framebuffer);
 +#ifdef VITA3K_UWP
-+    uwp_render_target_dirty = true; // a new scene: the blending copy starts fresh
++    uwp_render_target_dirty = true; uwp_blend_copies = 0; // a new scene: the blending copy starts fresh
 +#endif
  
      if (context.record.region_clip_mode != SCE_GXM_REGION_CLIP_NONE) {
