@@ -1115,8 +1115,8 @@ bool CatalogShell::NavigateDirection(Windows::System::VirtualKey key) {
         (horizontal && dynamic_cast<Slider^>(focused) != nullptr)) return false;
     auto focus = [this](Control^ target) {
         if (target == nullptr || !target->Focus(Windows::UI::Xaml::FocusState::Keyboard)) return false;
-        if (dynamic_cast<Button^>(target) == nullptr ||
-            std::find(flowCards_.begin(), flowCards_.end(), dynamic_cast<Button^>(target)) == flowCards_.end())
+        if (dynamic_cast<Windows::UI::Xaml::Controls::Button^>(target) == nullptr ||
+            std::find(flowCards_.begin(), flowCards_.end(), dynamic_cast<Windows::UI::Xaml::Controls::Button^>(target)) == flowCards_.end())
             target->StartBringIntoView();
         return true;
     };
