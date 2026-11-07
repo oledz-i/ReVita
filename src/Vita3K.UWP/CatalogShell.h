@@ -123,6 +123,7 @@ private:
     Windows::UI::Xaml::Controls::SwapChainPanel^ renderSurface_;
     Windows::UI::Xaml::Controls::TextBox^ searchBox_;
     Windows::UI::Xaml::Controls::StackPanel^ libraryResults_;
+    Windows::UI::Xaml::Controls::TextBlock^ libraryFolder_;
     void RefreshLibraryItems();
     // A game's page: what the internet knows about it (GameInfo.h).
     void AppendGameInfo(size_t index);
@@ -187,6 +188,16 @@ private:
     std::vector<Windows::UI::Xaml::Controls::Button^> settingsRail_;
     void StyleSettingsRail();
     void FocusSettingsRail();
+    // The side menu: every page and (on Settings) every category, all
+    // reachable with the D-pad. Keys: a page number, or 100 + a settings tab.
+    std::vector<std::pair<int, Windows::UI::Xaml::Controls::Button^>> menuItems_;
+    int pendingMenuFocus_ = -1;
+    bool pendingContentFocus_ = false;
+    int MenuKeyOf(Platform::Object^ element) const;
+    void FocusMenu(int key);
+    bool FocusContent();
+    bool InWindow(Windows::UI::Xaml::DependencyObject^ element) const;
+    int CurrentMenuKey() const;
     void UpdateSpotlight(int index);
     void HideSpotlight();
     std::vector<size_t> RecentGames();
