@@ -45,6 +45,10 @@ protected:
         // backgrounds reach the screen edge instead of stopping at a border.
         Windows::UI::ViewManagement::ApplicationView::GetForCurrentView()->SetDesiredBoundsMode(
             Windows::UI::ViewManagement::ApplicationViewBoundsMode::UseCoreWindow);
+        if (dynamic_cast<CatalogShell^>(Window::Current->Content) != nullptr) {
+            Window::Current->Activate();
+            return;
+        }
         Window::Current->Content = ref new CatalogShell();
         Window::Current->Activate();
     }

@@ -201,6 +201,10 @@ private:
     int CurrentMenuKey() const;
     bool Navigate(int direction);
     bool HandleNavKey(Windows::System::VirtualKey code);
+    bool HandleNavAction(Windows::System::VirtualKey code);
+    void SwitchSettingsTab(int delta);
+    bool forgetFocusOnce_ = false;
+    unsigned long long actionTick_[16] = {};
     void EnsureVisible(Windows::UI::Xaml::Controls::Control^ control);
     void FocusContentSoon(int attempts, bool fromMenu = false);
     void CollectNavStops(Windows::UI::Xaml::DependencyObject^ node, std::vector<Windows::UI::Xaml::Controls::Control^>& out);

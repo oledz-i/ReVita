@@ -672,6 +672,15 @@ CatalogShell::CatalogShell() {
             });
         });
     Content = root_;
+    // XAML's own directional focus also moves on a press, and only a routed
+    // handler marked Handled stops it. Without this every press moved twice.
+    root_->PreviewKeyDown += ref new Windows::UI::Xaml::Input::KeyEventHandler(
+        [this](Platform::Object^, Windows::UI::Xaml::Input::KeyRoutedEventArgs^ e) {
+            if (e->Handled || inGame_ || libretro_.Running() || artPicker_ != nullptr) return;
+            if (page_ == 0 && xmb_ != nullptr && xmb_->Visibility == Windows::UI::Xaml::Visibility::Visible) return;
+            if (Windows::UI::Xaml::Media::VisualTreeHelper::GetOpenPopups(Window::Current)->Size > 0) return;
+            if (HandleNavAction(e->Key)) e->Handled = true;
+        });
     Window::Current->CoreWindow->KeyDown +=
         ref new TypedEventHandler<Windows::UI::Core::CoreWindow^, Windows::UI::Core::KeyEventArgs^>(
             [this](Windows::UI::Core::CoreWindow^, Windows::UI::Core::KeyEventArgs^ e) {
@@ -729,15 +738,7 @@ CatalogShell::CatalogShell() {
                 }
                 // A dialog, a drop-down or a flyout is open: it owns the controller.
                 if (Windows::UI::Xaml::Media::VisualTreeHelper::GetOpenPopups(Window::Current)->Size > 0) return;
-                // LB and RB move between the tabs, from any page.
-                if (e->VirtualKey == Windows::System::VirtualKey::GamepadLeftShoulder ||
-                    e->VirtualKey == Windows::System::VirtualKey::GamepadRightShoulder) {
-                    SwitchTab(e->VirtualKey == Windows::System::VirtualKey::GamepadLeftShoulder ? -1 : 1);
-                    e->Handled = true;
-                    return;
-                }
-                // everything else that moves around the menus
-                if (HandleNavKey(e->VirtualKey)) e->Handled = true;
+                if (HandleNavAction(e->VirtualKey)) e->Handled = true;
             });
     // B on Xbox also raises a system back request; one left unhandled closes
     // the app (B at Home, or B in a game, dropped you to the dashboard). The
@@ -962,6 +963,7 @@ void CatalogShell::BuildNavigation() {
         sub->BorderThickness = Thickness(1);
         auto row = ref new StackPanel();
         row->Orientation = Orientation::Horizontal;
+        row->Children->Append(bumper(L"LT"));
         const wchar_t* groups[] = { L"System", L"Emulation", L"Look", L"Sound", L"Artwork", L"Help" };
         const wchar_t* groupGlyphs[] = { L"\xE7F8", L"\xE7FC", L"\xE790", L"\xE767", L"\xEB9F", L"\xE897" };
         for (int g = 0; g < 6; ++g) {
@@ -999,6 +1001,7 @@ void CatalogShell::BuildNavigation() {
             settingsRail_.push_back(item);
             row->Children->Append(item);
         }
+        row->Children->Append(bumper(L"RT"));
         sub->Child = row;
         layer->Children->Append(sub);
     }
@@ -1302,6 +1305,55 @@ bool CatalogShell::Navigate(int dir) {
     libretro_.LogLine(std::string("nav: ") + names[dir] + " from " + NameOf(current) + " has nowhere to go (" +
         std::to_string(considered) + " controls considered)");
     return true;
+}
+bool CatalogShell::HandleNavAction(Windows::System::VirtualKey code) {
+    using Windows::System::VirtualKey;
+    int action = -1;
+    switch (code) {
+    case VirtualKey::GamepadDPadUp: case VirtualKey::GamepadLeftThumbstickUp: case VirtualKey::Up: action = 0; break;
+    case VirtualKey::GamepadDPadDown: case VirtualKey::GamepadLeftThumbstickDown: case VirtualKey::Down: action = 1; break;
+    case VirtualKey::GamepadDPadLeft: case VirtualKey::GamepadLeftThumbstickLeft: case VirtualKey::Left: action = 2; break;
+    case VirtualKey::GamepadDPadRight: case VirtualKey::GamepadLeftThumbstickRight: case VirtualKey::Right: action = 3; break;
+    case VirtualKey::GamepadLeftShoulder: action = 4; break;
+    case VirtualKey::GamepadRightShoulder: action = 5; break;
+    case VirtualKey::GamepadLeftTrigger: case VirtualKey::PageUp: action = 6; break;
+    case VirtualKey::GamepadRightTrigger: case VirtualKey::PageDown: action = 7; break;
+    case VirtualKey::GamepadB: case VirtualKey::Escape: action = 8; break;
+    case VirtualKey::GamepadA: action = 9; break;
+    default: return false;
+    }
+    // The same press can arrive by two routes (the window and the page). The
+    // second copy is swallowed so one press is one step.
+    const unsigned long long now = GetTickCount64();
+    if (action != 9 && now - actionTick_[action] < 45) return true;
+    bool handled;
+    if (action == 4 || action == 5) {
+        SwitchTab(action == 4 ? -1 : 1);
+        handled = true;
+    } else if ((action == 6 || action == 7) && page_ == 2) {
+        SwitchSettingsTab(action == 6 ? -1 : 1);
+        handled = true;
+    } else {
+        handled = HandleNavKey(code);
+    }
+    if (handled && action != 9) actionTick_[action] = now;
+    return handled;
+}
+void CatalogShell::SwitchSettingsTab(int delta) {
+    const int groups = 6;
+    const int next = (settingsTab_ + delta + groups) % groups;
+    PlayCue(4);
+    if (MenuKeyOf(Windows::UI::Xaml::Input::FocusManager::GetFocusedElement()) >= 100) {
+        // on the pill row: moving focus switches the category
+        FocusMenu(100 + next);
+        return;
+    }
+    settingsTab_ = next;
+    PutPref(L"settings.tab", StringOf(std::to_wstring(settingsTab_)));
+    StyleSettingsRail();
+    forgetFocusOnce_ = true;
+    Render();
+    if (contentScroll_ != nullptr) contentScroll_->ChangeView(nullptr, ref new Platform::Box<double>(0.0), nullptr, true);
 }
 bool CatalogShell::HandleNavKey(Windows::System::VirtualKey code) {
     using Windows::System::VirtualKey;
@@ -3054,7 +3106,8 @@ void CatalogShell::Render() {
     // Drawing the same page again (a toggle, a theme, a sort) keeps the
     // controller on the control it was on instead of throwing it to the top.
     int keepFocus = -1;
-    if (page_ == shownPage_ && content_ != nullptr) {
+    if (forgetFocusOnce_) forgetFocusOnce_ = false;
+    else if (page_ == shownPage_ && content_ != nullptr) {
         auto focused = dynamic_cast<DependencyObject^>(Windows::UI::Xaml::Input::FocusManager::GetFocusedElement());
         if (focused != nullptr) {
             std::vector<Control^> stops;
