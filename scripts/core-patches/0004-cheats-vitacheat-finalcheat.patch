@@ -1946,10 +1946,29 @@ index a8eb771e..723a09aa 100644
  void refresh_controllers(CtrlState &state, EmuEnvState &emuenv);
  void update_keyboard_state(EmuEnvState &emuenv, const std::function<bool(input::PhysicalKeyCode)> &key_held);
 diff --git a/vita3k/ctrl/src/ctrl.cpp b/vita3k/ctrl/src/ctrl.cpp
-index 525994a5..6a48a8dc 100644
+index 525994a5..bd1cf4b8 100644
 --- a/vita3k/ctrl/src/ctrl.cpp
 +++ b/vita3k/ctrl/src/ctrl.cpp
-@@ -463,6 +463,13 @@ static void retrieve_ctrl_data(EmuEnvState &emuenv, int port, bool is_v2, bool n
+@@ -129,6 +129,18 @@ int ctrl_get(const SceUID thread_id, EmuEnvState &emuenv, int port, SceCtrlData2
+ 
+     return nb_returned_data;
+ }
++
++// The buttons held right now, for cheat codes that trigger on a button combo
++SceUInt32 ctrl_peek_buttons(EmuEnvState &emuenv, int port) {
++    (void)emuenv;
++    (void)port;
++    auto &inp = libretro_input_state();
++    std::lock_guard<std::mutex> lock(inp.mutex);
++    uint32_t buttons = 0;
++    for (uint32_t p = 0; p < LIBRETRO_MAX_PORTS; p++)
++        buttons |= inp.ports[p].buttons;
++    return buttons;
++}
+ #else // !BUILD_LIBRETRO
+ 
+ void update_keyboard_state(EmuEnvState &emuenv, const std::function<bool(input::PhysicalKeyCode)> &key_held) {
+@@ -463,6 +475,13 @@ static void retrieve_ctrl_data(EmuEnvState &emuenv, int port, bool is_v2, bool n
      reset_axes();
  }
  
