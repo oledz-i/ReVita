@@ -1108,6 +1108,16 @@ bool CatalogShell::NavigateDirection(Windows::System::VirtualKey key) {
     auto focused = dynamic_cast<DependencyObject^>(FocusManager::GetFocusedElement());
     if (focused != nullptr && !InWindow(focused)) return false; // native popup/dialog
     const bool horizontal = direction == FocusNavigationDirection::Left || direction == FocusNavigationDirection::Right;
+    auto reader = dynamic_cast<ScrollViewer^>(focused);
+    if (reader != nullptr && !horizontal) {
+        const double step = direction == FocusNavigationDirection::Down ? 180.0 : -180.0;
+        const double offset = std::max(0.0, std::min(reader->ScrollableHeight, reader->VerticalOffset + step));
+        if (std::abs(offset - reader->VerticalOffset) > 0.5) {
+            reader->ChangeView(nullptr, ref new Platform::Box<double>(offset), nullptr, true);
+            return true;
+        }
+        // At the end of a read-only pane, continue to the next page control.
+    }
     // These controls use directions to edit values, select text or operate a
     // dropdown. Do not turn their editing keys into shell navigation.
     if (dynamic_cast<TextBox^>(focused) != nullptr || dynamic_cast<PasswordBox^>(focused) != nullptr ||
@@ -2842,7 +2852,7 @@ void CatalogShell::CollectFocusable(DependencyObject^ node, std::vector<Control^
     auto control = dynamic_cast<Control^>(node);
     if (control != nullptr) {
         if (!control->IsEnabled) return;
-        if (control->IsTabStop && dynamic_cast<ScrollViewer^>(control) == nullptr) {
+        if (control->IsTabStop) {
             out.push_back(control);
             return; // a control's template is not a second set of navigation stops
         }
@@ -3213,7 +3223,7 @@ void CatalogShell::Settings() {
     logView->TextWrapping = TextWrapping::Wrap;
     logView->TextTrimming = TextTrimming::None;
     auto logScroll = ref new ScrollViewer();
-    logScroll->IsTabStop = false;
+    logScroll->IsTabStop = true; // this read-only pane needs controller scrolling
     logScroll->MaxHeight = 320;
     logScroll->Margin = Thickness(0, 12, 0, 0);
     logScroll->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
