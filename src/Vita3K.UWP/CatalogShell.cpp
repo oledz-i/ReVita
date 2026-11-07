@@ -1092,7 +1092,7 @@ void CatalogShell::FocusContentSoon(int attempts, bool fromMenu) {
     }
     auto timer = ref new DispatcherTimer();
     timer->Interval = Millis(60);
-    timer->Tick += ref new EventHandler<Platform::Object^>([this,timer,attempts](Platform::Object^, Platform::Object^) {
+    timer->Tick += ref new EventHandler<Platform::Object^>([this,timer,attempts,fromMenu](Platform::Object^, Platform::Object^) {
         timer->Stop();
         FocusContentSoon(attempts - 1, fromMenu);
     });
