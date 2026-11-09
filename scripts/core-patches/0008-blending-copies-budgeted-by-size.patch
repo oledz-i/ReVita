@@ -1,0 +1,116 @@
+diff --git a/external/psvpfstools b/external/psvpfstools
+--- a/external/psvpfstools
++++ b/external/psvpfstools
+@@ -1 +1 @@
+-Subproject commit e21df9a74852433f48d6593b8ef203dc7c424e05
++Subproject commit e21df9a74852433f48d6593b8ef203dc7c424e05-dirty
+diff --git a/external/spdlog b/external/spdlog
+index 79524dd..d6c93f3 160000
+--- a/external/spdlog
++++ b/external/spdlog
+@@ -1 +1 @@
+-Subproject commit 79524ddd08a4ec981b7fea76afd08ee05f83755d
++Subproject commit d6c93f38a08b4ea0f8ffcfd7f7857307d5d5c3fa
+diff --git a/vita3k/renderer/src/gl/draw.cpp b/vita3k/renderer/src/gl/draw.cpp
+index c708908..427ceca 100644
+--- a/vita3k/renderer/src/gl/draw.cpp
++++ b/vita3k/renderer/src/gl/draw.cpp
+@@ -62,6 +62,13 @@ static GLenum translate_primitive(SceGxmPrimitiveType primType) {
+ // it. A few copies are kept, one per size and format.
+ // set by any draw that writes the target without reading it, and at a new scene
+ bool uwp_render_target_dirty = true; int uwp_blend_copies = 0;
++// What the blending copies moved this scene. Every draw that blends gets its
++// own copy (exact) until 128 MB have been copied; past that (a scene that
++// blends hundreds of times at a large size, Minecraft's) a copy is shared by
++// 8 draws, so the GPU never falls far enough behind for the console to end
++// the app.
++int64_t uwp_blend_bytes = 0;
++constexpr int64_t uwp_blend_exact_budget = 128ll * 1024 * 1024;
+ 
+ static GLuint uwp_color_attachment_copy(GLuint attachment) {
+     struct Copy {
+@@ -81,6 +88,7 @@ static GLuint uwp_color_attachment_copy(GLuint attachment) {
+     glGetTextureLevelParameteriv(attachment, 0, GL_TEXTURE_HEIGHT, &height);
+     if (width <= 0 || height <= 0 || format == 0)
+         return 0; // never the render target itself: sampling what is being drawn is a feedback loop
++    uwp_blend_bytes += static_cast<int64_t>(width) * height * 4;
+     Copy *copy = nullptr;
+     for (auto &c : copies) {
+         if (c.texture && c.format == format && c.width == width && c.height == height) {
+@@ -218,10 +226,10 @@ void draw(GLState &renderer, GLContext &context, const FeatureState &features, S
+         static GLuint copied_from = 0;
+         static GLuint copy_texture = 0;
+         static int reuses_left = 0;
+-        if (uwp_blend_copies < 300 || uwp_render_target_dirty || copied_from != context.current_color_attachment || reuses_left <= 0 || !copy_texture) {
++        if (uwp_blend_bytes < uwp_blend_exact_budget || uwp_render_target_dirty || copied_from != context.current_color_attachment || reuses_left <= 0 || !copy_texture) {
+             copy_texture = uwp_color_attachment_copy(context.current_color_attachment);
+             copied_from = context.current_color_attachment;
+-            reuses_left = uwp_blend_copies < 300 ? 0 : 16; // exact first, a cheaper copy shared only in a scene with hundreds
++            reuses_left = uwp_blend_bytes < uwp_blend_exact_budget ? 0 : 8; // exact first, shared once the scene has copied a lot
+             uwp_render_target_dirty = false; uwp_blend_copies++;
+         } else {
+             reuses_left--;
+diff --git a/vita3k/renderer/src/gl/renderer.cpp b/vita3k/renderer/src/gl/renderer.cpp
+index 1699fb6..b525691 100644
+--- a/vita3k/renderer/src/gl/renderer.cpp
++++ b/vita3k/renderer/src/gl/renderer.cpp
+@@ -46,7 +46,7 @@
+ 
+ namespace renderer::gl {
+ #ifdef VITA3K_UWP
+-extern bool uwp_render_target_dirty; extern int uwp_blend_copies; // draw.cpp
++extern bool uwp_render_target_dirty; extern int uwp_blend_copies; extern int64_t uwp_blend_bytes; // draw.cpp
+ #endif
+ 
+ GLContext::GLContext()
+@@ -409,7 +409,7 @@ void set_context(GLState &state, GLContext &context, const MemState &mem, const
+ 
+     glBindFramebuffer(GL_FRAMEBUFFER, context.current_framebuffer);
+ #ifdef VITA3K_UWP
+-    uwp_render_target_dirty = true; uwp_blend_copies = 0; // a new scene: the blending copy starts fresh
++    uwp_render_target_dirty = true; uwp_blend_copies = 0; uwp_blend_bytes = 0; // a new scene: the blending copy starts fresh
+ #endif
+ 
+     if (context.record.region_clip_mode != SCE_GXM_REGION_CLIP_NONE) {
+diff --git a/vita3k/renderer/src/vulkan/context.cpp b/vita3k/renderer/src/vulkan/context.cpp
+index 21694f6..0fabca1 100644
+--- a/vita3k/renderer/src/vulkan/context.cpp
++++ b/vita3k/renderer/src/vulkan/context.cpp
+@@ -379,6 +379,7 @@ struct UwpFetchCopy {
+ std::vector<UwpFetchCopy> uwp_fetch_copies;
+ int uwp_fetch_copies_this_scene = 0;
+ int uwp_fetch_reuses_left = 0;
++int64_t uwp_fetch_bytes_this_scene = 0;
+ } // namespace
+ 
+ vkutil::Image *uwp_fetch_image(uint32_t width, uint32_t height, vk::Format format, bool create) {
+@@ -402,9 +403,11 @@ vkutil::Image *uwp_fetch_image(uint32_t width, uint32_t height, vk::Format forma
+ // draw does for the first 300 of a scene; past that (a scene that blends
+ // hundreds of times) a copy is shared by 16 draws to keep the GPU on time.
+ bool uwp_fetch_copy_needed() {
+-    if (uwp_fetch_copies_this_scene < 300 || uwp_fetch_reuses_left <= 0) {
++    // exact until 128 MB have been copied in the scene, then shared by 8 draws
++    constexpr int64_t budget = 128ll * 1024 * 1024;
++    if (uwp_fetch_bytes_this_scene < budget || uwp_fetch_reuses_left <= 0) {
+         ++uwp_fetch_copies_this_scene;
+-        uwp_fetch_reuses_left = uwp_fetch_copies_this_scene < 300 ? 0 : 16;
++        uwp_fetch_reuses_left = uwp_fetch_bytes_this_scene < budget ? 0 : 8;
+         return true;
+     }
+     --uwp_fetch_reuses_left;
+@@ -433,6 +436,7 @@ void uwp_fetch_copy(VKContext &context, vkutil::Image &copy) {
+         .extent = { std::min(source->width, copy.width), std::min(source->height, copy.height), 1 }
+     };
+     context.render_cmd.copyImage(source->image, vk::ImageLayout::eGeneral, copy.image, vk::ImageLayout::eTransferDstOptimal, region);
++    uwp_fetch_bytes_this_scene += static_cast<int64_t>(region.extent.width) * region.extent.height * 4;
+     copy.transition_to(context.render_cmd, vkutil::ImageLayout::StorageImage);
+     const vk::ImageMemoryBarrier back{
+         .srcAccessMask = vk::AccessFlagBits::eTransferRead,
+@@ -529,6 +533,7 @@ void VKContext::start_render_pass(bool create_descriptor_set, bool maskupdate) {
+ #ifdef VITA3K_UWP
+     uwp_fetch_copies_this_scene = 0;
+     uwp_fetch_reuses_left = 0;
++    uwp_fetch_bytes_this_scene = 0;
+     if (!state.features.support_shader_interlock && state.features.direct_fragcolor && current_color_base_image && record.color_surface.data) {
+         if (vkutil::Image *copy = uwp_fetch_image(current_color_base_image->width, current_color_base_image->height, current_color_format, true))
+             descr_color_info.imageView = copy->view;
