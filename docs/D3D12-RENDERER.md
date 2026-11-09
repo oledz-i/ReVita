@@ -35,8 +35,15 @@ The core's renderers implement `renderer::State` and `renderer::Context`
 
 ## Order of work
 
-1. A device shared with the presenter, a clear colour per frame, present:
-   the backend exists and can be picked.
+1. **Done (revita-next):** the backend exists and can be picked
+   (Settings, Renderer: Direct3D 12). The core asks the frontend for a
+   Direct3D 12 context (libretro's `RETRO_HW_CONTEXT_D3D12`), keeps every
+   guest command flowing (contexts, render targets, programs, notifications,
+   sync objects) and presents the display buffer from guest memory through
+   its own textures. GXM draws are accepted and dropped. Core side:
+   `scripts/core-patches/0010-d3d12-renderer-stage-1.patch`
+   (`vita3k/renderer/src/d3d12/`); frontend side:
+   `src/Vita3K.UWP/VitaD3D12Bridge.cpp`.
 2. Shaders: translation and compilation, logged per game; no drawing.
 3. Untextured draws, then textures, then render targets: 2D games first
    (Undertale), then 3D (Persona 4 Golden, Gravity Rush).

@@ -97,6 +97,7 @@
     <ClCompile Include="UwpFileRedirect.cpp"><CompileAsWinRT>false</CompileAsWinRT><LanguageStandard>stdcpp17</LanguageStandard></ClCompile>
     <ClCompile Include="CrashLog.cpp"><CompileAsWinRT>false</CompileAsWinRT><LanguageStandard>stdcpp17</LanguageStandard></ClCompile>
     <ClCompile Include="VitaVulkanBridge.cpp"><CompileAsWinRT>false</CompileAsWinRT><LanguageStandard>stdcpp17</LanguageStandard></ClCompile>
+    <ClCompile Include="VitaD3D12Bridge.cpp"><CompileAsWinRT>false</CompileAsWinRT><LanguageStandard>stdcpp17</LanguageStandard></ClCompile>
     <ClCompile Include="GlHost.cpp"><CompileAsWinRT>false</CompileAsWinRT><LanguageStandard>stdcpp17</LanguageStandard></ClCompile>
     <ClCompile Include="D3D12Host.cpp">
       <CompileAsWinRT>false</CompileAsWinRT>
@@ -109,6 +110,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="D3D12Host.h" />
+    <ClInclude Include="VitaD3D12Bridge.h" />
     <ClInclude Include="VitaLibretroHost.h" />
     <ClInclude Include="GlHost.h" />
     <ClInclude Include="GameInfo.h" />

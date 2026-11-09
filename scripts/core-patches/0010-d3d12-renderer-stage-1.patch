@@ -1,0 +1,979 @@
+diff --git a/vita3k/libretro/libretro_vita3k.cpp b/vita3k/libretro/libretro_vita3k.cpp
+index d078d8f..ffb332a 100644
+--- a/vita3k/libretro/libretro_vita3k.cpp
++++ b/vita3k/libretro/libretro_vita3k.cpp
+@@ -52,6 +52,12 @@
+ #include <renderer/gl/state.h>
+ #include <renderer/shaders.h>
+ #include <renderer/state.h>
++#ifdef VITA3K_UWP
++#include <renderer/d3d12/state.h>
++struct ID3D12Device;
++struct ID3D12CommandQueue;
++struct ID3D12Resource;
++#endif
+ #include <renderer/vulkan/state.h>
+ #include <vkutil/objects.h>
+ #include <vkutil/vkutil.h>
+@@ -1090,6 +1096,54 @@ static void context_reset_vulkan() {
+     lr_log(RETRO_LOG_INFO, "Vulkan context reset complete\n");
+ }
+ 
++#ifdef VITA3K_UWP
++// Xbox: the native Direct3D 12 renderer (experimental). The frontend's
++// interface; the same layout as libretro_d3d.h's, with the types kept opaque.
++struct uwp_retro_hw_render_interface_d3d12 {
++    enum retro_hw_render_interface_type interface_type;
++    unsigned interface_version;
++    void *handle;
++    ID3D12Device *device;
++    ID3D12CommandQueue *queue;
++    void *D3DCompile;
++    unsigned required_state;
++    void (*set_texture)(void *handle, ID3D12Resource *texture, int format);
++};
++
++static void context_reset_d3d12() {
++    lr_trace("context_reset_d3d12.enter", "renderer_ready=%d", libretro.renderer_ready ? 1 : 0);
++    const uwp_retro_hw_render_interface_d3d12 *d3d12 = nullptr;
++    if (!libretro.environ_cb(RETRO_ENVIRONMENT_GET_HW_RENDER_INTERFACE, (void **)&d3d12) || !d3d12
++        || d3d12->interface_type != RETRO_HW_RENDER_INTERFACE_D3D12) {
++        lr_log(RETRO_LOG_ERROR, "Direct3D 12: the frontend gave no Direct3D 12 interface\n");
++        return;
++    }
++    renderer::d3d12::Interface iface;
++    iface.handle = d3d12->handle;
++    iface.device = d3d12->device;
++    iface.queue = d3d12->queue;
++    iface.required_state = d3d12->required_state;
++    iface.set_texture = d3d12->set_texture;
++    renderer::d3d12::set_interface(iface);
++
++    if (libretro.emuenv) {
++        EmuEnvState &emuenv = *libretro.emuenv;
++        if (!emuenv.renderer) {
++            if (!renderer::init(libretro_frame_host(), emuenv.renderer, renderer::Backend::D3D12, emuenv.cfg, *libretro.root_paths)) {
++                lr_log(RETRO_LOG_ERROR, "Failed to create the Direct3D 12 renderer!\n");
++                return;
++            }
++            emuenv.renderer->late_init(emuenv.cfg, emuenv.io.app_path, emuenv.mem);
++            apply_renderer_config(emuenv);
++            if (!emuenv.io.title_id.empty())
++                emuenv.renderer->set_app(emuenv.io.title_id.c_str(), emuenv.self_name.c_str());
++        }
++    }
++    libretro.renderer_ready = true;
++    lr_log(RETRO_LOG_INFO, "Direct3D 12 context reset complete (experimental renderer: draws are not drawn yet)\n");
++}
++#endif
++
+ static void context_reset_opengl() {
+     lr_trace("context_reset_opengl.enter", "starting");
+     
+@@ -1246,6 +1300,42 @@ static void context_reset_finalize() {
+         libretro.emuenv && libretro.emuenv->renderer ? static_cast<void*>(libretro.emuenv->renderer.get()) : nullptr,
+         static_cast<void*>(libretro.render_thread.get()));
+ 
++#ifdef VITA3K_UWP
++    if (libretro.active_context == RETRO_HW_CONTEXT_D3D12
++        && libretro.emuenv && libretro.emuenv->renderer && !libretro.render_thread) {
++        libretro.render_thread_running = true;
++        libretro.render_thread = std::make_unique<std::thread>([]() {
++            uwp_profile::register_thread("renderer");
++            EmuEnvState &emuenv = *libretro.emuenv;
++            try {
++                while (libretro.render_thread_running.load()) {
++                    if (!emuenv.renderer)
++                        break;
++                    emuenv.renderer->should_display = false;
++                    renderer::process_batches(*emuenv.renderer, emuenv.renderer->features, emuenv.mem, emuenv.cfg);
++                    const bool overlay_flip = emuenv.renderer->async_flip_requested.exchange(false, std::memory_order_relaxed);
++                    if (emuenv.renderer->should_display || overlay_flip) {
++                        DisplayFrameInfo frame;
++                        {
++                            std::lock_guard<std::mutex> guard(emuenv.display.display_info_mutex);
++                            frame = emuenv.display.next_rendered_frame;
++                        }
++                        auto *d3d = dynamic_cast<renderer::d3d12::D3D12State *>(emuenv.renderer.get());
++                        if (d3d && frame.base && frame.image_size.x > 0 && frame.image_size.y > 0
++                            && frame.pitch >= static_cast<uint32_t>(frame.image_size.x))
++                            d3d->present_from_memory(frame.base.get(emuenv.mem), frame.pitch,
++                                static_cast<uint32_t>(frame.image_size.x), static_cast<uint32_t>(frame.image_size.y));
++                    }
++                }
++            } catch (const std::exception &e) {
++                lr_log(RETRO_LOG_ERROR, "Render thread stopped by an error: %s\n", e.what());
++            } catch (...) {
++                lr_log(RETRO_LOG_ERROR, "Render thread stopped by an unknown error\n");
++            }
++        });
++    }
++#endif
++
+     if (libretro.active_context == RETRO_HW_CONTEXT_VULKAN
+         && libretro.emuenv && libretro.emuenv->renderer && !libretro.render_thread) {
+         lr_trace("context_reset_finalize.starting_render_thread");
+@@ -1332,6 +1422,10 @@ static void context_reset() {
+ 
+     if (libretro.active_context == RETRO_HW_CONTEXT_VULKAN) {
+         context_reset_vulkan();
++#ifdef VITA3K_UWP
++    } else if (libretro.active_context == RETRO_HW_CONTEXT_D3D12) {
++        context_reset_d3d12();
++#endif
+     } else if (libretro.active_context == RETRO_HW_CONTEXT_OPENGL_CORE
+             || libretro.active_context == RETRO_HW_CONTEXT_OPENGL) {
+         context_reset_opengl();
+@@ -2066,11 +2160,36 @@ static bool try_set_hw_opengl() {
+     return true;
+ }
+ 
++#ifdef VITA3K_UWP
++static bool try_set_hw_d3d12() {
++    memset(&libretro.hw_render, 0, sizeof(libretro.hw_render));
++    libretro.hw_render.context_type = RETRO_HW_CONTEXT_D3D12;
++    libretro.hw_render.version_major = 12;
++    libretro.hw_render.version_minor = 0;
++    libretro.hw_render.context_reset = context_reset;
++    libretro.hw_render.context_destroy = context_destroy;
++    libretro.hw_render.cache_context = true;
++    libretro.hw_render.bottom_left_origin = false;
++    if (!libretro.environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &libretro.hw_render)) {
++        lr_log(RETRO_LOG_WARN, "Frontend rejected the Direct3D 12 HW context\n");
++        return false;
++    }
++    libretro.active_context = RETRO_HW_CONTEXT_D3D12;
++    return true;
++}
++#endif
++
+ static bool libretro_init_hw_render() {
+     const char *backend_option = get_core_option_value("vita3k_backend_renderer", "Vulkan");
+     const bool force_opengl = (strcmp(backend_option, "OpenGL") == 0);
+     const bool force_vulkan = (strcmp(backend_option, "Vulkan") == 0);
+ 
++#ifdef VITA3K_UWP
++    if (strcmp(backend_option, "D3D12") == 0) {
++        if (try_set_hw_d3d12()) return true;
++        if (try_set_hw_vulkan()) return true;
++    }
++#endif
+     if (force_opengl) {
+         if (try_set_hw_opengl()) return true;
+         if (try_set_hw_vulkan()) return true;
+@@ -2346,7 +2465,9 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game) {
+     libretro.cfg = std::make_unique<Config>();
+     Config &cfg = *libretro.cfg;
+     cfg.set_vita_fs_path(root.get_vita_fs_path());
+-    cfg.backend_renderer = (libretro.active_context == RETRO_HW_CONTEXT_VULKAN) ? "Vulkan" : "OpenGL";
++    cfg.backend_renderer = (libretro.active_context == RETRO_HW_CONTEXT_VULKAN) ? "Vulkan"
++        : (libretro.active_context == RETRO_HW_CONTEXT_D3D12) ? "D3D12"
++                                                              : "OpenGL";
+     cfg.audio_backend = "Libretro";
+     cfg.console = false;
+     cfg.overwrite_config = false;
+@@ -2900,6 +3021,19 @@ RETRO_API void retro_run(void) {
+     auto &vkp = libretro.vk_presentation;
+     const auto *vulkan = vkp.vulkan;
+ 
++#ifdef VITA3K_UWP
++    if (libretro.renderer_ready && libretro.active_context == RETRO_HW_CONTEXT_D3D12) {
++        uint32_t w = 0, h = 0;
++        auto *d3d = dynamic_cast<renderer::d3d12::D3D12State *>(emuenv.renderer.get());
++        if (d3d && d3d->take_frame(w, h)) {
++            report_frame_size(w, h);
++            libretro.video_cb(RETRO_HW_FRAME_BUFFER_VALID, w, h, 0);
++        } else {
++            // nothing new: the frontend shows the last frame again
++            libretro.video_cb(nullptr, 960, 544, 0);
++        }
++    } else
++#endif
+     if (libretro.renderer_ready && libretro.active_context == RETRO_HW_CONTEXT_VULKAN
+         && vulkan && vkp.num_images > 0) {
+         if (!libretro_vk_validate_functions()) {
+@@ -3366,7 +3500,7 @@ static void read_core_options() {
+     // GPU Options
+     read_core_option("vita3k_backend_renderer", "Vulkan", [](const char *value) {
+         const std::string token = normalize_option_token(value);
+-        libretro.cfg->current_config.backend_renderer = (token == "opengl") ? "OpenGL" : "Vulkan";
++        libretro.cfg->current_config.backend_renderer = (token == "opengl") ? "OpenGL" : (token == "d3d12") ? "D3D12" : "Vulkan";
+     });
+     
+     read_core_option("vita3k_resolution_multiplier", "1", [](const char *value) {
+diff --git a/vita3k/renderer/CMakeLists.txt b/vita3k/renderer/CMakeLists.txt
+index 0e40944..8f46745 100644
+--- a/vita3k/renderer/CMakeLists.txt
++++ b/vita3k/renderer/CMakeLists.txt
+@@ -55,6 +55,11 @@ if(ANDROID)
+ 	target_link_libraries(renderer PRIVATE android adrenotools)
+ endif()
+ 
++# Xbox: the native Direct3D 12 renderer (experimental)
++if(WIN32)
++	target_sources(renderer PRIVATE src/d3d12/state.cpp)
++endif()
++
+ if(APPLE)
+ 	target_sources(renderer PRIVATE src/vulkan/metal_layer.mm)
+ 	target_link_libraries(renderer PRIVATE "-framework QuartzCore" "-framework Cocoa")
+diff --git a/vita3k/renderer/include/renderer/d3d12/state.h b/vita3k/renderer/include/renderer/d3d12/state.h
+new file mode 100644
+index 0000000..2eff2c2
+--- /dev/null
++++ b/vita3k/renderer/include/renderer/d3d12/state.h
+@@ -0,0 +1,110 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++// Xbox (ReVita): the native Direct3D 12 renderer, experimental.
++//
++// Stage 1 of docs/D3D12-RENDERER.md in the ReVita repository: the backend
++// exists, can be picked, keeps every guest command flowing (contexts, render
++// targets, programs, notifications and sync objects all behave as they do on
++// the other renderers) and presents the picture the game's display buffer
++// holds in guest memory through the frontend's own Direct3D 12 device. It
++// does not draw yet: GXM draws are accepted and dropped, so a game that
++// draws with the GPU shows black, and one that writes its screen with the
++// CPU shows it.
++
++#pragma once
++
++#include <renderer/state.h>
++#include <renderer/texture_cache.h>
++#include <renderer/types.h>
++
++#include <atomic>
++#include <cstdint>
++#include <memory>
++
++struct ID3D12Device;
++struct ID3D12CommandQueue;
++struct ID3D12Resource;
++struct Config;
++
++namespace renderer::d3d12 {
++
++// What the frontend hands over (libretro's retro_hw_render_interface_d3d12)
++struct Interface {
++    void *handle = nullptr;
++    ID3D12Device *device = nullptr;
++    ID3D12CommandQueue *queue = nullptr;
++    // the state the frontend reads a texture in (D3D12_RESOURCE_STATES)
++    uint32_t required_state = 0;
++    // hands the frame to show to the frontend; format is a DXGI_FORMAT
++    void (*set_texture)(void *handle, ID3D12Resource *texture, int format) = nullptr;
++};
++// called from the libretro context reset, before renderer::init
++void set_interface(const Interface &iface);
++const Interface &get_interface();
++
++// No texture work yet: draws are dropped before anything is sampled
++class D3D12TextureCache final : public TextureCache {
++public:
++    void select(size_t index, const SceGxmTexture &texture) override {}
++    void configure_texture(const SceGxmTexture &texture) override {}
++    void upload_texture_impl(SceGxmTextureBaseFormat base_format, uint32_t width, uint32_t height, uint32_t mip_index, const void *pixels, int face, uint32_t pixels_per_stride) override {}
++    void import_configure_impl(SceGxmTextureBaseFormat base_format, uint32_t width, uint32_t height, bool is_srgb, uint16_t nb_components, uint16_t mipcount, bool swap_rb) override {}
++};
++
++struct D3D12Context : public renderer::Context {};
++struct D3D12RenderTarget : public renderer::RenderTarget {};
++
++struct D3D12State : public renderer::State {
++    D3D12State();
++    ~D3D12State() override;
++
++    D3D12TextureCache texture_cache;
++
++    bool init() override;
++    void late_init(const Config &cfg, const std::string_view game_id, MemState &mem) override;
++    TextureCache *get_texture_cache() override { return &texture_cache; }
++    void render_frame(DisplayState &display, const GxmState &gxm, MemState &mem) override;
++    void swap_window() override {}
++    std::vector<uint32_t> dump_frame(DisplayState &display, uint32_t &width, uint32_t &height) override;
++    int get_supported_filters() override;
++    void set_screen_filter(const std::string_view &filter) override {}
++    int get_max_anisotropic_filtering() override { return 1; }
++    void set_anisotropic_filtering(int anisotropic_filtering) override {}
++    int get_max_2d_texture_width() override { return 16384; }
++    std::string_view get_gpu_name() override { return "Direct3D 12 (experimental)"; }
++    void precompile_shader(const ShadersHash &hash) override {}
++    void preclose_action() override {}
++
++    // Render thread: the RGBA8 picture at pixels (pitch in pixels) into the
++    // next of three textures, which retro_run then hands to the frontend.
++    bool present_from_memory(const void *pixels, uint32_t pitch, uint32_t width, uint32_t height);
++    // retro_run: the newest finished frame, if one was made since the last
++    // call (its texture goes to the frontend through set_texture)
++    bool take_frame(uint32_t &width, uint32_t &height);
++
++    struct Impl;
++    std::unique_ptr<Impl> impl;
++};
++
++bool create(std::unique_ptr<renderer::State> &state, const Config &config);
++bool create(std::unique_ptr<renderer::Context> &context);
++bool create(std::unique_ptr<renderer::RenderTarget> &rt);
++void create(std::unique_ptr<renderer::FragmentProgram> &fp);
++void create(std::unique_ptr<renderer::VertexProgram> &vp);
++
++} // namespace renderer::d3d12
+diff --git a/vita3k/renderer/include/renderer/types.h b/vita3k/renderer/include/renderer/types.h
+index 8f012aa..1dddcb6 100644
+--- a/vita3k/renderer/include/renderer/types.h
++++ b/vita3k/renderer/include/renderer/types.h
+@@ -48,7 +48,9 @@ struct UniformSetRequest {
+ 
+ enum class Backend : uint32_t {
+     OpenGL,
+-    Vulkan
++    Vulkan,
++    // Xbox: the native Direct3D 12 renderer (experimental)
++    D3D12
+ };
+ 
+ enum class GXMState : std::uint16_t {
+diff --git a/vita3k/renderer/src/creation.cpp b/vita3k/renderer/src/creation.cpp
+index e54ed83..e4f35d6 100644
+--- a/vita3k/renderer/src/creation.cpp
++++ b/vita3k/renderer/src/creation.cpp
+@@ -23,6 +23,7 @@
+ 
+ #include <renderer/gl/functions.h>
+ #include <renderer/gl/state.h>
++#include <renderer/d3d12/state.h>
+ #include <renderer/vulkan/functions.h>
+ #include <renderer/vulkan/state.h>
+ 
+@@ -66,6 +67,10 @@ COMMAND(handle_create_context) {
+         break;
+     }
+ 
++    case Backend::D3D12:
++        result = d3d12::create(*ctx);
++        break;
++
+     default: {
+         REPORT_MISSING(renderer.current_backend);
+         break;
+@@ -112,6 +117,10 @@ COMMAND(handle_create_render_target) {
+         result = vulkan::create(dynamic_cast<vulkan::VKState &>(renderer), *render_target, *params, features);
+         break;
+ 
++    case Backend::D3D12:
++        result = d3d12::create(*render_target);
++        break;
++
+     default:
+         REPORT_MISSING(renderer.current_backend);
+         break;
+@@ -143,6 +152,9 @@ COMMAND(handle_destroy_render_target) {
+         vulkan::destroy(dynamic_cast<vulkan::VKState &>(renderer), *render_target);
+         break;
+ 
++    case Backend::D3D12:
++        break;
++
+     default:
+         REPORT_MISSING(renderer.current_backend);
+         break;
+@@ -188,6 +200,10 @@ bool create(std::unique_ptr<FragmentProgram> &fp, State &state, const SceGxmProg
+         vulkan::create(fp, dynamic_cast<vulkan::VKState &>(state), program, blend);
+         break;
+ 
++    case Backend::D3D12:
++        d3d12::create(fp);
++        break;
++
+     default:
+         REPORT_MISSING(state.current_backend);
+         return false;
+@@ -215,6 +231,10 @@ bool create(std::unique_ptr<VertexProgram> &vp, State &state, const SceGxmProgra
+         vulkan::create(vp, dynamic_cast<vulkan::VKState &>(state), program);
+         break;
+ 
++    case Backend::D3D12:
++        d3d12::create(vp);
++        break;
++
+     default:
+         REPORT_MISSING(state.current_backend);
+         return false;
+@@ -272,6 +292,14 @@ bool init(FrameHost &frame, std::unique_ptr<State> &state, Backend backend, cons
+             return false;
+         break;
+ 
++    case Backend::D3D12:
++        state = std::make_unique<d3d12::D3D12State>();
++        state->frame = &frame;
++        state->init_paths(root_paths);
++        if (!d3d12::create(state, config))
++            return false;
++        break;
++
+     default:
+         LOG_ERROR("Cannot create a renderer with unsupported backend {}.", static_cast<int>(backend));
+         return false;
+diff --git a/vita3k/renderer/src/d3d12/state.cpp b/vita3k/renderer/src/d3d12/state.cpp
+new file mode 100644
+index 0000000..1f1b247
+--- /dev/null
++++ b/vita3k/renderer/src/d3d12/state.cpp
+@@ -0,0 +1,307 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++// Xbox (ReVita): the native Direct3D 12 renderer, stage 1 (see state.h).
++
++#include <renderer/d3d12/state.h>
++
++#include <display/state.h>
++#include <util/log.h>
++
++#include <windows.h>
++
++#include <d3d12.h>
++#include <wrl/client.h>
++
++#include <cstring>
++#include <mutex>
++
++using Microsoft::WRL::ComPtr;
++
++namespace renderer::d3d12 {
++
++namespace {
++Interface g_interface;
++}
++
++void set_interface(const Interface &iface) {
++    g_interface = iface;
++}
++
++const Interface &get_interface() {
++    return g_interface;
++}
++
++struct D3D12State::Impl {
++    static constexpr int kSlots = 3;
++    ID3D12Device *device = nullptr;
++    ID3D12CommandQueue *queue = nullptr;
++    D3D12_RESOURCE_STATES required = D3D12_RESOURCE_STATE_COPY_SOURCE;
++    ComPtr<ID3D12Fence> fence;
++    HANDLE event = nullptr;
++    uint64_t fence_value = 0;
++
++    struct Slot {
++        ComPtr<ID3D12CommandAllocator> allocator;
++        ComPtr<ID3D12GraphicsCommandList> list;
++        ComPtr<ID3D12Resource> upload;
++        uint64_t upload_size = 0;
++        ComPtr<ID3D12Resource> texture;
++        uint32_t width = 0;
++        uint32_t height = 0;
++        bool fresh = true; // still in the state it was made in (copy destination)
++        uint64_t done = 0; // fence value when its last copy has finished
++    };
++    Slot slots[kSlots];
++    int next = 0;
++
++    std::mutex published_mutex;
++    int published = -1;
++    int taken = -1;
++    uint32_t published_width = 0;
++    uint32_t published_height = 0;
++    uint64_t frames = 0;
++
++    ~Impl() {
++        if (fence && event) {
++            // the queue may still copy into the textures released here
++            const uint64_t last = fence_value;
++            if (fence->GetCompletedValue() < last && SUCCEEDED(fence->SetEventOnCompletion(last, event)))
++                WaitForSingleObjectEx(event, 2000, FALSE);
++        }
++        if (event)
++            CloseHandle(event);
++    }
++};
++
++D3D12State::D3D12State()
++    : impl(std::make_unique<Impl>()) {
++}
++
++D3D12State::~D3D12State() = default;
++
++bool D3D12State::init() {
++    Impl &d = *impl;
++    const Interface &iface = get_interface();
++    d.device = iface.device;
++    d.queue = iface.queue;
++    if (!d.device || !d.queue) {
++        LOG_ERROR("Direct3D 12: the frontend gave no device or queue");
++        return false;
++    }
++    if (iface.required_state)
++        d.required = static_cast<D3D12_RESOURCE_STATES>(iface.required_state);
++    if (FAILED(d.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&d.fence)))) {
++        LOG_ERROR("Direct3D 12: CreateFence failed");
++        return false;
++    }
++    d.event = CreateEventExW(nullptr, nullptr, 0, EVENT_MODIFY_STATE | SYNCHRONIZE);
++    if (!d.event)
++        return false;
++    for (auto &slot : d.slots) {
++        if (FAILED(d.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&slot.allocator)))
++            || FAILED(d.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, slot.allocator.Get(), nullptr, IID_PPV_ARGS(&slot.list)))) {
++            LOG_ERROR("Direct3D 12: could not make a command list");
++            return false;
++        }
++        slot.list->Close();
++    }
++    texture_cache.backend = Backend::D3D12;
++    LOG_INFO("Direct3D 12 renderer (experimental): device ready. Stage 1: guest draws are not drawn yet; the display buffer in memory is shown.");
++    return true;
++}
++
++void D3D12State::late_init(const Config &cfg, const std::string_view game_id, MemState &mem) {
++}
++
++void D3D12State::render_frame(DisplayState &display, const GxmState &gxm, MemState &mem) {
++    DisplayFrameInfo frame;
++    {
++        std::lock_guard<std::mutex> guard(display.display_info_mutex);
++        frame = display.next_rendered_frame;
++    }
++    if (!frame.base || frame.image_size.x <= 0 || frame.image_size.y <= 0)
++        return;
++    present_from_memory(frame.base.get(mem), frame.pitch, static_cast<uint32_t>(frame.image_size.x), static_cast<uint32_t>(frame.image_size.y));
++}
++
++bool D3D12State::present_from_memory(const void *pixels, uint32_t pitch, uint32_t width, uint32_t height) {
++    Impl &d = *impl;
++    if (!d.device || !pixels || width == 0 || height == 0 || pitch < width)
++        return false;
++    Impl::Slot &slot = d.slots[d.next];
++
++    // the slot's last copy has to be done before its upload buffer is written
++    if (slot.done && d.fence->GetCompletedValue() < slot.done) {
++        if (SUCCEEDED(d.fence->SetEventOnCompletion(slot.done, d.event)))
++            WaitForSingleObjectEx(d.event, 2000, FALSE);
++    }
++
++    if (!slot.texture || slot.width != width || slot.height != height) {
++        D3D12_HEAP_PROPERTIES heap{};
++        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
++        D3D12_RESOURCE_DESC desc{};
++        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++        desc.Width = width;
++        desc.Height = height;
++        desc.DepthOrArraySize = 1;
++        desc.MipLevels = 1;
++        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++        desc.SampleDesc.Count = 1;
++        desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
++        slot.texture.Reset();
++        if (FAILED(d.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&slot.texture)))) {
++            LOG_ERROR("Direct3D 12: could not make a {}x{} frame texture", width, height);
++            return false;
++        }
++        slot.width = width;
++        slot.height = height;
++        slot.fresh = true;
++    }
++
++    const D3D12_RESOURCE_DESC desc = slot.texture->GetDesc();
++    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
++    UINT64 total = 0;
++    d.device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, &total);
++    if (!slot.upload || slot.upload_size < total) {
++        D3D12_HEAP_PROPERTIES heap{};
++        heap.Type = D3D12_HEAP_TYPE_UPLOAD;
++        D3D12_RESOURCE_DESC buffer{};
++        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
++        buffer.Width = total;
++        buffer.Height = 1;
++        buffer.DepthOrArraySize = 1;
++        buffer.MipLevels = 1;
++        buffer.Format = DXGI_FORMAT_UNKNOWN;
++        buffer.SampleDesc.Count = 1;
++        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++        slot.upload.Reset();
++        if (FAILED(d.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&slot.upload)))) {
++            LOG_ERROR("Direct3D 12: could not make an upload buffer of {} bytes", total);
++            return false;
++        }
++        slot.upload_size = total;
++    }
++
++    void *mapped = nullptr;
++    const D3D12_RANGE nothing_read{ 0, 0 };
++    if (FAILED(slot.upload->Map(0, &nothing_read, &mapped)))
++        return false;
++    const auto *src = static_cast<const uint8_t *>(pixels);
++    auto *dst = static_cast<uint8_t *>(mapped) + footprint.Offset;
++    for (uint32_t y = 0; y < height; ++y)
++        std::memcpy(dst + static_cast<size_t>(y) * footprint.Footprint.RowPitch, src + static_cast<size_t>(y) * pitch * 4, static_cast<size_t>(width) * 4);
++    slot.upload->Unmap(0, nullptr);
++
++    slot.allocator->Reset();
++    slot.list->Reset(slot.allocator.Get(), nullptr);
++    D3D12_RESOURCE_BARRIER barrier{};
++    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    barrier.Transition.pResource = slot.texture.Get();
++    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    if (!slot.fresh && d.required != D3D12_RESOURCE_STATE_COPY_DEST) {
++        barrier.Transition.StateBefore = d.required;
++        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
++        slot.list->ResourceBarrier(1, &barrier);
++    }
++    D3D12_TEXTURE_COPY_LOCATION to{};
++    to.pResource = slot.texture.Get();
++    to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++    to.SubresourceIndex = 0;
++    D3D12_TEXTURE_COPY_LOCATION from{};
++    from.pResource = slot.upload.Get();
++    from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++    from.PlacedFootprint = footprint;
++    slot.list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
++    if (d.required != D3D12_RESOURCE_STATE_COPY_DEST) {
++        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
++        barrier.Transition.StateAfter = d.required;
++        slot.list->ResourceBarrier(1, &barrier);
++    }
++    slot.fresh = false;
++    if (FAILED(slot.list->Close()))
++        return false;
++    ID3D12CommandList *lists[] = { slot.list.Get() };
++    d.queue->ExecuteCommandLists(1, lists);
++    slot.done = ++d.fence_value;
++    d.queue->Signal(d.fence.Get(), slot.done);
++
++    {
++        std::lock_guard<std::mutex> guard(d.published_mutex);
++        d.published = d.next;
++        d.published_width = width;
++        d.published_height = height;
++    }
++    d.next = (d.next + 1) % Impl::kSlots;
++    if (++d.frames == 1)
++        LOG_INFO("Direct3D 12: first frame ({}x{}) on its way to the screen", width, height);
++    return true;
++}
++
++bool D3D12State::take_frame(uint32_t &width, uint32_t &height) {
++    Impl &d = *impl;
++    const Interface &iface = get_interface();
++    int index;
++    {
++        std::lock_guard<std::mutex> guard(d.published_mutex);
++        if (d.published < 0)
++            return false;
++        index = d.published;
++        width = d.published_width;
++        height = d.published_height;
++        d.taken = index;
++    }
++    if (!iface.set_texture || !d.slots[index].texture)
++        return false;
++    iface.set_texture(iface.handle, d.slots[index].texture.Get(), DXGI_FORMAT_R8G8B8A8_UNORM);
++    return true;
++}
++
++std::vector<uint32_t> D3D12State::dump_frame(DisplayState &display, uint32_t &width, uint32_t &height) {
++    width = 0;
++    height = 0;
++    return {};
++}
++
++int D3D12State::get_supported_filters() {
++    return 0;
++}
++
++bool create(std::unique_ptr<renderer::State> &state, const Config &config) {
++    state->res_multiplier = 1.0f;
++    return state->init();
++}
++
++bool create(std::unique_ptr<renderer::Context> &context) {
++    context = std::make_unique<D3D12Context>();
++    return true;
++}
++
++bool create(std::unique_ptr<renderer::RenderTarget> &rt) {
++    rt = std::make_unique<D3D12RenderTarget>();
++    return true;
++}
++
++void create(std::unique_ptr<renderer::FragmentProgram> &fp) {
++    fp = std::make_unique<renderer::FragmentProgram>();
++}
++
++void create(std::unique_ptr<renderer::VertexProgram> &vp) {
++    vp = std::make_unique<renderer::VertexProgram>();
++}
++
++} // namespace renderer::d3d12
+diff --git a/vita3k/renderer/src/renderer.cpp b/vita3k/renderer/src/renderer.cpp
+index b4b3501..59f6baa 100644
+--- a/vita3k/renderer/src/renderer.cpp
++++ b/vita3k/renderer/src/renderer.cpp
+@@ -333,6 +333,9 @@ void destroy_render_target_during_shutdown(State &state, std::unique_ptr<RenderT
+     case Backend::Vulkan:
+         vulkan::destroy(dynamic_cast<vulkan::VKState &>(state), rt);
+         break;
++    case Backend::D3D12:
++        break;
++
+     }
+ 
+     rt.reset();
+diff --git a/vita3k/renderer/src/scene.cpp b/vita3k/renderer/src/scene.cpp
+index b445738..9eb08ec 100644
+--- a/vita3k/renderer/src/scene.cpp
++++ b/vita3k/renderer/src/scene.cpp
+@@ -89,6 +89,9 @@ COMMAND(handle_set_context) {
+         vulkan::set_context(*reinterpret_cast<vulkan::VKContext *>(render_context), mem, reinterpret_cast<vulkan::VKRenderTarget *>(rt), features);
+         break;
+ 
++    case Backend::D3D12:
++        break;
++
+     default:
+         REPORT_MISSING(renderer.current_backend);
+         break;
+@@ -147,7 +150,7 @@ COMMAND(handle_sync_surface_data) {
+     if (renderer.current_backend == Backend::OpenGL && static_cast<int>(renderer.res_multiplier * 4.0f) % 4 != 0)
+         renderer.disable_surface_sync = true;
+ 
+-    if (renderer.disable_surface_sync || renderer.current_backend == Backend::Vulkan) {
++    if (renderer.disable_surface_sync || renderer.current_backend == Backend::Vulkan || renderer.current_backend == Backend::D3D12) {
+         if (helper.cmd->status) {
+             complete_command(renderer, helper, 0);
+         }
+@@ -179,6 +182,9 @@ COMMAND(handle_sync_surface_data) {
+     case Backend::Vulkan:
+         break;
+ 
++    case Backend::D3D12:
++        break;
++
+     default:
+         REPORT_MISSING(renderer.current_backend);
+         break;
+@@ -239,6 +245,9 @@ COMMAND(handle_draw) {
+             count, instance_count, mem, config);
+         break;
+ 
++    case Backend::D3D12:
++        break;
++
+     default:
+         REPORT_MISSING(renderer.current_backend);
+         break;
+diff --git a/vita3k/renderer/src/state_set.cpp b/vita3k/renderer/src/state_set.cpp
+index e983487..217bc14 100644
+--- a/vita3k/renderer/src/state_set.cpp
++++ b/vita3k/renderer/src/state_set.cpp
+@@ -69,6 +69,9 @@ COMMAND_SET_STATE(region_clip) {
+         vulkan::sync_clipping(*static_cast<vulkan::VKContext *>(render_context));
+         break;
+ 
++    case Backend::D3D12:
++        break;
++
+     default:
+         REPORT_MISSING(renderer.current_backend);
+         break;
+@@ -94,6 +97,9 @@ COMMAND_SET_STATE(program) {
+         case Backend::Vulkan:
+             break;
+ 
++        case Backend::D3D12:
++            break;
++
+         default:
+             REPORT_MISSING(renderer.current_backend);
+             break;
+@@ -128,6 +134,9 @@ COMMAND_SET_STATE(uniform_buffer) {
+         vulkan::set_uniform_buffer(*reinterpret_cast<vulkan::VKContext *>(render_context), mem, program, is_vertex, block_num, size, data);
+         break;
+ 
++    case Backend::D3D12:
++        break;
++
+     default:
+         REPORT_MISSING(renderer.current_backend);
+         return;
+@@ -185,6 +194,9 @@ COMMAND_SET_STATE(viewport) {
+             vulkan::sync_viewport_real(*reinterpret_cast<vulkan::VKContext *>(render_context), xOffset, yOffset, zOffset, xScale, yScale, zScale);
+             break;
+ 
++        case Backend::D3D12:
++            break;
++
+         default:
+             REPORT_MISSING(renderer.current_backend);
+             break;
+@@ -206,6 +218,9 @@ COMMAND_SET_STATE(viewport) {
+             vulkan::sync_viewport_flat(*reinterpret_cast<vulkan::VKContext *>(render_context));
+             break;
+ 
++        case Backend::D3D12:
++            break;
++
+         default:
+             REPORT_MISSING(renderer.current_backend);
+             break;
+@@ -225,6 +240,9 @@ COMMAND_SET_STATE(viewport) {
+             vulkan::sync_clipping(*reinterpret_cast<vulkan::VKContext *>(render_context));
+             break;
+ 
++        case Backend::D3D12:
++            break;
++
+         default:
+             REPORT_MISSING(renderer.current_backend);
+             break;
+@@ -252,6 +270,9 @@ COMMAND_SET_STATE(depth_bias) {
+             vulkan::sync_depth_bias(*reinterpret_cast<vulkan::VKContext *>(render_context));
+         break;
+ 
++    case Backend::D3D12:
++        break;
++
+     default:
+         REPORT_MISSING(renderer.current_backend);
+         break;
+@@ -278,6 +299,9 @@ COMMAND_SET_STATE(depth_func) {
+         vulkan::refresh_pipeline(*reinterpret_cast<vulkan::VKContext *>(render_context));
+         break;
+ 
++    case Backend::D3D12:
++        break;
++
+     default:
+         REPORT_MISSING(renderer.current_backend);
+         break;
+@@ -303,6 +327,9 @@ COMMAND_SET_STATE(depth_write_enable) {
+         vulkan::refresh_pipeline(*reinterpret_cast<vulkan::VKContext *>(render_context));
+         break;
+ 
++    case Backend::D3D12:
++        break;
++
+     default:
+         REPORT_MISSING(renderer.current_backend);
+         break;
+@@ -327,6 +354,9 @@ COMMAND_SET_STATE(polygon_mode) {
+         vulkan::refresh_pipeline(*reinterpret_cast<vulkan::VKContext *>(render_context));
+         break;
+ 
++    case Backend::D3D12:
++        break;
++
+     default:
+         REPORT_MISSING(renderer.current_backend);
+         break;
+@@ -349,6 +379,9 @@ COMMAND_SET_STATE(point_line_width) {
+         vulkan::sync_point_line_width(*reinterpret_cast<vulkan::VKContext *>(render_context), is_front);
+         break;
+ 
++    case Backend::D3D12:
++        break;
++
+     default:
+         REPORT_MISSING(renderer.current_backend);
+         break;
+@@ -390,6 +423,9 @@ COMMAND_SET_STATE(stencil_func) {
+         vulkan::sync_stencil_func(dynamic_cast<vulkan::VKContext &>(*render_context), !is_front);
+         break;
+ 
++    case Backend::D3D12:
++        break;
++
+     default:
+         REPORT_MISSING(renderer.current_backend);
+         break;
+@@ -415,6 +451,9 @@ COMMAND_SET_STATE(stencil_ref) {
+         vulkan::sync_stencil_func(dynamic_cast<vulkan::VKContext &>(*render_context), !is_front);
+         break;
+ 
++    case Backend::D3D12:
++        break;
++
+     default:
+         REPORT_MISSING(renderer.current_backend);
+         break;
+@@ -437,6 +476,9 @@ COMMAND_SET_STATE(texture) {
+             config);
+         break;
+ 
++    case Backend::D3D12:
++        break;
++
+     default:
+         REPORT_MISSING(renderer.current_backend);
+         break;
+@@ -460,6 +502,9 @@ COMMAND_SET_STATE(two_sided) {
+         vulkan::sync_stencil_func(dynamic_cast<vulkan::VKContext &>(*render_context), true);
+         break;
+ 
++    case Backend::D3D12:
++        break;
++
+     default:
+         REPORT_MISSING(renderer.current_backend);
+         break;
+@@ -479,6 +524,9 @@ COMMAND_SET_STATE(cull_mode) {
+         vulkan::refresh_pipeline(*reinterpret_cast<vulkan::VKContext *>(render_context));
+         break;
+ 
++    case Backend::D3D12:
++        break;
++
+     default:
+         REPORT_MISSING(renderer.current_backend);
+         break;
+diff --git a/vita3k/renderer/src/sync.cpp b/vita3k/renderer/src/sync.cpp
+index 684c12c..2d881be 100644
+--- a/vita3k/renderer/src/sync.cpp
++++ b/vita3k/renderer/src/sync.cpp
+@@ -86,6 +86,9 @@ COMMAND(handle_set_screen_filter) {
+     case Backend::Vulkan:
+         dynamic_cast<vulkan::VKState &>(renderer).screen_renderer.set_filter(*filter);
+         break;
++    case Backend::D3D12:
++        break;
++
+     }
+ }
+ 

@@ -374,6 +374,8 @@ void VitaLibretroHost::UnloadGame() {
     // Vulkan allocations. Its shared device must remain alive until it returns.
     if (gameLoaded_ && unloadGame_) unloadGame_();
     vulkan_.Shutdown();
+    d3d12_.Shutdown();
+    d3dMode_ = false;
     StopOpenGL();
     gameLoaded_ = false;
     sampleBuffer_.clear();
@@ -436,6 +438,19 @@ bool VitaLibretroHost::LoadGame(const std::string& readableContentPath, std::wst
         Log(1, "Renderer: OpenGL (Mesa OpenGL on D3D12); the context is made when the game starts.\n");
         vita3k_uwp::ReassertCrashLog();
         detail = L"Vita3K retro_load_game returned true (OpenGL).";
+        return true;
+    }
+    if (d3dMode_) {
+        std::string d3dError;
+        if (!d3d12_.Initialize(d3dError)) {
+            Log(3, "Direct3D 12 renderer could not start: %s\n", d3dError.c_str());
+            detail = L"Direct3D 12 renderer could not start: " + FromUtf8(d3dError.c_str());
+            UnloadGame();
+            return false;
+        }
+        Log(1, "Renderer: Direct3D 12 (native, experimental: the game runs, its GPU drawing is not shown yet).\n");
+        vita3k_uwp::ReassertCrashLog();
+        detail = L"Vita3K retro_load_game returned true (Direct3D 12, experimental).";
         return true;
     }
     std::string vulkanError;
@@ -784,12 +799,24 @@ bool __cdecl VitaLibretroHost::Environment(unsigned cmd, void* data) {
             return true;
         }
         host->glMode_ = false;
+        if (callback->context_type == RETRO_HW_CONTEXT_D3D12) {
+            host->d3dMode_ = host->d3d12_.Accept(callback);
+            host->unsupportedVideo_ = !host->d3dMode_;
+            return host->d3dMode_;
+        }
+        host->d3dMode_ = false;
         host->unsupportedVideo_ = !host->vulkan_.Accept(callback);
         return !host->unsupportedVideo_;
     }
     case RETRO_ENVIRONMENT_SET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE:
         return host->vulkan_.Negotiate(static_cast<const retro_hw_render_context_negotiation_interface_vulkan*>(data));
     case RETRO_ENVIRONMENT_GET_HW_RENDER_INTERFACE: {
+        if (host->d3dMode_) {
+            const auto d3d = host->d3d12_.Interface();
+            if (!d3d) return false;
+            *static_cast<const VitaD3D12Interface**>(data) = d3d;
+            return true;
+        }
         auto api = host->vulkan_.Interface();
         if (!api) return false;
         *static_cast<const retro_hw_render_interface_vulkan**>(data) = api;
@@ -838,6 +865,16 @@ void __cdecl VitaLibretroHost::Video(
         return;
     }
     std::string error;
+    if (active_->d3dMode_) {
+        if (active_->d3d12_.Present(width, height, error)) {
+            if (!active_->framePresented_.exchange(true))
+                Log(1, "First core video frame presented: %u x %u (Direct3D 12, experimental).\n", width, height);
+        } else if (!error.empty()) {
+            static std::atomic<unsigned> d3dFailures{0};
+            if (++d3dFailures <= 5) Log(3, "Direct3D 12 frame readback failed: %s\n", error.c_str());
+        }
+        return;
+    }
     if (active_->vulkan_.Present(width, height, error)) {
         if (!active_->framePresented_.exchange(true))
             Log(1, "First core video frame presented: %u x %u (%s).\n", width, height, active_->vulkan_.ReadbackInfo().c_str());
@@ -1012,7 +1049,7 @@ void VitaLibretroHost::WriteDiagnostics(const char* when) {
         out += "Vita3K for Xbox - diagnostics (written " + std::string(when) + ")\n";
         out += "App build: " + (buildLabel_.empty() ? std::string("unknown") : buildLabel_) + "\n";
         out += "Game: " + diag_.game + "\n";
-        out += std::string("Renderer: ") + (glMode_ ? "OpenGL (" + gl_.Description() + ")" : "Vulkan (Dozen, Vulkan on Direct3D 12)") + "\n";
+        out += std::string("Renderer: ") + (glMode_ ? "OpenGL (" + gl_.Description() + ")" : d3dMode_ ? std::string("Direct3D 12 (native, experimental)") : "Vulkan (Dozen, Vulkan on Direct3D 12)") + "\n";
         std::snprintf(line, sizeof(line), "Played: %.1f min, %llu frames shown, first frame after %.1f s, worst frame %.1f ms\n",
             (tick - diag_.startTick) / 60000.0, diag_.frames, diag_.firstFrameMs / 1000.0, diag_.worstFrameMs);
         out += line;

@@ -17,6 +17,7 @@
 #include <Xinput.h>
 #include "CoreAudio.h"
 #include "VitaVulkanBridge.h"
+#include "VitaD3D12Bridge.h"
 #include "GlHost.h"
 
 class VitaLibretroHost final {
@@ -55,7 +56,7 @@ public:
     void SetMenuSink(std::function<void()> sink) { std::lock_guard<std::mutex> guard(menuMutex_); menuSink_ = std::move(sink); }
     void SetPaused(bool paused) { paused_.store(paused); }
     bool Paused() const { return paused_.load(); }
-    void SetFrameSink(VitaVulkanBridge::FrameSink sink) { vulkan_.sink = std::move(sink); }
+    void SetFrameSink(VitaVulkanBridge::FrameSink sink) { d3d12_.sink = sink; vulkan_.sink = std::move(sink); }
     // Which renderer the running game uses ("Vulkan" or "OpenGL"), and the GPU
     // and driver behind OpenGL once its context exists.
     bool UsingOpenGL() const { return glMode_; }
@@ -169,6 +170,9 @@ private:
     std::atomic<bool> framePresented_{false};
     std::thread runThread_;
     VitaVulkanBridge vulkan_;
+    // the core's native Direct3D 12 renderer (experimental)
+    VitaD3D12Bridge d3d12_;
+    bool d3dMode_ = false;
     // OpenGL (onyx_gl.dll): chosen when the core asks for a GL context. The
     // context lives on the emulation thread; the core's context_reset runs
     // there before the first frame.
