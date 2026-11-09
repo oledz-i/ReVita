@@ -1,0 +1,111 @@
+diff --git a/vita3k/renderer/src/gl/compile_program.cpp b/vita3k/renderer/src/gl/compile_program.cpp
+index 4630928..bd48cf7 100644
+--- a/vita3k/renderer/src/gl/compile_program.cpp
++++ b/vita3k/renderer/src/gl/compile_program.cpp
+@@ -26,10 +26,14 @@
+ 
+ #include <shader/spirv_recompiler.h>
+ 
++#include <chrono>
+ #include <iomanip>
+ #include <vector>
+ 
+ namespace renderer::gl {
++#ifdef VITA3K_UWP
++bool uwp_program_deferred = false;
++#endif
+ static SharedGLObject compile_glsl(GLenum type, const std::string &source) {
+     R_PROFILE(__func__);
+ 
+@@ -262,6 +266,24 @@ SharedGLObject compile_program(GLState &renderer, GLContext &context, const GxmR
+ 
+     // No... It doesn't exist. Now we try to find each object. If it doesn't exist then we can kind
+     // of compile it again.
++#ifdef VITA3K_UWP
++    // A program met for the first time costs ~50 ms on the console's OpenGL
++    // (the driver builds it for Direct3D 12 there and then). A burst of new
++    // ones froze the game for seconds at a time. Now about one is built per
++    // frame; a draw whose program waits its turn is skipped until then.
++    static auto uwp_window = std::chrono::steady_clock::now();
++    static double uwp_spent_ms = 0.0;
++    const auto uwp_start = std::chrono::steady_clock::now();
++    if (uwp_start - uwp_window > std::chrono::milliseconds(33)) {
++        uwp_window = uwp_start;
++        uwp_spent_ms = 0.0;
++    }
++    if (uwp_spent_ms >= 24.0) {
++        uwp_program_deferred = true;
++        return SharedGLObject();
++    }
++    uwp_program_deferred = false;
++#endif
+ 
+     // update the hints
+     context.shader_hints.color_format = state.color_surface.colorFormat;
+@@ -284,6 +306,9 @@ SharedGLObject compile_program(GLState &renderer, GLContext &context, const GxmR
+     }
+ 
+     SharedGLObject program = compile_program(renderer.program_cache, fragment_shader, vertex_shader, hashes);
++#ifdef VITA3K_UWP
++    uwp_spent_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - uwp_start).count();
++#endif
+ 
+     // Save shader cache haches
+     const auto shader_cache_hash_index = get_shaders_hash_index(renderer.shaders_cache_hashs, fragment_program.hash, vertex_program.hash);
+diff --git a/vita3k/renderer/src/gl/draw.cpp b/vita3k/renderer/src/gl/draw.cpp
+index 3668524..c708908 100644
+--- a/vita3k/renderer/src/gl/draw.cpp
++++ b/vita3k/renderer/src/gl/draw.cpp
+@@ -162,7 +162,13 @@ void draw(GLState &renderer, GLContext &context, const FeatureState &features, S
+         // Need to recompile!
+         SharedGLObject program = gl::compile_program(renderer, context, context.record, features, mem, config.shader_cache, config.spirv_shader, gxm_fragment_program.is_maskupdate);
+ 
++#ifdef VITA3K_UWP
++        // a program waiting for its turn to compile is not a failure
++        extern bool uwp_program_deferred;
++        LOG_ERROR_IF(!program && !uwp_program_deferred, "Fail to get program!");
++#else
+         LOG_ERROR_IF(!program, "Fail to get program!");
++#endif
+ 
+         // Use it
+         program_id = program ? (*program).get() : 0;
+@@ -185,6 +191,11 @@ void draw(GLState &renderer, GLContext &context, const FeatureState &features, S
+         // bindings reads the wrong resources (garbage at best, a GPU fault on
+         // the console at worst), so this draw is skipped
+         static bool logged = false;
++#ifdef VITA3K_UWP
++        extern bool uwp_program_deferred;
++        if (uwp_program_deferred)
++            return;
++#endif
+         LOG_ERROR_IF(!logged, "OpenGL: a draw's shader program failed; such draws are skipped");
+         logged = true;
+         return;
+diff --git a/vita3k/renderer/src/shaders.cpp b/vita3k/renderer/src/shaders.cpp
+index 59e3c0f..ec9f661 100644
+--- a/vita3k/renderer/src/shaders.cpp
++++ b/vita3k/renderer/src/shaders.cpp
+@@ -87,6 +87,22 @@ bool get_shaders_cache_hashs(State &renderer) {
+ }
+ 
+ void save_shaders_cache_hashs(State &renderer, std::vector<ShadersHash> &shaders_cache_hashs) {
++#ifdef VITA3K_UWP
++    // The whole list was written to disk again for every new program, on the
++    // thread that draws; in a burst of new programs that was a write per
++    // draw. Now at most every two seconds (or every 64 new programs).
++    {
++        static auto last_write = std::chrono::steady_clock::time_point{};
++        static size_t last_size = 0;
++        const auto now = std::chrono::steady_clock::now();
++        if (shaders_cache_hashs.size() < last_size)
++            last_size = 0;
++        if (last_size != 0 && now - last_write < std::chrono::seconds(2) && shaders_cache_hashs.size() - last_size < 64)
++            return;
++        last_write = now;
++        last_size = shaders_cache_hashs.size();
++    }
++#endif
+     fs::create_directories(renderer.shaders_path);
+     std::string hash_file_name = fmt::format("hashs-{}.dat", (renderer.current_backend == Backend::OpenGL) ? "gl" : "vk");
+     std::ofstream shaders_hashs(renderer.shaders_path / hash_file_name, std::ios::out | std::ios::binary);
