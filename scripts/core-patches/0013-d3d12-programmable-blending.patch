@@ -1,0 +1,229 @@
+diff --git a/vita3k/renderer/src/d3d12/draw.cpp b/vita3k/renderer/src/d3d12/draw.cpp
+index f725c9d..5035a1c 100644
+--- a/vita3k/renderer/src/d3d12/draw.cpp
++++ b/vita3k/renderer/src/d3d12/draw.cpp
+@@ -26,8 +26,9 @@
+ //   the way SPIRV-Cross numbers the Vulkan translator's bindings (set N is
+ //   register space N).
+ // - fixed-function blending from the fragment program, depth test and write,
+-//   no stencil, no culling (both faces drawn), no mask bit, no programmable
+-//   blending (a fragment shader reading the target gets nothing to read).
++//   no stencil, no culling (both faces drawn), no mask bit.
++// - programmable blending: a shader reading the target reads a copy of it
++//   made before the draw (exact up to a byte budget per frame, then shared).
+ // - textures through the shared texture cache, and render targets sampled
+ //   as textures when a texture points at one.
+ // - vertex, index and uniform data copied each draw into upload memory,
+@@ -73,6 +74,9 @@ constexpr uint32_t kSamplerSegments = 4;
+ constexpr uint32_t kSamplerSegmentSize = 512;
+ constexpr uint32_t kLists = 4;
+ constexpr uint32_t kUnits = SCE_GXM_MAX_TEXTURE_UNITS;
++// programmable blending: exact copies of the target until this many bytes
++// were copied since the last present, then one copy shared by 8 draws
++constexpr uint64_t kFetchBudget = 128ull << 20;
+ 
+ // Root signature slots
+ enum RootParam : UINT {
+@@ -84,6 +88,7 @@ enum RootParam : UINT {
+     RootVertexSamplers, // s0-15 space2
+     RootFragmentTextures, // t0-15 space3
+     RootFragmentSamplers, // s0-15 space3
++    RootFetch, // t0 space1: a copy of the render target, for shaders that read it
+     RootCount
+ };
+ 
+@@ -359,7 +364,8 @@ struct Drawer {
+     ComPtr<ID3D12DescriptorHeap> dsvs;
+     uint32_t rtv_size = 0;
+     uint32_t dsv_size = 0;
+-    static constexpr uint32_t kNullView = TextureCacheSize + kMaxTargets;
++    static constexpr uint32_t kFetchViews = TextureCacheSize + kMaxTargets; // one per target
++    static constexpr uint32_t kNullView = kFetchViews + kMaxTargets;
+     static constexpr uint32_t kNullCubeView = kNullView + 1;
+ 
+     ComPtr<ID3D12RootSignature> root;
+@@ -389,6 +395,11 @@ struct Drawer {
+         uint64_t last_draw = 0; // presents counter at its last draw
+         bool clear_depth = false;
+         float clear_value = 1.0f;
++        // what shaders reading the target read: a copy made before the draw
++        ComPtr<ID3D12Resource> fetch;
++        D3D12_RESOURCE_STATES fetch_state = D3D12_RESOURCE_STATE_COPY_DEST;
++        bool fetch_stale = true; // drawn to since the copy
++        uint32_t fetch_shared = 0; // draws that used the copy past the budget
+     };
+     std::unordered_map<uint32_t, Target> targets;
+     std::vector<bool> target_index_used = std::vector<bool>(kMaxTargets, false);
+@@ -401,6 +412,8 @@ struct Drawer {
+ 
+     uint64_t draws = 0;
+     uint64_t dropped = 0;
++    uint64_t fetch_bytes = 0; // copied for programmable blending since the last present
++    uint64_t fetch_copies = 0;
+ 
+     ~Drawer() {
+         wait_idle();
+@@ -634,7 +647,7 @@ bool Drawer::init(ID3D12Device *dev, ID3D12CommandQueue *q) {
+     device->CreateShaderResourceView(nullptr, &null_view, cpu_view(kNullCubeView));
+ 
+     // the root signature every draw uses
+-    D3D12_DESCRIPTOR_RANGE ranges[4]{};
++    D3D12_DESCRIPTOR_RANGE ranges[5]{};
+     for (int i = 0; i < 4; i++) {
+         ranges[i].RangeType = (i % 2 == 0) ? D3D12_DESCRIPTOR_RANGE_TYPE_SRV : D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+         ranges[i].NumDescriptors = kUnits;
+@@ -657,6 +670,13 @@ bool Drawer::init(ID3D12Device *dev, ID3D12CommandQueue *q) {
+         p.DescriptorTable.NumDescriptorRanges = 1;
+         p.DescriptorTable.pDescriptorRanges = &ranges[i];
+     }
++    ranges[4].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
++    ranges[4].NumDescriptors = 1;
++    ranges[4].BaseShaderRegister = 0;
++    ranges[4].RegisterSpace = 1;
++    params[RootFetch].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++    params[RootFetch].DescriptorTable.NumDescriptorRanges = 1;
++    params[RootFetch].DescriptorTable.pDescriptorRanges = &ranges[4];
+     for (auto &p : params)
+         p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+     D3D12_ROOT_SIGNATURE_DESC desc{};
+@@ -682,6 +702,7 @@ Drawer::Target *Drawer::get_target(uint32_t address, uint32_t width, uint32_t he
+     if (it != targets.end() && (it->second.width != width || it->second.height != height)) {
+         retire(it->second.color);
+         retire(it->second.depth);
++        retire(it->second.fetch);
+         target_index_used[it->second.index] = false;
+         targets.erase(it);
+         it = targets.end();
+@@ -701,6 +722,7 @@ Drawer::Target *Drawer::get_target(uint32_t address, uint32_t width, uint32_t he
+             return nullptr;
+         retire(oldest->second.color);
+         retire(oldest->second.depth);
++        retire(oldest->second.fetch);
+         target_index_used[oldest->second.index] = false;
+         targets.erase(oldest);
+     }
+@@ -754,6 +776,10 @@ Drawer::Target *Drawer::get_target(uint32_t address, uint32_t width, uint32_t he
+     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+     srv.Texture2D.MipLevels = 1;
+     device->CreateShaderResourceView(t.color.Get(), &srv, cpu_view(TextureCacheSize + t.index));
++    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++    desc.Flags = D3D12_RESOURCE_FLAG_NONE;
++    if (SUCCEEDED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&t.fetch))))
++        device->CreateShaderResourceView(t.fetch.Get(), &srv, cpu_view(kFetchViews + t.index));
+ 
+     // a new target starts black, as the GPU would find fresh memory on the console
+     if (ensure_list()) {
+@@ -1390,7 +1416,7 @@ void draw(D3D12State &state, renderer::Context &ctx, SceGxmPrimitiveType type, S
+     }
+ 
+     // texture tables
+-    const uint32_t first_view = d.allocate_views(2 * kUnits);
++    const uint32_t first_view = d.allocate_views(2 * kUnits + 1);
+     if (first_view == ~0u) {
+         d.dropped++;
+         return;
+@@ -1421,6 +1447,14 @@ void draw(D3D12State &state, renderer::Context &ctx, SceGxmPrimitiveType type, S
+             d.device->CopyDescriptorsSimple(1, dst, d.cpu_view(source), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+         }
+     }
++    // programmable blending: the shader reads a copy of the target (Direct3D
++    // cannot read the target it draws to)
++    const bool reads_target = ps && !fragment_program->is_maskupdate && fragment_gxp->is_frag_color_used() && target.fetch;
++    {
++        D3D12_CPU_DESCRIPTOR_HANDLE dst = d.views->GetCPUDescriptorHandleForHeapStart();
++        dst.ptr += static_cast<SIZE_T>(first_view + 2 * kUnits) * d.view_size;
++        d.device->CopyDescriptorsSimple(1, dst, d.cpu_view(reads_target ? Drawer::kFetchViews + target.index : Drawer::kNullView), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++    }
+     const uint32_t vertex_samplers = d.sampler_table(vertex_sampler_keys);
+     const uint32_t fragment_samplers = d.sampler_table(fragment_sampler_keys);
+     if (vertex_samplers == ~0u || fragment_samplers == ~0u) {
+@@ -1441,6 +1475,23 @@ void draw(D3D12State &state, renderer::Context &ctx, SceGxmPrimitiveType type, S
+     }
+     for (Drawer::Target *t : sampled)
+         d.transition(t->color.Get(), t->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++    if (reads_target) {
++        const uint64_t bytes = static_cast<uint64_t>(target.width) * target.height * 4;
++        bool copy = target.fetch_stale;
++        if (copy && d.fetch_bytes + bytes > kFetchBudget) {
++            // past the budget: refresh the copy every 8th draw
++            copy = (++target.fetch_shared % 8) == 0;
++        }
++        if (copy) {
++            d.transition(target.color.Get(), target.state, D3D12_RESOURCE_STATE_COPY_SOURCE);
++            d.transition(target.fetch.Get(), target.fetch_state, D3D12_RESOURCE_STATE_COPY_DEST);
++            list->CopyResource(target.fetch.Get(), target.color.Get());
++            target.fetch_stale = false;
++            d.fetch_bytes += bytes;
++            d.fetch_copies++;
++        }
++        d.transition(target.fetch.Get(), target.fetch_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
++    }
+     d.transition(target.color.Get(), target.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+ 
+     D3D12_CPU_DESCRIPTOR_HANDLE rtv = d.rtvs->GetCPUDescriptorHandleForHeapStart();
+@@ -1486,6 +1537,9 @@ void draw(D3D12State &state, renderer::Context &ctx, SceGxmPrimitiveType type, S
+     sampler_handle = d.samplers->GetGPUDescriptorHandleForHeapStart();
+     sampler_handle.ptr += static_cast<UINT64>(fragment_samplers) * d.sampler_size;
+     list->SetGraphicsRootDescriptorTable(RootFragmentSamplers, sampler_handle);
++    D3D12_GPU_DESCRIPTOR_HANDLE fetch_handle = d.views->GetGPUDescriptorHandleForHeapStart();
++    fetch_handle.ptr += static_cast<UINT64>(first_view + 2 * kUnits) * d.view_size;
++    list->SetGraphicsRootDescriptorTable(RootFetch, fetch_handle);
+ 
+     D3D12_INDEX_BUFFER_VIEW ib{ index_gpu, static_cast<UINT>(align(index_bytes, 4)), index_size == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT };
+     list->IASetIndexBuffer(&ib);
+@@ -1494,6 +1548,7 @@ void draw(D3D12State &state, renderer::Context &ctx, SceGxmPrimitiveType type, S
+     list->DrawIndexedInstanced(count, instance_count, 0, 0, 0);
+ 
+     target.last_draw = d.presents;
++    target.fetch_stale = true;
+     target.last_use = ++d.use_counter;
+     if (++d.draws == 1)
+         LOG_INFO("Direct3D 12: first draw recorded");
+@@ -1520,6 +1575,7 @@ bool find_display_target(D3D12State &state, uint32_t address, ID3D12Resource *&c
+     Drawer &d = *state.drawer;
+     d.submit();
+     d.presents++;
++    d.fetch_bytes = 0;
+     const auto it = d.targets.find(address);
+     if (it == d.targets.end() || it->second.last_draw + 3 < d.presents)
+         return false;
+@@ -1534,7 +1590,7 @@ std::string draw_summary(const D3D12State &state) {
+     if (!state.drawer)
+         return "no draw path";
+     const Drawer &d = *state.drawer;
+-    return fmt::format("{} draws, {} skipped, {} pipelines, {} targets", d.draws, d.dropped, d.pipelines.size(), d.targets.size());
++    return fmt::format("{} draws, {} skipped, {} pipelines, {} targets, {} blending copies", d.draws, d.dropped, d.pipelines.size(), d.targets.size(), d.fetch_copies);
+ }
+ 
+ } // namespace renderer::d3d12
+diff --git a/vita3k/renderer/src/d3d12/shaders.cpp b/vita3k/renderer/src/d3d12/shaders.cpp
+index dd3d707..e9c9e6e 100644
+--- a/vita3k/renderer/src/d3d12/shaders.cpp
++++ b/vita3k/renderer/src/d3d12/shaders.cpp
+@@ -55,7 +55,7 @@ namespace renderer::d3d12 {
+ 
+ namespace {
+ // bump when the HLSL options below change: the DXBC cache key
+-constexpr int kHlslVersion = 3;
++constexpr int kHlslVersion = 4;
+ 
+ // pD3DCompile, spelled out so d3dcompiler.h is not needed
+ typedef HRESULT(WINAPI *CompileFn)(LPCVOID src, SIZE_T size, LPCSTR name, const D3D_SHADER_MACRO *defines,
+diff --git a/vita3k/renderer/src/d3d12/state.cpp b/vita3k/renderer/src/d3d12/state.cpp
+index 6395ae1..bd37b0e 100644
+--- a/vita3k/renderer/src/d3d12/state.cpp
++++ b/vita3k/renderer/src/d3d12/state.cpp
+@@ -129,10 +129,11 @@ bool D3D12State::init() {
+     // the surface read through a bound texture for programmable blending (the
+     // copy the other renderers use), three-component vertex attributes
+     features.spirv_shader = true;
+-    // no programmable blending yet: fixed-function blending only
++    // programmable blending: the shader reads the target as a subpass input,
++    // which SPIRV-Cross turns into a texture load; the draw binds a copy
+     features.support_texture_barrier = false;
+     features.support_shader_interlock = false;
+-    features.direct_fragcolor = false;
++    features.direct_fragcolor = true;
+     // Direct3D has no 3-component 8/16-bit or scaled vertex formats: the shader converts
+     features.support_rgb_attributes = false;
+     features.support_scaled_attribute_formats = false;

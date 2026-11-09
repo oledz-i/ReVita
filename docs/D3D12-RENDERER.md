@@ -65,7 +65,13 @@ The core's renderers implement `renderer::State` and `renderer::Context`
    now: stencil, culling, the mask bit, programmable blending, depth-only
    scenes, surface sync back to guest memory.
    `scripts/core-patches/0012-d3d12-renderer-stage-3-drawing.patch`.
-4. Surface sync, programmable blending, mask bit.
+4. Programmable blending: **first pass in (revita-next)**. The translator
+   reads the target as a subpass input, SPIRV-Cross turns that into a
+   texture load, and the draw binds a copy of the target made just before
+   it (exact up to 128 MB of copies a frame, then refreshed every 8th draw),
+   as the Vulkan renderer does on the console
+   (`scripts/core-patches/0013-d3d12-programmable-blending.patch`).
+   Still to do: surface sync, mask bit, stencil, culling.
 5. Shader and pipeline caches on disk.
 
 Each step ships only when the one before runs on the console, with Vulkan
