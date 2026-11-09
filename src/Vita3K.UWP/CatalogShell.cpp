@@ -1609,14 +1609,65 @@ void CatalogShell::FetchLibretroArtwork(size_t index, bool continueBatch) {
     else if (id.rfind(L"PCSG", 0) == 0 || id.rfind(L"PCSC", 0) == 0) { add(L"Japan"); add(L"Japan, Asia"); }
     else if (id.rfind(L"PCSH", 0) == 0 || id.rfind(L"PCSD", 0) == 0) { add(L"Asia"); add(L"Japan, Asia"); }
     for (auto r : { L"USA", L"Europe", L"Japan", L"World", L"USA, Europe", L"Asia", L"Japan, Asia" }) add(r);
-    // the characters the set's file names cannot hold become an underscore
-    std::wstring name(games_[index].name->Data());
-    for (auto& c : name)
-        if (std::wstring(L"&*/:`<>?\\|\"").find(c) != std::wstring::npos) c = L'_';
+    // The set names files after the No-Intro database: "Title - Subtitle
+    // (Region)", trademark signs dropped, and the characters a file name
+    // cannot hold (& * / : ` < > ? \ | ") as underscores. A game's own title
+    // ("Danganronpa: Trigger Happy Havoc™") is turned into those forms.
+    std::wstring raw(games_[index].name->Data());
+    std::wstring plain;
+    for (wchar_t c : raw) {
+        if (c == L'™' || c == L'®' || c == L'©') continue;   // ™ ® ©
+        if (c == L'’' || c == L'‘') c = L'\'';
+        if (c == L'–' || c == L'—') c = L'-';
+        if (c == L'\r' || c == L'\n' || c == L'\t') c = L' ';
+        plain.push_back(c);
+    }
+    auto collapse = [](std::wstring text) {
+        std::wstring out;
+        for (wchar_t c : text) {
+            if (c == L' ' && (out.empty() || out.back() == L' ')) continue;
+            out.push_back(c);
+        }
+        while (!out.empty() && out.back() == L' ') out.pop_back();
+        return out;
+    };
+    auto underscores = [](std::wstring text) {
+        for (auto& c : text)
+            if (std::wstring(L"&*/:`<>?\\|\"").find(c) != std::wstring::npos) c = L'_';
+        return text;
+    };
+    std::vector<std::wstring> names;
+    auto addName = [&](std::wstring n) {
+        n = collapse(n);
+        if (!n.empty() && std::find(names.begin(), names.end(), n) == names.end()) names.push_back(n);
+    };
+    {
+        // "A: B" -> "A - B" (the database's form), then as typed
+        std::wstring dashed;
+        for (size_t i = 0; i < plain.size(); ++i) {
+            if (plain[i] == L':') { dashed += L" -"; continue; }
+            dashed.push_back(plain[i]);
+        }
+        addName(underscores(dashed));
+        addName(underscores(plain));
+        // Titles in capitals ("PERSONA 4 GOLDEN") as words with a capital
+        bool shouting = true;
+        for (wchar_t c : plain) if (iswlower(c)) { shouting = false; break; }
+        if (shouting) {
+            std::wstring words = dashed;
+            bool start = true;
+            for (auto& c : words) {
+                if (iswalpha(c)) { c = start ? towupper(c) : towlower(c); start = false; }
+                else start = (c == L' ' || c == L'-');
+            }
+            addName(underscores(words));
+        }
+    }
     auto urls = std::make_shared<std::vector<std::wstring>>();
     for (auto& region : regions)
-        urls->push_back(L"https://raw.githubusercontent.com/libretro-thumbnails/Sony_-_PlayStation_Vita/master/Named_Boxarts/" +
-            std::wstring(Uri::EscapeComponent(ref new Platform::String((name + L" (" + region + L")").c_str()))->Data()) + L".png");
+        for (auto& n : names)
+            urls->push_back(L"https://raw.githubusercontent.com/libretro-thumbnails/Sony_-_PlayStation_Vita/master/Named_Boxarts/" +
+                std::wstring(Uri::EscapeComponent(ref new Platform::String((n + L" (" + region + L")").c_str()))->Data()) + L".png");
     auto client = ref new Windows::Web::Http::HttpClient();
     auto gameKey = games_[index].key;
     auto title = games_[index].name;
@@ -1773,7 +1824,7 @@ Button^ CatalogShell::MakeTile(size_t index) {
     foot->Child = words;
     art->Children->Append(foot);
     cover->Child = art;
-    tile->Content = cover;
+    tile->Content = BoxWrap(cover);
 
     // Scale, ring and press feedback come from the shared button template.
     tile->GotFocus += ref new RoutedEventHandler([this,index](Platform::Object^, RoutedEventArgs^) {
