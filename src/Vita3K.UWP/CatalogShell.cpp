@@ -18,6 +18,8 @@
 #include <windows.h>
 #include <collection.h>
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <atomic>
 #include <functional>
 #include <cmath>
@@ -1527,6 +1529,124 @@ Platform::String^ CatalogShell::ArtworkUri(size_t index) {
         return L"ms-appdata:///local/Artwork/" + file;
     return Pref(L"art.remote." + key);
 }
+// A cover as a game case: the front turned a little, and the case's side
+// (the spine) beside it, so the cover reads as a box with depth instead of a
+// flat picture. Settings > Artwork turns it off.
+Windows::UI::Xaml::UIElement^ CatalogShell::BoxWrap(Border^ poster) {
+    if (Pref(L"art.box3d", L"1")->Equals(L"0")) return poster;
+    const double spineWidth = 18;
+    auto grid = ref new Grid();
+    grid->HorizontalAlignment = poster->HorizontalAlignment;
+    grid->VerticalAlignment = poster->VerticalAlignment;
+    if (poster->Width > 0 && !std::isnan(poster->Width)) {
+        grid->Width = poster->Width + spineWidth;
+        poster->Width = std::numeric_limits<double>::quiet_NaN();
+    }
+    if (poster->Height > 0 && !std::isnan(poster->Height)) {
+        grid->Height = poster->Height;
+        poster->Height = std::numeric_limits<double>::quiet_NaN();
+    }
+    auto side = ref new ColumnDefinition();
+    side->Width = GridLength(spineWidth);
+    auto front = ref new ColumnDefinition();
+    front->Width = GridLength(1, GridUnitType::Star);
+    grid->ColumnDefinitions->Append(side);
+    grid->ColumnDefinitions->Append(front);
+
+    // the side of the case folds back from the front's left edge
+    auto spine = ref new Border();
+    spine->Width = 36;
+    spine->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Right;
+    spine->Background = Gradient(RgbColor(58, 62, 112), RgbColor(16, 17, 38));
+    spine->BorderBrush = Solid(Alpha(60, 255, 255, 255));
+    spine->BorderThickness = Thickness(1, 0, 0, 0);
+    spine->CornerRadius = Windows::UI::Xaml::CornerRadius(6, 0, 0, 6);
+    auto spineTurn = ref new PlaneProjection();
+    spineTurn->CenterOfRotationX = 1.0;
+    spineTurn->RotationY = -66;
+    spine->Projection = spineTurn;
+    Grid::SetColumn(spine, 0);
+    grid->Children->Append(spine);
+
+    // the front, with a soft sheen across the plastic
+    auto face = ref new Grid();
+    poster->CornerRadius = Windows::UI::Xaml::CornerRadius(4, 10, 10, 4);
+    face->Children->Append(poster);
+    auto sheen = ref new Border();
+    sheen->IsHitTestVisible = false;
+    sheen->CornerRadius = poster->CornerRadius;
+    auto gloss = ref new LinearGradientBrush();
+    gloss->StartPoint = Point(0, 0);
+    gloss->EndPoint = Point(1, 1);
+    auto stopA = ref new GradientStop(); stopA->Color = Alpha(70, 255, 255, 255); stopA->Offset = 0.0;
+    auto stopB = ref new GradientStop(); stopB->Color = Alpha(0, 255, 255, 255); stopB->Offset = 0.42;
+    auto stopC = ref new GradientStop(); stopC->Color = Alpha(46, 0, 0, 0); stopC->Offset = 1.0;
+    gloss->GradientStops->Append(stopA);
+    gloss->GradientStops->Append(stopB);
+    gloss->GradientStops->Append(stopC);
+    sheen->Background = gloss;
+    face->Children->Append(sheen);
+    auto faceTurn = ref new PlaneProjection();
+    faceTurn->CenterOfRotationX = 0.0;
+    faceTurn->RotationY = 24;
+    face->Projection = faceTurn;
+    Grid::SetColumn(face, 1);
+    grid->Children->Append(face);
+    return grid;
+}
+// Front covers from the libretro-thumbnails set: public, no account or key.
+// The name is the game's title with the release's region; the file is tried
+// for the regions that title's ID belongs to, then the others.
+void CatalogShell::FetchLibretroArtwork(size_t index, bool continueBatch) {
+    if (index >= games_.size()) { if (continueBatch) artworkScanBusy_ = false; return; }
+    const std::wstring id(games_[index].key->Data());
+    std::vector<std::wstring> regions;
+    auto add = [&](const wchar_t* r) {
+        if (std::find(regions.begin(), regions.end(), r) == regions.end()) regions.push_back(r);
+    };
+    if (id.rfind(L"PCSE", 0) == 0 || id.rfind(L"PCSA", 0) == 0) { add(L"USA"); add(L"USA, Europe"); }
+    else if (id.rfind(L"PCSB", 0) == 0 || id.rfind(L"PCSF", 0) == 0) { add(L"Europe"); add(L"USA, Europe"); }
+    else if (id.rfind(L"PCSG", 0) == 0 || id.rfind(L"PCSC", 0) == 0) { add(L"Japan"); add(L"Japan, Asia"); }
+    else if (id.rfind(L"PCSH", 0) == 0 || id.rfind(L"PCSD", 0) == 0) { add(L"Asia"); add(L"Japan, Asia"); }
+    for (auto r : { L"USA", L"Europe", L"Japan", L"World", L"USA, Europe", L"Asia", L"Japan, Asia" }) add(r);
+    // the characters the set's file names cannot hold become an underscore
+    std::wstring name(games_[index].name->Data());
+    for (auto& c : name)
+        if (std::wstring(L"&*/:`<>?\\|\"").find(c) != std::wstring::npos) c = L'_';
+    auto urls = std::make_shared<std::vector<std::wstring>>();
+    for (auto& region : regions)
+        urls->push_back(L"https://raw.githubusercontent.com/libretro-thumbnails/Sony_-_PlayStation_Vita/master/Named_Boxarts/" +
+            std::wstring(Uri::EscapeComponent(ref new Platform::String((name + L" (" + region + L")").c_str()))->Data()) + L".png");
+    auto client = ref new Windows::Web::Http::HttpClient();
+    auto gameKey = games_[index].key;
+    auto title = games_[index].name;
+    SetStatus(L"Looking for the cover of: " + title);
+    auto attempt = std::make_shared<std::function<void(size_t)>>();
+    *attempt = [this, client, urls, attempt, index, gameKey, title, continueBatch](size_t at) {
+        if (at >= urls->size()) {
+            // not in the set: SteamGridDB when there is a key, otherwise the next game
+            if (!ApiKey()->IsEmpty()) FetchArtwork(index, continueBatch);
+            else if (continueBatch) FetchMissingArtwork(index + 1);
+            return;
+        }
+        auto request = ref new Windows::Web::Http::HttpRequestMessage(Windows::Web::Http::HttpMethod::Head,
+            ref new Uri(ref new Platform::String((*urls)[at].c_str())));
+        create_task(client->SendRequestAsync(request)).then(
+            [this, urls, attempt, at, index, gameKey, title, continueBatch](task<Windows::Web::Http::HttpResponseMessage^> reply) {
+                bool found = false;
+                try { found = reply.get()->IsSuccessStatusCode; } catch (Platform::Exception^) {}
+                if (found) {
+                    PutPref(L"art.remote." + gameKey, ref new Platform::String((*urls)[at].c_str()));
+                    SetStatus(L"Cover found for: " + title);
+                    Render();
+                    if (continueBatch) FetchMissingArtwork(index + 1);
+                    return;
+                }
+                (*attempt)(at + 1);
+            }, task_continuation_context::use_current());
+    };
+    (*attempt)(0);
+}
 void CatalogShell::ConfigureCover(Border^ cover, size_t index) {
     // Give every title a film-poster-like palette even when offline or when
     // SteamGridDB has no match. Never display made-up third-party game art.
@@ -1918,7 +2038,7 @@ Button^ CatalogShell::MakeFlowCard(size_t index, int position) {
         art->Children->Append(caption);
         poster->Child = art;
     }
-    card->Content = poster;
+    card->Content = BoxWrap(poster);
 
     // the turn and the step back (animated in FocusFlow)
     auto projection = ref new PlaneProjection();
@@ -2353,7 +2473,7 @@ void CatalogShell::GameDetails() {
         fallback->Children->Append(Text(games_[index].name, 14, true));
         cover->Child = fallback;
     }
-    layout->Children->Append(cover);
+    layout->Children->Append(BoxWrap(cover));
 
     auto right = Vertical();
     right->Margin = Thickness(26, 6, 6, 4);
@@ -3396,9 +3516,9 @@ void CatalogShell::Settings() {
     Section(L"Game artwork", L"Use original cover images or bring in your own.");
     auto art = Vertical();
     art->Children->Append(Text(
-        L"SteamGridDB cover matching requires a personal API key. The search uses each "
-        L"game's title and only accepts an exact title match, to avoid mismatched artwork. "
-        L"If no match is available, your game keeps its themed cover.", 13, false, true));
+        L"Covers come from the public libretro thumbnail set, no account needed, matched by each "
+        L"game's title and region. A SteamGridDB key adds a second source for titles it lacks. "
+        L"With no match, your game keeps its themed cover. 3D box style shows each cover as a case.", 13, false, true));
     auto password = ref new PasswordBox();
     password->PlaceholderText = L"SteamGridDB API key (saved in Windows PasswordVault)";
     password->Height = 40;
@@ -3413,11 +3533,17 @@ void CatalogShell::Settings() {
         password->Password = L"";
     });
     buttons->Children->Append(save);
+    auto box = Button(Pref(L"art.box3d", L"1")->Equals(L"0") ? L"3D box style: Off" : L"3D box style: On");
+    box->Click += ref new RoutedEventHandler([this](Platform::Object^, RoutedEventArgs^) {
+        PutPref(L"art.box3d", Pref(L"art.box3d", L"1")->Equals(L"0") ? L"1" : L"0");
+        Render();
+    });
     auto fetch = Button(L"Get missing covers");
     fetch->Click += ref new RoutedEventHandler([this](Platform::Object^, RoutedEventArgs^) {
         FetchMissingArtwork();
     });
     buttons->Children->Append(fetch);
+    buttons->Children->Append(box);
     art->Children->Append(buttons);
     art->Children->Append(Text(
         ApiKey()->IsEmpty() ? L"No API key saved yet." : L"SteamGridDB API key saved.",
@@ -6481,10 +6607,6 @@ void CatalogShell::FetchMissingArtwork(size_t index) {
             SetStatus(L"Artwork lookup is already running.");
             return;
         }
-        if (ApiKey()->IsEmpty()) {
-            SetStatus(L"Save your SteamGridDB API key in Settings to search covers.");
-            return;
-        }
         artworkScanBusy_ = true;
         SetStatus(L"Looking for matching game artwork...");
     }
@@ -6495,7 +6617,7 @@ void CatalogShell::FetchMissingArtwork(size_t index) {
         Render();
         return;
     }
-    FetchArtwork(index, true);
+    FetchLibretroArtwork(index, true);
 }
 void CatalogShell::FetchArtwork(size_t index, bool continueBatch) {
     if (index >= games_.size()) {

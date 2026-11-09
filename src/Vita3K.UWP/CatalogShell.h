@@ -355,6 +355,8 @@ private:
     Platform::String^ ApiKey();
     void FetchArtwork(size_t index, bool continueBatch = false);
     void FetchMissingArtwork(size_t index = 0);
+    void FetchLibretroArtwork(size_t index, bool continueBatch);
+    Windows::UI::Xaml::UIElement^ BoxWrap(Windows::UI::Xaml::Controls::Border^ poster);
     void ProbeMemory();
     void ProbeCore();
     void ProbeLibretro(bool initialize);
