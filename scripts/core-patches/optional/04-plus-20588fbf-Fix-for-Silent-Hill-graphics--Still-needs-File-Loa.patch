@@ -1,0 +1,14 @@
+diff --git a/vita3k/shader/include/shader/usse_translator.h b/vita3k/shader/include/shader/usse_translator.h
+index e14cc997..24d01ac5 100644
+--- a/vita3k/shader/include/shader/usse_translator.h
++++ b/vita3k/shader/include/shader/usse_translator.h
+@@ -161,6 +161,9 @@ private:
+         if (repeat_mode == RepeatMode::EXTERNAL && bank != RegisterBank::FPINTERNAL) {
+             return repeat_index * 4;
+         }
++        if (repeat_mode == RepeatMode::EXTERNAL) {
++            return repeat_index;
++        }
+         if (repeat_mode == RepeatMode::SLMSI) {
+             auto inc = repeat_increase[op.index][repeat_index];
+ 
