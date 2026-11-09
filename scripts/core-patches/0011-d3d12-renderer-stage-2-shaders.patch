@@ -1,0 +1,472 @@
+diff --git a/external/CMakeLists.txt b/external/CMakeLists.txt
+index e76a5fd..6fcbcdc 100644
+--- a/external/CMakeLists.txt
++++ b/external/CMakeLists.txt
+@@ -232,7 +232,12 @@ add_subdirectory(glslang)
+ 
+ option(SPIRV_CROSS_CLI "Build the CLI binary. Requires SPIRV_CROSS_STATIC." OFF)
+ option(SPIRV_CROSS_ENABLE_TESTS "Enable SPIRV-Cross tests." OFF)
+-option(SPIRV_CROSS_ENABLE_HLSL "Enable HLSL target support." OFF)
++# Xbox: the Direct3D 12 renderer translates SPIR-V to HLSL
++if(WIN32)
++	option(SPIRV_CROSS_ENABLE_HLSL "Enable HLSL target support." ON)
++else()
++	option(SPIRV_CROSS_ENABLE_HLSL "Enable HLSL target support." OFF)
++endif()
+ option(SPIRV_CROSS_ENABLE_MSL "Enable MSL target support." OFF)
+ option(SPIRV_CROSS_ENABLE_CPP "Enable C++ target support." OFF)
+ option(SPIRV_CROSS_ENABLE_REFLECT "Enable JSON reflection target support." OFF)
+diff --git a/vita3k/libretro/libretro_vita3k.cpp b/vita3k/libretro/libretro_vita3k.cpp
+index ffb332a..c0e409c 100644
+--- a/vita3k/libretro/libretro_vita3k.cpp
++++ b/vita3k/libretro/libretro_vita3k.cpp
+@@ -1123,6 +1123,7 @@ static void context_reset_d3d12() {
+     iface.device = d3d12->device;
+     iface.queue = d3d12->queue;
+     iface.required_state = d3d12->required_state;
++    iface.d3d_compile = d3d12->D3DCompile;
+     iface.set_texture = d3d12->set_texture;
+     renderer::d3d12::set_interface(iface);
+ 
+diff --git a/vita3k/renderer/CMakeLists.txt b/vita3k/renderer/CMakeLists.txt
+index 8f46745..fc4e19d 100644
+--- a/vita3k/renderer/CMakeLists.txt
++++ b/vita3k/renderer/CMakeLists.txt
+@@ -57,7 +57,9 @@ endif()
+ 
+ # Xbox: the native Direct3D 12 renderer (experimental)
+ if(WIN32)
+-	target_sources(renderer PRIVATE src/d3d12/state.cpp)
++	target_sources(renderer PRIVATE src/d3d12/state.cpp src/d3d12/shaders.cpp)
++	# SPIR-V to HLSL (SPIRV_CROSS_ENABLE_HLSL is on for Windows in external/)
++	target_link_libraries(renderer PRIVATE spirv-cross-hlsl)
+ endif()
+ 
+ if(APPLE)
+diff --git a/vita3k/renderer/include/renderer/d3d12/state.h b/vita3k/renderer/include/renderer/d3d12/state.h
+index 2eff2c2..45086fc 100644
+--- a/vita3k/renderer/include/renderer/d3d12/state.h
++++ b/vita3k/renderer/include/renderer/d3d12/state.h
+@@ -17,14 +17,14 @@
+ 
+ // Xbox (ReVita): the native Direct3D 12 renderer, experimental.
+ //
+-// Stage 1 of docs/D3D12-RENDERER.md in the ReVita repository: the backend
++// Stages 1 and 2 of docs/D3D12-RENDERER.md in the ReVita repository: the backend
+ // exists, can be picked, keeps every guest command flowing (contexts, render
+ // targets, programs, notifications and sync objects all behave as they do on
+ // the other renderers) and presents the picture the game's display buffer
+ // holds in guest memory through the frontend's own Direct3D 12 device. It
+-// does not draw yet: GXM draws are accepted and dropped, so a game that
+-// draws with the GPU shows black, and one that writes its screen with the
+-// CPU shows it.
++// does not draw yet: GXM draws compile the shaders they would use (stage 2)
++// and are dropped, so a game that draws with the GPU shows black, and one
++// that writes its screen with the CPU shows it.
+ 
+ #pragma once
+ 
+@@ -35,11 +35,14 @@
+ #include <atomic>
+ #include <cstdint>
+ #include <memory>
++#include <string>
+ 
+ struct ID3D12Device;
+ struct ID3D12CommandQueue;
+ struct ID3D12Resource;
+ struct Config;
++struct MemState;
++struct SceGxmTexture;
+ 
+ namespace renderer::d3d12 {
+ 
+@@ -48,6 +51,8 @@ struct Interface {
+     void *handle = nullptr;
+     ID3D12Device *device = nullptr;
+     ID3D12CommandQueue *queue = nullptr;
++    // the frontend's D3DCompile (pD3DCompile), or null
++    void *d3d_compile = nullptr;
+     // the state the frontend reads a texture in (D3D12_RESOURCE_STATES)
+     uint32_t required_state = 0;
+     // hands the frame to show to the frontend; format is a DXGI_FORMAT
+@@ -67,6 +72,11 @@ public:
+ };
+ 
+ struct D3D12Context : public renderer::Context {};
++
++// Shaders (stage 2): GXP to SPIR-V (the Vulkan path's translator), SPIR-V to
++// HLSL (SPIRV-Cross), HLSL to DXBC (D3DCompile, shader model 5.1), kept in
++// memory and on disk next to the other renderers' shader caches.
++struct ShaderCache;
+ struct D3D12RenderTarget : public renderer::RenderTarget {};
+ 
+ struct D3D12State : public renderer::State {
+@@ -99,8 +109,16 @@ struct D3D12State : public renderer::State {
+ 
+     struct Impl;
+     std::unique_ptr<Impl> impl;
++    std::shared_ptr<ShaderCache> shaders;
+ };
+ 
++// Stage 2: a draw compiles the shaders it would need (cached) and draws nothing
++void draw(D3D12State &state, renderer::Context &context, MemState &mem);
++std::shared_ptr<ShaderCache> make_shader_cache();
++std::string shader_cache_summary(const ShaderCache &cache);
++// a texture binding: the shader translator needs the texture formats
++void sync_texture(renderer::Context &context, uint32_t index, const SceGxmTexture &texture);
++
+ bool create(std::unique_ptr<renderer::State> &state, const Config &config);
+ bool create(std::unique_ptr<renderer::Context> &context);
+ bool create(std::unique_ptr<renderer::RenderTarget> &rt);
+diff --git a/vita3k/renderer/src/d3d12/shaders.cpp b/vita3k/renderer/src/d3d12/shaders.cpp
+new file mode 100644
+index 0000000..aec0620
+--- /dev/null
++++ b/vita3k/renderer/src/d3d12/shaders.cpp
+@@ -0,0 +1,274 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++// Xbox (ReVita): Direct3D 12 renderer, stage 2: shaders.
++//
++// GXP to SPIR-V with the translator the Vulkan renderer uses, SPIR-V to HLSL
++// with SPIRV-Cross, HLSL to DXBC (shader model 5.1) with the frontend's
++// D3DCompile. Each result is kept in memory and on disk (shaders/<title>/
++// <self>/<hash>.<vs|ps>.dx<version>.dxbc), so a shader is compiled once per
++// game. A shader that does not translate is logged once, its HLSL written
++// next to the shader logs, and never tried again this session.
++
++#include <renderer/d3d12/state.h>
++
++#include <gxm/functions.h>
++#include <gxm/types.h>
++#include <mem/ptr.h>
++#include <renderer/shaders.h>
++#include <renderer/types.h>
++#include <shader/spirv_recompiler.h>
++#include <util/fs.h>
++#include <util/hash.h>
++#include <util/log.h>
++
++#include <spirv_hlsl.hpp>
++
++#include <windows.h>
++
++#include <d3dcommon.h>
++
++#include <chrono>
++#include <fstream>
++#include <mutex>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++namespace renderer::d3d12 {
++
++namespace {
++// bump when the HLSL options below change: the DXBC cache key
++constexpr int kHlslVersion = 1;
++
++// pD3DCompile, spelled out so d3dcompiler.h is not needed
++typedef HRESULT(WINAPI *CompileFn)(LPCVOID src, SIZE_T size, LPCSTR name, const D3D_SHADER_MACRO *defines,
++    ID3DInclude *include, LPCSTR entry, LPCSTR target, UINT flags1, UINT flags2, ID3DBlob **code, ID3DBlob **errors);
++constexpr UINT kOptimize3 = 1u << 15; // D3DCOMPILE_OPTIMIZATION_LEVEL3
++
++enum class Status : uint8_t {
++    Ready,
++    Failed,
++};
++
++struct Entry {
++    Status status = Status::Failed;
++    std::vector<uint8_t> dxbc;
++};
++} // namespace
++
++struct ShaderCache {
++    std::mutex mutex;
++    std::unordered_map<std::string, Entry> entries;
++    uint64_t compiled = 0;
++    uint64_t from_disk = 0;
++    uint64_t failed = 0;
++    bool warned_no_compiler = false;
++};
++
++static std::string translate_to_hlsl(const std::vector<uint32_t> &spirv, bool is_vertex, std::string &error) {
++    try {
++        spirv_cross::CompilerHLSL hlsl(spirv);
++        spirv_cross::CompilerHLSL::Options options;
++        options.shader_model = 51;
++        options.point_size_compat = true;
++        options.point_coord_compat = true;
++        options.flatten_matrix_vertex_input_semantics = true;
++        hlsl.set_hlsl_options(options);
++
++        auto common = hlsl.get_common_options();
++        // the Vulkan translator writes Vulkan clip space (y down); Direct3D's is y up
++        common.vertex.flip_vert_y = is_vertex;
++        common.vertex.fixup_clipspace = false; // both use a 0 to 1 depth range
++        hlsl.set_common_options(common);
++
++        // every input as TEXCOORD<location>, so the input layout can name them
++        if (is_vertex) {
++            const auto resources = hlsl.get_shader_resources();
++            for (const auto &input : resources.stage_inputs) {
++                if (!hlsl.has_decoration(input.id, spv::DecorationLocation))
++                    continue;
++                spirv_cross::HLSLVertexAttributeRemap remap;
++                remap.location = hlsl.get_decoration(input.id, spv::DecorationLocation);
++                remap.semantic = "TEXCOORD" + std::to_string(remap.location);
++                hlsl.add_vertex_attribute_remap(remap);
++            }
++        }
++        return hlsl.compile();
++    } catch (const std::exception &e) {
++        error = e.what();
++        return {};
++    }
++}
++
++static bool read_file(const fs::path &path, std::vector<uint8_t> &out) {
++    std::ifstream file(path, std::ios::binary | std::ios::ate);
++    if (!file)
++        return false;
++    const std::streamsize size = file.tellg();
++    if (size <= 0)
++        return false;
++    out.resize(static_cast<size_t>(size));
++    file.seekg(0);
++    return static_cast<bool>(file.read(reinterpret_cast<char *>(out.data()), size));
++}
++
++static void write_file(const fs::path &path, const void *data, size_t size) {
++    std::error_code ec;
++    fs::create_directories(path.parent_path(), ec);
++    std::ofstream file(path, std::ios::binary | std::ios::trunc);
++    if (file)
++        file.write(static_cast<const char *>(data), static_cast<std::streamsize>(size));
++}
++
++// The DXBC for one program, compiled on first use; null when it cannot be had
++static const std::vector<uint8_t> *get_shader(D3D12State &state, const SceGxmProgram &program, const Sha256Hash &hash,
++    bool is_vertex, const shader::Hints &hints, bool maskupdate) {
++    ShaderCache &cache = *state.shaders;
++    const std::string hash_text = hex_string(hash);
++    const char *stage = is_vertex ? "vs" : "ps";
++    const std::string key = hash_text + (is_vertex ? ".vs" : (maskupdate ? ".psm" : ".ps"));
++
++    {
++        std::lock_guard<std::mutex> guard(cache.mutex);
++        const auto it = cache.entries.find(key);
++        if (it != cache.entries.end())
++            return it->second.status == Status::Ready ? &it->second.dxbc : nullptr;
++    }
++
++    Entry entry;
++    const std::string version = fmt::format("dx{}-{}", shader::CURRENT_VERSION, kHlslVersion);
++    const fs::path disk = state.shaders_path.empty()
++        ? fs::path{}
++        : state.shaders_path / fmt::format("{}.{}.dxbc", key, version);
++
++    if (!disk.empty() && read_file(disk, entry.dxbc)) {
++        entry.status = Status::Ready;
++        std::lock_guard<std::mutex> guard(cache.mutex);
++        cache.from_disk++;
++        return &(cache.entries[key] = std::move(entry)).dxbc;
++    }
++
++    const auto compile = reinterpret_cast<CompileFn>(get_interface().d3d_compile);
++    if (!compile) {
++        std::lock_guard<std::mutex> guard(cache.mutex);
++        if (!cache.warned_no_compiler) {
++            cache.warned_no_compiler = true;
++            LOG_ERROR("Direct3D 12: the frontend gave no D3DCompile, shaders cannot be built");
++        }
++        cache.entries[key] = Entry{};
++        return nullptr;
++    }
++
++    const auto start = std::chrono::steady_clock::now();
++    const std::vector<uint32_t> spirv = load_spirv_shader(program, state.features, true, hints, maskupdate,
++        state.shaders_path, state.shaders_log_path, fmt::format("dx{}", shader::CURRENT_VERSION), false);
++
++    std::string error;
++    std::string hlsl = spirv.empty() ? std::string{} : translate_to_hlsl(spirv, is_vertex, error);
++    if (spirv.empty())
++        error = "GXP to SPIR-V failed";
++
++    if (!hlsl.empty()) {
++        ID3DBlob *code = nullptr;
++        ID3DBlob *errors = nullptr;
++        const HRESULT hr = compile(hlsl.data(), hlsl.size(), key.c_str(), nullptr, nullptr, "main",
++            is_vertex ? "vs_5_1" : "ps_5_1", kOptimize3, 0, &code, &errors);
++        if (SUCCEEDED(hr) && code) {
++            const auto *bytes = static_cast<const uint8_t *>(code->GetBufferPointer());
++            entry.dxbc.assign(bytes, bytes + code->GetBufferSize());
++            entry.status = Status::Ready;
++        } else {
++            error = errors ? std::string(static_cast<const char *>(errors->GetBufferPointer()), errors->GetBufferSize())
++                           : fmt::format("D3DCompile failed (0x{:08X})", static_cast<uint32_t>(hr));
++        }
++        if (code)
++            code->Release();
++        if (errors)
++            errors->Release();
++    }
++
++    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
++    if (entry.status == Status::Ready) {
++        if (!disk.empty())
++            write_file(disk, entry.dxbc.data(), entry.dxbc.size());
++        LOG_INFO("Direct3D 12 shader {} {}: {} bytes in {} ms", hash_text, stage, entry.dxbc.size(), ms);
++    } else {
++        // the first line or so of the reason, and the whole HLSL for whoever reads the logs
++        const std::string first = error.substr(0, std::min<size_t>(error.find('\n'), 300));
++        LOG_ERROR("Direct3D 12 shader {} {} not built: {}", hash_text, stage, first);
++        if (!state.shaders_log_path.empty() && !hlsl.empty()) {
++            const std::string dump = hlsl + "\n/*\n" + error + "\n*/\n";
++            write_file(state.shaders_log_path / fmt::format("{}.{}.hlsl", key, stage), dump.data(), dump.size());
++        }
++    }
++
++    std::lock_guard<std::mutex> guard(cache.mutex);
++    if (entry.status == Status::Ready)
++        cache.compiled++;
++    else
++        cache.failed++;
++    Entry &stored = (cache.entries[key] = std::move(entry));
++    return stored.status == Status::Ready ? &stored.dxbc : nullptr;
++}
++
++void sync_texture(renderer::Context &context, uint32_t index, const SceGxmTexture &texture) {
++    const SceGxmTextureFormat format = gxm::get_format(texture);
++    if (index >= SCE_GXM_MAX_TEXTURE_UNITS) {
++        if (index - SCE_GXM_MAX_TEXTURE_UNITS < SCE_GXM_MAX_TEXTURE_UNITS)
++            context.shader_hints.vertex_textures[index - SCE_GXM_MAX_TEXTURE_UNITS] = format;
++    } else {
++        context.shader_hints.fragment_textures[index] = format;
++    }
++}
++
++void draw(D3D12State &state, renderer::Context &context, MemState &mem) {
++    if (!state.shaders)
++        return;
++    const SceGxmVertexProgram *vertex_program = context.record.vertex_program.get(mem);
++    const SceGxmFragmentProgram *fragment_program = context.record.fragment_program.get(mem);
++    if (!vertex_program || !fragment_program || !vertex_program->renderer_data || !fragment_program->renderer_data)
++        return;
++
++    shader::Hints hints = context.shader_hints;
++    hints.attributes = &vertex_program->attributes;
++    hints.color_format = context.record.color_surface.colorFormat;
++    hints.masked_framebuffer_fetch = false;
++
++    const SceGxmProgram *vertex_gxp = vertex_program->program.get(mem);
++    if (vertex_gxp)
++        get_shader(state, *vertex_gxp, vertex_program->renderer_data->hash, true, hints, false);
++
++    const bool maskupdate = fragment_program->is_maskupdate;
++    const SceGxmProgram *fragment_gxp = fragment_program->program.get(mem);
++    if (!fragment_gxp)
++        return;
++    const bool fragment_disabled = !maskupdate
++        && (context.record.front_side_fragment_program_mode == SCE_GXM_FRAGMENT_PROGRAM_DISABLED || fragment_gxp->has_no_effect());
++    if (!fragment_disabled)
++        get_shader(state, *fragment_gxp, fragment_program->renderer_data->hash, false, hints, maskupdate);
++}
++
++std::shared_ptr<ShaderCache> make_shader_cache() {
++    return std::make_shared<ShaderCache>();
++}
++
++std::string shader_cache_summary(const ShaderCache &cache) {
++    return fmt::format("{} compiled, {} from disk, {} failed", cache.compiled, cache.from_disk, cache.failed);
++}
++
++} // namespace renderer::d3d12
+diff --git a/vita3k/renderer/src/d3d12/state.cpp b/vita3k/renderer/src/d3d12/state.cpp
+index 1f1b247..647ee26 100644
+--- a/vita3k/renderer/src/d3d12/state.cpp
++++ b/vita3k/renderer/src/d3d12/state.cpp
+@@ -121,7 +121,15 @@ bool D3D12State::init() {
+         slot.list->Close();
+     }
+     texture_cache.backend = Backend::D3D12;
+-    LOG_INFO("Direct3D 12 renderer (experimental): device ready. Stage 1: guest draws are not drawn yet; the display buffer in memory is shown.");
++    // what the shader translator may assume: SPIR-V for a Vulkan-like target,
++    // the surface read through a bound texture for programmable blending (the
++    // copy the other renderers use), three-component vertex attributes
++    features.spirv_shader = true;
++    features.support_texture_barrier = true;
++    features.support_rgb_attributes = true;
++    features.use_mask_bit = false;
++    shaders = make_shader_cache();
++    LOG_INFO("Direct3D 12 renderer (experimental): device ready. Stage 2: shaders are built for every draw, the draws themselves are not drawn yet; the display buffer in memory is shown.");
+     return true;
+ }
+ 
+@@ -129,6 +137,9 @@ void D3D12State::late_init(const Config &cfg, const std::string_view game_id, Me
+ }
+ 
+ void D3D12State::render_frame(DisplayState &display, const GxmState &gxm, MemState &mem) {
++    static uint64_t frames_seen = 0;
++    if (shaders && (++frames_seen % 600) == 0)
++        LOG_INFO("Direct3D 12 shaders so far: {}", shader_cache_summary(*shaders));
+     DisplayFrameInfo frame;
+     {
+         std::lock_guard<std::mutex> guard(display.display_info_mutex);
+diff --git a/vita3k/renderer/src/scene.cpp b/vita3k/renderer/src/scene.cpp
+index 9eb08ec..f41efca 100644
+--- a/vita3k/renderer/src/scene.cpp
++++ b/vita3k/renderer/src/scene.cpp
+@@ -26,6 +26,7 @@
+ #include <renderer/gl/types.h>
+ 
+ #include <renderer/vulkan/functions.h>
++#include <renderer/d3d12/state.h>
+ 
+ #include <config/state.h>
+ #include <util/log.h>
+@@ -246,6 +247,7 @@ COMMAND(handle_draw) {
+         break;
+ 
+     case Backend::D3D12:
++        d3d12::draw(static_cast<d3d12::D3D12State &>(renderer), *render_context, mem);
+         break;
+ 
+     default:
+diff --git a/vita3k/renderer/src/state_set.cpp b/vita3k/renderer/src/state_set.cpp
+index 217bc14..be6e4b2 100644
+--- a/vita3k/renderer/src/state_set.cpp
++++ b/vita3k/renderer/src/state_set.cpp
+@@ -26,6 +26,7 @@
+ #include <renderer/gl/types.h>
+ 
+ #include <renderer/vulkan/functions.h>
++#include <renderer/d3d12/state.h>
+ #include <renderer/vulkan/state.h>
+ #include <renderer/vulkan/types.h>
+ 
+@@ -477,6 +478,7 @@ COMMAND_SET_STATE(texture) {
+         break;
+ 
+     case Backend::D3D12:
++        d3d12::sync_texture(*render_context, texture_index, texture);
+         break;
+ 
+     default:

@@ -44,7 +44,14 @@ The core's renderers implement `renderer::State` and `renderer::Context`
    `scripts/core-patches/0010-d3d12-renderer-stage-1.patch`
    (`vita3k/renderer/src/d3d12/`); frontend side:
    `src/Vita3K.UWP/VitaD3D12Bridge.cpp`.
-2. Shaders: translation and compilation, logged per game; no drawing.
+2. **Done (revita-next):** shaders. Every draw builds the shaders it
+   would use: GXP to SPIR-V (the Vulkan translator), SPIR-V to HLSL
+   (SPIRV-Cross, shader model 5.1, Vulkan clip space flipped), HLSL to DXBC
+   (the frontend's `D3DCompile`). Results are cached in memory and on disk
+   (`<hash>.vs|ps.dx<version>.dxbc` in the game's shader folder); a shader
+   that fails is logged once with its HLSL written to the shader log folder.
+   The log prints a running count every 600 frames. Still no drawing.
+   `scripts/core-patches/0011-d3d12-renderer-stage-2-shaders.patch`.
 3. Untextured draws, then textures, then render targets: 2D games first
    (Undertale), then 3D (Persona 4 Golden, Gravity Rush).
 4. Surface sync, programmable blending, mask bit.

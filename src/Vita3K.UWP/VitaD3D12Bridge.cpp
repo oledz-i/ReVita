@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "VitaD3D12Bridge.h"
 #include <libretro.h>
+#include <d3dcompiler.h>
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
@@ -43,7 +44,8 @@ bool VitaD3D12Bridge::Initialize(std::string& error) {
         interface_.handle = this;
         interface_.device = device_.Get();
         interface_.queue = queue_.Get();
-        interface_.D3DCompile = nullptr;
+        // the core builds its shaders with it (HLSL from SPIR-V, shader model 5.1)
+        interface_.D3DCompile = reinterpret_cast<void*>(&::D3DCompile);
         interface_.required_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
         interface_.set_texture = &VitaD3D12Bridge::SetTexture;
         contextReset_();

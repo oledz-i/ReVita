@@ -47,7 +47,7 @@
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
       <AdditionalIncludeDirectories>$(MSBuildProjectDirectory)\..\..\build\abi\include;$(MSBuildProjectDirectory)\..\..\build\abi\Vulkan-Headers\include;$(MSBuildProjectDirectory)\\..\\..\\third_party\\vita3k\\mem\\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
-    <Link><SubSystem>Console</SubSystem><StackReserveSize>8388608</StackReserveSize><GenerateWindowsMetadata>true</GenerateWindowsMetadata><AdditionalDependencies>d3d12.lib;dxgi.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
+    <Link><SubSystem>Console</SubSystem><StackReserveSize>8388608</StackReserveSize><GenerateWindowsMetadata>true</GenerateWindowsMetadata><AdditionalDependencies>d3d12.lib;dxgi.lib;d3dcompiler.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp">
