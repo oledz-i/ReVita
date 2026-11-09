@@ -1,0 +1,824 @@
+diff --git a/external/psvpfstools b/external/psvpfstools
+--- a/external/psvpfstools
++++ b/external/psvpfstools
+@@ -1 +1 @@
+-Subproject commit e21df9a74852433f48d6593b8ef203dc7c424e05
++Subproject commit e21df9a74852433f48d6593b8ef203dc7c424e05-dirty
+diff --git a/external/spdlog b/external/spdlog
+index 79524dd..d6c93f3 160000
+--- a/external/spdlog
++++ b/external/spdlog
+@@ -1 +1 @@
+-Subproject commit 79524ddd08a4ec981b7fea76afd08ee05f83755d
++Subproject commit d6c93f38a08b4ea0f8ffcfd7f7857307d5d5c3fa
+diff --git a/vita3k/app/src/apps_list.cpp b/vita3k/app/src/apps_list.cpp
+index 797c1ab..4929483 100644
+--- a/vita3k/app/src/apps_list.cpp
++++ b/vita3k/app/src/apps_list.cpp
+@@ -331,9 +331,9 @@ AppEntry read_app_info(EmuEnvState &emuenv, const std::string &title_id) {
+         info.app_savedata = title_id;
+         info.app_short_title = title_id;
+         info.app_title = title_id;
+-        info.app_version = "N/A";
+-        info.app_category = "N/A";
+-        info.app_parental_level = "N/A";
++        info.app_version = "0.00";
++        info.app_category = "-";
++        info.app_parental_level = "0";
+     }
+ 
+     AppEntry app;
+diff --git a/vita3k/audio/src/audio.cpp b/vita3k/audio/src/audio.cpp
+index faa66d3..c923547 100644
+--- a/vita3k/audio/src/audio.cpp
++++ b/vita3k/audio/src/audio.cpp
+@@ -101,6 +101,9 @@ void AudioState::set_backend(const std::string &adapter_name) {
+ }
+ 
+ AudioOutPortPtr AudioState::open_port(int nb_channels, int freq, int nb_sample) {
++    // Without an audio device the app runs without sound
++    if (!adapter)
++        return nullptr;
+     AudioOutPortPtr port = adapter->open_port(nb_channels, freq, nb_sample);
+     set_volume(*port, port->volume);
+     return port;
+@@ -147,7 +150,8 @@ void AudioState::set_global_volume(float volume) {
+ }
+ 
+ void AudioState::switch_state(const bool pause) {
+-    adapter->switch_state(pause);
++    if (adapter)
++        adapter->switch_state(pause);
+ }
+ 
+ int AudioState::get_rest_sample(AudioOutPort &out_port) {
+diff --git a/vita3k/gxm/include/gxm/state.h b/vita3k/gxm/include/gxm/state.h
+index 7b12b74..990fd54 100644
+--- a/vita3k/gxm/include/gxm/state.h
++++ b/vita3k/gxm/include/gxm/state.h
+@@ -58,6 +58,8 @@ struct GxmState {
+     SceGxmInitializeParams params;
+ 
+     Queue<DisplayCallback> display_queue;
++    std::mutex display_queue_add_mutex;
++    bool display_queue_closed = false;
+     SceUID display_queue_thread;
+     std::thread display_host_thread;
+ 
+@@ -89,6 +91,7 @@ struct GxmState {
+ 
+         memory_mapped_regions.clear();
+         display_queue.reset();
++        display_queue_closed = false;
+         params = {};
+         display_queue_thread = 0;
+         global_timestamp = 1;
+diff --git a/vita3k/modules/SceAudiodec/SceAudiodecUser.cpp b/vita3k/modules/SceAudiodec/SceAudiodecUser.cpp
+index c6667e9..0789603 100644
+--- a/vita3k/modules/SceAudiodec/SceAudiodecUser.cpp
++++ b/vita3k/modules/SceAudiodec/SceAudiodecUser.cpp
+@@ -169,6 +169,11 @@ static int create_decoder(EmuEnvState &emuenv, SceAudiodecCtrl *ctrl, SceAudiode
+     case SCE_AUDIODEC_TYPE_AT9: {
+         SceAudiodecInfoAt9 &info = ctrl->info.get(emuenv.mem)->at9;
+         DecoderPtr decoder = std::make_shared<Atrac9DecoderState>(info.config_data);
++        // libatrac9 leaves the codec info empty for a config it can't parse, which would divide by zero below
++        if (decoder->get(DecoderQuery::AT9_SAMPLE_PER_SUPERFRAME) == 0) {
++            state->codecs[codec].erase(handle);
++            return SCE_AUDIODEC_AT9_ERROR_INVALID_CONFIG;
++        }
+         state->decoders[handle] = decoder;
+ 
+         info.channels = decoder->get(DecoderQuery::CHANNELS);
+diff --git a/vita3k/modules/SceFios2Kernel/SceFios2Kernel.cpp b/vita3k/modules/SceFios2Kernel/SceFios2Kernel.cpp
+index 64020f5..1ea8e4a 100644
+--- a/vita3k/modules/SceFios2Kernel/SceFios2Kernel.cpp
++++ b/vita3k/modules/SceFios2Kernel/SceFios2Kernel.cpp
+@@ -21,6 +21,8 @@
+ #include <io/functions.h>
+ #endif
+ 
++#include <io/state.h>
++
+ #include <util/tracy.h>
+ TRACY_MODULE_NAME(SceFios2Kernel);
+ 
+@@ -37,12 +39,25 @@ struct sceFiosKernelOverlayResolveWithRangeSync_opt {
+     int reserved6;
+ };
+ 
++static constexpr int SCE_FIOS_ERROR_NULL_OUT_ID = 0x80820006;
++
+ EXPORT(int, _sceFiosKernelOverlayAdd) {
+     return UNIMPLEMENTED();
+ }
+ 
+-EXPORT(int, _sceFiosKernelOverlayAddForProcess) {
+-    return UNIMPLEMENTED();
++EXPORT(int, _sceFiosKernelOverlayAddForProcess, SceUID pid, const SceFiosProcessOverlay *pOverlay, SceUID *pOutID) {
++    TRACY_FUNC(_sceFiosKernelOverlayAddForProcess, pid, pOverlay, pOutID);
++    if (!pOutID)
++        return SCE_FIOS_ERROR_NULL_OUT_ID;
++
++    // paths are not remapped, so only an overlay that maps a path onto itself is accepted
++    if (!pOverlay || strncmp(pOverlay->dst, pOverlay->src, SCE_FIOS_OVERLAY_POINT_MAX) != 0)
++        return UNIMPLEMENTED();
++
++    STUBBED("Identity overlay, nothing to remap");
++    const std::lock_guard<std::mutex> guard(emuenv.io.overlay_mutex);
++    *pOutID = emuenv.io.next_overlay_id++;
++    return 0;
+ }
+ 
+ EXPORT(int, _sceFiosKernelOverlayDHChstatSync) {
+diff --git a/vita3k/modules/SceGxm/SceGxm.cpp b/vita3k/modules/SceGxm/SceGxm.cpp
+index 52b7694..d1b0df3 100644
+--- a/vita3k/modules/SceGxm/SceGxm.cpp
++++ b/vita3k/modules/SceGxm/SceGxm.cpp
+@@ -1832,7 +1832,7 @@ EXPORT(SceGxmColorSurfaceType, sceGxmColorSurfaceGetType, const SceGxmColorSurfa
+ 
+ EXPORT(int, sceGxmColorSurfaceInit, SceGxmColorSurface *surface, SceGxmColorFormat colorFormat, SceGxmColorSurfaceType surfaceType, SceGxmColorSurfaceScaleMode scaleMode, SceGxmOutputRegisterSize outputRegisterSize, uint32_t width, uint32_t height, uint32_t strideInPixels, Ptr<void> data) {
+     TRACY_FUNC(sceGxmColorSurfaceInit, surface, colorFormat, surfaceType, scaleMode, outputRegisterSize, width, height, strideInPixels, data);
+-    if (!surface || !data)
++    if (!surface)
+         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
+ 
+     if (width == 0 || width > 4096 || height == 0 || height > 4096)
+@@ -2240,16 +2240,24 @@ EXPORT(int, sceGxmDestroyRenderTarget, Ptr<SceGxmRenderTarget> renderTarget) {
+ 
+ EXPORT(int, sceGxmDisplayQueueAddEntry, Ptr<SceGxmSyncObject> oldBuffer, Ptr<SceGxmSyncObject> newBuffer, Ptr<const void> callbackData) {
+     TRACY_FUNC(sceGxmDisplayQueueAddEntry, oldBuffer, newBuffer, callbackData);
+-    if (!oldBuffer || !newBuffer)
++    if (!emuenv.gxm.params.displayQueueCallback)
++        return RET_ERROR(SCE_GXM_ERROR_UNINITIALIZED);
++    const uint32_t data_size = emuenv.gxm.params.displayQueueCallbackDataSize;
++    if (!oldBuffer || !newBuffer || (!callbackData && data_size != 0))
+         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
+ 
+-    const Address address = alloc(emuenv.mem, emuenv.gxm.params.displayQueueCallbackDataSize, __FUNCTION__);
+-    const Ptr<void> ptr(address);
+-    memcpy(ptr.get(emuenv.mem), callbackData.get(emuenv.mem), emuenv.gxm.params.displayQueueCallbackDataSize);
++    // The firmware waits for a free slot before it reserves the sync objects
++    const std::lock_guard<std::mutex> add_guard(emuenv.gxm.display_queue_add_mutex);
++    if (emuenv.gxm.display_queue_closed)
++        return RET_ERROR(SCE_GXM_ERROR_UNINITIALIZED);
++    if (!emuenv.gxm.display_queue.wait_space())
++        return 0;
++
++    const Address address = alloc(emuenv.mem, data_size, __FUNCTION__);
++    memcpy(Ptr<void>(address).get(emuenv.mem), callbackData.get(emuenv.mem), data_size);
+ 
+     DisplayFrameInfo *frame = predict_next_image(emuenv, newBuffer.address());
+ 
+-    // Block future rendering by setting values of sync object
+     SceGxmSyncObject *oldBufferSync = oldBuffer.get(emuenv.mem);
+     SceGxmSyncObject *newBufferSync = newBuffer.get(emuenv.mem);
+ 
+@@ -2262,13 +2270,19 @@ EXPORT(int, sceGxmDisplayQueueAddEntry, Ptr<SceGxmSyncObject> oldBuffer, Ptr<Sce
+         .frame_predicted = frame != nullptr
+     };
+ 
++    const uint32_t old_last_display = oldBufferSync->last_display;
++    const uint32_t new_last_display = newBufferSync->last_display;
+     oldBufferSync->last_display = ++oldBufferSync->timestamp_ahead;
+     if (oldBufferSync != newBufferSync)
+         newBufferSync->last_display = ++newBufferSync->timestamp_ahead;
+     emuenv.gxm.last_display_global = emuenv.gxm.global_timestamp.fetch_add(1, std::memory_order_relaxed);
+ 
+-    // function may be blocking here (expected behavior)
+-    emuenv.gxm.display_queue.push(display_callback);
++    if (!emuenv.gxm.display_queue.push(display_callback)) {
++        oldBufferSync->last_display = old_last_display;
++        newBufferSync->last_display = new_last_display;
++        free(emuenv.mem, address);
++        return 0;
++    }
+ 
+     // TODO: I do this because the sync function does not have access to the display state, but this is not great
+     renderer::Context *active_renderer_context = nullptr;
+@@ -2282,15 +2296,13 @@ EXPORT(int, sceGxmDisplayQueueAddEntry, Ptr<SceGxmSyncObject> oldBuffer, Ptr<Sce
+ 
+     renderer::send_single_command(*emuenv.renderer, nullptr, renderer::CommandOpcode::NewFrame, false, frame, &emuenv.display, active_renderer_context);
+ 
+-    if (emuenv.gxm.params.displayQueueMaxPendingCount == 1)
+-        // double buffering, not handled by the queue configuration
+-        emuenv.gxm.display_queue.wait_empty();
+-
+     return 0;
+ }
+ 
+ EXPORT(int, sceGxmDisplayQueueFinish) {
+     TRACY_FUNC(sceGxmDisplayQueueFinish);
++    if (!emuenv.gxm.params.displayQueueCallback)
++        return RET_ERROR(SCE_GXM_ERROR_UNINITIALIZED);
+     emuenv.gxm.display_queue.wait_empty();
+ 
+     return 0;
+@@ -2878,12 +2890,13 @@ EXPORT(int, sceGxmInitialize, const SceGxmInitializeParams *params) {
+         return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
+     }
+ 
++    if (params->displayQueueCallback && (params->displayQueueMaxPendingCount == 0 || params->displayQueueMaxPendingCount > 16 || params->displayQueueCallbackDataSize == 0)) {
++        return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
++    }
++
+     emuenv.gxm.params = *params;
+-    // hack, limit the number of frame rendering at the same time to at most 3
+-    // also, the last frame won't be in the queue so decrease the count by 1
+-    // the case where displayQueueMaxPendingCount is 1 handled in sceGxmDisplayQueueAddEntry
+-    const uint32_t max_queue_size = std::max(std::min(params->displayQueueMaxPendingCount, 3U) - 1, 1U);
+-    emuenv.gxm.display_queue.maxPendingCount_ = max_queue_size;
++    // A slot stays occupied until its callback returns, like the firmware
++    emuenv.gxm.display_queue.maxPendingCount_ = params->displayQueueMaxPendingCount;
+ 
+     const ThreadStatePtr main_thread = emuenv.kernel.get_thread(thread_id);
+     const ThreadStatePtr display_queue_thread = emuenv.kernel.create_thread(emuenv.mem, "SceGxmDisplayQueue", Ptr<void>(0), SCE_KERNEL_HIGHEST_PRIORITY_USER, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_DEFAULT, 0, nullptr);
+@@ -2894,6 +2907,7 @@ EXPORT(int, sceGxmInitialize, const SceGxmInitializeParams *params) {
+ 
+     // Reset the queue in case sceGxmTerminate was called earlier
+     emuenv.gxm.display_queue.reset();
++    emuenv.gxm.display_queue_closed = false;
+     emuenv.gxm.display_host_thread = std::thread(display_entry_thread, std::ref(emuenv));
+     emuenv.gxm.notification_region = Ptr<uint32_t>(alloc(emuenv.mem, MiB(1), "SceGxmNotificationRegion"));
+     memset(emuenv.gxm.notification_region.get(emuenv.mem), 0, MiB(1));
+@@ -4935,6 +4949,10 @@ EXPORT(int, sceGxmSyncObjectDestroy, Ptr<SceGxmSyncObject> syncObject) {
+ 
+ EXPORT(int, sceGxmTerminate) {
+     TRACY_FUNC(sceGxmTerminate);
++    {
++        const std::lock_guard<std::mutex> add_guard(emuenv.gxm.display_queue_add_mutex);
++        emuenv.gxm.display_queue_closed = true;
++    }
+     // Make sure everything is done in SDL side before killing Vita thread
+     emuenv.gxm.display_queue.wait_empty();
+     gxm::destroy_all_contexts(emuenv, false);
+diff --git a/vita3k/modules/SceSysmem/SceSysmem.cpp b/vita3k/modules/SceSysmem/SceSysmem.cpp
+index 10cfebc..9b1df48 100644
+--- a/vita3k/modules/SceSysmem/SceSysmem.cpp
++++ b/vita3k/modules/SceSysmem/SceSysmem.cpp
+@@ -123,10 +123,13 @@ static SceInt32 alignment_error(SceKernelMemBlockType type, SceSize alignment) {
+     if (alignment == 0)
+         return 0;
+     const SceUInt32 phymempart = type & MEMBLOCK_TYPE_PHYMEMPART_MASK;
+-    if (phymempart == MEMBLOCK_TYPE_PHYMEMPART_PHYCONT || (alignment & (alignment - 1)) != 0)
++    if ((alignment & (alignment - 1)) != 0)
+         return SCE_KERNEL_ERROR_INVALID_ARGUMENT;
++    // Under a page the alignment is below what every block has anyway
++    if (phymempart == MEMBLOCK_TYPE_PHYMEMPART_PHYCONT)
++        return alignment >= MEMBLOCK_MIN_ALIGNMENT ? SCE_KERNEL_ERROR_INVALID_ARGUMENT : 0;
+     if (phymempart == MEMBLOCK_TYPE_PHYMEMPART_CDRAM) {
+-        if (alignment < MEMBLOCK_CDRAM_MIN_ALIGNMENT)
++        if (alignment >= MEMBLOCK_MIN_ALIGNMENT && alignment < MEMBLOCK_CDRAM_MIN_ALIGNMENT)
+             return SCE_KERNEL_ERROR_NO_FREE_PHYSICAL_PAGE_CDRAM;
+         return alignment > MiB(64) ? SCE_KERNEL_ERROR_INVALID_ARGUMENT : 0;
+     }
+diff --git a/vita3k/renderer/include/renderer/functions.h b/vita3k/renderer/include/renderer/functions.h
+index 831844a..5637983 100644
+--- a/vita3k/renderer/include/renderer/functions.h
++++ b/vita3k/renderer/include/renderer/functions.h
+@@ -216,6 +216,7 @@ namespace texture {
+ void palette_texture_to_rgba_4(uint32_t *dst, const uint8_t *src, uint32_t width, uint32_t height, const uint32_t *palette);
+ void palette_texture_to_rgba_8(uint32_t *dst, const uint8_t *src, uint32_t width, uint32_t height, const uint32_t *palette);
+ void yuv420_texture_to_rgb(YUVConversionCache &cache, uint8_t *dst, const uint8_t *src, uint32_t width, uint32_t height, uint32_t layout_width, uint32_t layout_height, bool is_p3);
++void yuv422_texture_to_rgba(uint8_t *dst, const uint8_t *src, uint32_t width, uint32_t height, SceGxmTextureFormat fmt);
+ const uint32_t *get_texture_palette(const SceGxmTexture &texture, const MemState &mem);
+ 
+ // Assume fmt is a bcn format
+diff --git a/vita3k/renderer/include/renderer/vulkan/state.h b/vita3k/renderer/include/renderer/vulkan/state.h
+index 9c02cc1..cad578c 100644
+--- a/vita3k/renderer/include/renderer/vulkan/state.h
++++ b/vita3k/renderer/include/renderer/vulkan/state.h
+@@ -91,6 +91,8 @@ struct VKState : public renderer::State {
+ 
+     // objects for which one copy is needed for every frame being rendered at the same time
+     std::array<FrameObject, MAX_FRAMES_RENDERING> frames;
++    // shared by all the contexts, like the frame objects
++    uint64_t frame_timestamp = 1;
+     // start at 1 because last_frame_waited is set to 0
+     int current_frame_idx = 1;
+ 
+@@ -107,6 +109,11 @@ struct VKState : public renderer::State {
+ 
+     // queue where we put requests that need to wait for the GPU
+     Queue<WaitThreadRequest> request_queue;
++    // only used if memory mapping is enabled, one thread for all the contexts as they share the queue
++    std::thread gpu_request_wait_thread;
++    std::mutex new_frame_mutex;
++    std::condition_variable new_frame_condv;
++    uint64_t last_frame_waited = 0;
+ 
+     vkutil::Image default_image;
+     vkutil::Buffer default_buffer;
+@@ -142,6 +149,7 @@ struct VKState : public renderer::State {
+     bool create(std::unique_ptr<renderer::State> &state, const Config &config);
+     void late_init(const Config &cfg, const std::string_view game_id, MemState &mem) override;
+     void cleanup() override;
++    void wait_thread_function(const MemState &mem);
+ 
+     TextureCache *get_texture_cache() override {
+         return &texture_cache;
+diff --git a/vita3k/renderer/include/renderer/vulkan/types.h b/vita3k/renderer/include/renderer/vulkan/types.h
+index dcb1280..690892e 100644
+--- a/vita3k/renderer/include/renderer/vulkan/types.h
++++ b/vita3k/renderer/include/renderer/vulkan/types.h
+@@ -102,7 +102,7 @@ struct FrameObject {
+     vk::CommandPool prerender_pool;
+ 
+     std::vector<vk::Fence> rendered_fences;
+-    // equals to context.frame_timestamp when the frame object is used
++    // equals to state.frame_timestamp when the frame object is used
+     uint64_t frame_timestamp;
+ 
+     // there are at most 16 different textures for a given stage
+@@ -239,7 +239,6 @@ struct VKContext : public renderer::Context {
+ 
+     MemState &mem;
+ 
+-    uint64_t frame_timestamp = 1;
+     uint64_t scene_timestamp = 1;
+     // Unlike scene_timestamp, recording splits do not advance the logical GXM scene.
+     uint64_t gxm_scene_id = 0;
+@@ -343,12 +342,6 @@ struct VKContext : public renderer::Context {
+     // only useful if shader interlock is enabled, to know if we need to transition
+     bool last_draw_was_framebuffer_fetch;
+ 
+-    // only used if memory mapping is enabled
+-    std::mutex new_frame_mutex;
+-    std::condition_variable new_frame_condv;
+-    std::thread gpu_request_wait_thread;
+-    uint64_t last_frame_waited = 0;
+-
+     explicit VKContext(VKState &state, MemState &mem);
+     // TODO: properly destroy the context
+     ~VKContext() override;
+@@ -363,9 +356,6 @@ struct VKContext : public renderer::Context {
+ 
+     // check (when the render target has macroblock set) if we are drawing to another block
+     void check_for_macroblock_change(bool is_draw);
+-
+-private:
+-    void wait_thread_function(const MemState &mem);
+ };
+ 
+ struct VKRenderTarget : public renderer::RenderTarget {
+diff --git a/vita3k/renderer/src/scene.cpp b/vita3k/renderer/src/scene.cpp
+index f466887..b445738 100644
+--- a/vita3k/renderer/src/scene.cpp
++++ b/vita3k/renderer/src/scene.cpp
+@@ -72,9 +72,10 @@ COMMAND(handle_set_context) {
+     if (depth_stencil_surface && !depth_stencil_surface->disabled()) {
+         render_context->record.depth_stencil_surface = *depth_stencil_surface;
+     } else {
+-        render_context->record.depth_stencil_surface.depth_data.reset();
+-        render_context->record.depth_stencil_surface.stencil_data.reset();
++        render_context->record.depth_stencil_surface = {};
++        render_context->record.depth_stencil_surface.background_depth = 1.0f;
+         render_context->record.depth_stencil_surface.mask = 1;
++        render_context->record.depth_stencil_surface.unk2 = 1;
+     }
+ 
+     destroy_command_payload(*helper.cmd);
+diff --git a/vita3k/renderer/src/texture/cache.cpp b/vita3k/renderer/src/texture/cache.cpp
+index 8b1d732..1414d63 100644
+--- a/vita3k/renderer/src/texture/cache.cpp
++++ b/vita3k/renderer/src/texture/cache.cpp
+@@ -325,8 +325,8 @@ void TextureCache::upload_texture(const SceGxmTexture &gxm_texture, MemState &me
+     const SceGxmTextureFormat fmt = gxm::get_format(gxm_texture);
+     const SceGxmTextureBaseFormat base_format = gxm::get_base_format(fmt);
+ 
+-    if (base_format == SCE_GXM_TEXTURE_BASE_FORMAT_YUV422) {
+-        LOG_ERROR_ONCE("Unimplemented YUV format 0x{:0X}, please report it to the developers.", fmt::underlying(base_format));
++    if (base_format == SCE_GXM_TEXTURE_BASE_FORMAT_YUV422 && gxm_texture.texture_type() != SCE_GXM_TEXTURE_LINEAR && gxm_texture.texture_type() != SCE_GXM_TEXTURE_LINEAR_STRIDED) {
++        LOG_ERROR_ONCE("Unimplemented non-linear YUV422 texture (type 0x{:0X}), please report it to the developers.", fmt::underlying(gxm_texture.texture_type()));
+         return;
+     }
+ 
+@@ -559,6 +559,14 @@ void TextureCache::upload_texture(const SceGxmTexture &gxm_texture, MemState &me
+             bpp = 32;
+             upload_format = SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8;
+             break;
++        case SCE_GXM_TEXTURE_BASE_FORMAT_YUV422:
++            texture_data_decompressed.resize(pixels_per_stride * memory_height * 4);
++            yuv422_texture_to_rgba(texture_data_decompressed.data(), static_cast<const uint8_t *>(pixels), pixels_per_stride, memory_height, fmt);
++            pixels = texture_data_decompressed.data();
++            bytes_per_pixel = 4;
++            bpp = 32;
++            upload_format = SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8;
++            break;
+         default:
+             break;
+         }
+diff --git a/vita3k/renderer/src/texture/yuv.cpp b/vita3k/renderer/src/texture/yuv.cpp
+index fe04180..3af3fe7 100644
+--- a/vita3k/renderer/src/texture/yuv.cpp
++++ b/vita3k/renderer/src/texture/yuv.cpp
+@@ -18,6 +18,8 @@
+ #include <renderer/functions.h>
+ #include <renderer/texture_cache.h>
+ 
++#include <algorithm>
++
+ extern "C" {
+ #include <libswscale/swscale.h>
+ }
+@@ -82,6 +84,56 @@ void yuv420_texture_to_rgb(YUVConversionCache &cache, uint8_t *dst, const uint8_
+     assert(error == height);
+ }
+ 
++// Packed 4:2:2, two pixels in 4 bytes. CSC0 is BT.601 and CSC1 BT.709, both video range (as the
++// YUV420 path above, which uses swscale's default BT.601 video range).
++void yuv422_texture_to_rgba(uint8_t *dst, const uint8_t *src, uint32_t width, uint32_t height, SceGxmTextureFormat fmt) {
++    const auto mode = static_cast<SceGxmTextureSwizzleYUV422Mode>(fmt & SCE_GXM_TEXTURE_SWIZZLE_MASK);
++    const bool bt709 = mode >= SCE_GXM_TEXTURE_SWIZZLE_YUYV_CSC1;
++    // byte offsets of Y0, Y1, U and V in each 4-byte pair
++    int y0, y1, u, v;
++    switch (mode) {
++    case SCE_GXM_TEXTURE_SWIZZLE_YUYV_CSC0:
++    case SCE_GXM_TEXTURE_SWIZZLE_YUYV_CSC1:
++        y0 = 0, u = 1, y1 = 2, v = 3;
++        break;
++    case SCE_GXM_TEXTURE_SWIZZLE_YVYU_CSC0:
++    case SCE_GXM_TEXTURE_SWIZZLE_YVYU_CSC1:
++        y0 = 0, v = 1, y1 = 2, u = 3;
++        break;
++    case SCE_GXM_TEXTURE_SWIZZLE_UYVY_CSC0:
++    case SCE_GXM_TEXTURE_SWIZZLE_UYVY_CSC1:
++        u = 0, y0 = 1, v = 2, y1 = 3;
++        break;
++    default: // VYUY
++        v = 0, y0 = 1, u = 2, y1 = 3;
++        break;
++    }
++    // 16.16 fixed point coefficients: Y scale, V->R, U->G, V->G, U->B
++    const int ky = 76309; // 255 / 219
++    const int kvr = bt709 ? 117504 : 104597;
++    const int kug = bt709 ? 13954 : 25675;
++    const int kvg = bt709 ? 34903 : 53279;
++    const int kub = bt709 ? 138453 : 132201;
++    const auto clamp8 = [](int x) { return static_cast<uint8_t>(std::clamp(x >> 16, 0, 255)); };
++    const auto pixel = [&](uint8_t *out, int y, int cu, int cv) {
++        const int luma = (y - 16) * ky + 32768;
++        out[0] = clamp8(luma + kvr * cv);
++        out[1] = clamp8(luma - kug * cu - kvg * cv);
++        out[2] = clamp8(luma + kub * cu);
++        out[3] = 255;
++    };
++    for (uint32_t row = 0; row < height; row++) {
++        const uint8_t *in = src + static_cast<size_t>(row) * width * 2;
++        uint8_t *out = dst + static_cast<size_t>(row) * width * 4;
++        for (uint32_t x = 0; x + 1 < width; x += 2, in += 4, out += 8) {
++            const int cu = in[u] - 128;
++            const int cv = in[v] - 128;
++            pixel(out, in[y0], cu, cv);
++            pixel(out + 4, in[y1], cu, cv);
++        }
++    }
++}
++
+ } // namespace renderer::texture
+ 
+ renderer::TextureCache::~TextureCache() {
+diff --git a/vita3k/renderer/src/vulkan/context.cpp b/vita3k/renderer/src/vulkan/context.cpp
+index d62fd6d..21694f6 100644
+--- a/vita3k/renderer/src/vulkan/context.cpp
++++ b/vita3k/renderer/src/vulkan/context.cpp
+@@ -30,21 +30,21 @@
+ 
+ namespace renderer::vulkan {
+ 
+-void VKContext::wait_thread_function(const MemState &mem) {
++void VKState::wait_thread_function(const MemState &mem) {
+     // try to wait for multiple fences at the same time if possible
+     std::vector<vk::Fence> fences;
+ 
+     auto wait_for_fences = [&]() {
+         while (!fences.empty()) {
+             // timeout so we can check for shutdown
+-            auto result = state.device.waitForFences(fences, VK_TRUE, 100'000'000ULL);
++            auto result = device.waitForFences(fences, VK_TRUE, 100'000'000ULL);
+             if (result == vk::Result::eSuccess) {
+                 // don't reset them
+                 fences.clear();
+                 return;
+             }
+             if (result == vk::Result::eTimeout) {
+-                if (state.request_queue.is_aborted()) {
++                if (request_queue.is_aborted()) {
+                     fences.clear();
+                     return;
+                 }
+@@ -58,7 +58,7 @@ void VKContext::wait_thread_function(const MemState &mem) {
+     };
+ 
+     while (true) {
+-        auto wait_request = state.request_queue.pop();
++        auto wait_request = request_queue.pop();
+ 
+         if (!wait_request)
+             break;
+@@ -72,7 +72,7 @@ void VKContext::wait_thread_function(const MemState &mem) {
+                                wait_for_fences();
+ 
+                                // same as in handle_sync_surface_data
+-                               std::unique_lock<std::mutex> lock(state.notification_mutex);
++                               std::unique_lock<std::mutex> lock(notification_mutex);
+ 
+                                if (request.notifications[0].address)
+                                    *request.notifications[0].address.get(mem) = request.notifications[0].value;
+@@ -81,7 +81,7 @@ void VKContext::wait_thread_function(const MemState &mem) {
+ 
+                                // unlocking before a notify should be faster
+                                lock.unlock();
+-                               state.notification_ready.notify_all();
++                               notification_ready.notify_all();
+                            }
+                        },
+                        [&](FrameDoneRequest &request) {
+@@ -96,8 +96,8 @@ void VKContext::wait_thread_function(const MemState &mem) {
+                        },
+                        [&](BufferSyncRequest &request) {
+                            wait_for_fences();
+-                           auto mem_it = state.mapped_memories.lower_bound(request.location);
+-                           if (mem_it == state.mapped_memories.end() || mem_it->first + mem_it->second.size < request.location + request.size) {
++                           auto mem_it = mapped_memories.lower_bound(request.location);
++                           if (mem_it == mapped_memories.end() || mem_it->first + mem_it->second.size < request.location + request.size) {
+                                LOG_ERROR("Buffer Sync request for {}-{} is not fully mapped", log_hex(request.location), log_hex(request.location + request.size));
+                                return;
+                            }
+@@ -108,7 +108,7 @@ void VKContext::wait_thread_function(const MemState &mem) {
+                        [&](PostSurfaceSyncRequest &request) {
+                            wait_for_fences();
+ 
+-                           state.surface_cache.perform_post_surface_sync(mem, request.cache_info);
++                           surface_cache.perform_post_surface_sync(mem, request.cache_info);
+                        },
+                        [&](SyncSignalRequest &request) {
+                            wait_for_fences();
+@@ -256,10 +256,10 @@ void VKContext::start_recording(bool first_in_scene) {
+         return;
+     }
+ 
+-    if (render_target->last_used_frame != frame_timestamp) {
++    if (render_target->last_used_frame != state.frame_timestamp) {
+         // reset idx if we are in a new frame
+         render_target->cmd_buffer_idx = 0;
+-        render_target->last_used_frame = frame_timestamp;
++        render_target->last_used_frame = state.frame_timestamp;
+     }
+ 
+     // safety check
+@@ -840,32 +840,33 @@ void VKContext::check_for_macroblock_change(bool is_draw) {
+ }
+ 
+ void new_frame(VKContext &context) {
+-    if (context.state.features.enable_memory_mapping) {
+-        FrameDoneRequest request = { context.frame_timestamp };
+-        context.state.request_queue.push(request);
++    VKState &state = context.state;
++    if (state.features.enable_memory_mapping) {
++        FrameDoneRequest request = { state.frame_timestamp };
++        state.request_queue.push(request);
+ 
+-        context.state.surface_cache.clear_surfaces_changed();
++        state.surface_cache.clear_surfaces_changed();
+     }
+ 
+-    context.frame_timestamp++;
+-    context.state.current_frame_idx = context.frame_timestamp % MAX_FRAMES_RENDERING;
++    state.frame_timestamp++;
++    state.current_frame_idx = state.frame_timestamp % MAX_FRAMES_RENDERING;
+ 
+-    vk::Device device = context.state.device;
+-    FrameObject &frame = context.state.frame();
++    vk::Device device = state.device;
++    FrameObject &frame = state.frame();
+ 
+     // wait on all fences still present to make sure
+     if (!frame.rendered_fences.empty()) {
+         // wait for the fences, then reset them
+ 
+-        if (context.state.features.enable_memory_mapping) {
++        if (state.features.enable_memory_mapping) {
+             // this will underflow for the first MAX_FRAMES_RENDERING frames
+             // but that's not an issue as frame.rendered_fences will be empty
+-            uint64_t previous_frame_timestamp = context.frame_timestamp - MAX_FRAMES_RENDERING;
++            uint64_t previous_frame_timestamp = state.frame_timestamp - MAX_FRAMES_RENDERING;
+ 
+             // the wait is done by the wait thread
+-            std::unique_lock<std::mutex> lock(context.new_frame_mutex);
+-            context.new_frame_condv.wait(lock, [&]() {
+-                return context.last_frame_waited >= previous_frame_timestamp;
++            std::unique_lock<std::mutex> lock(state.new_frame_mutex);
++            state.new_frame_condv.wait(lock, [&]() {
++                return state.last_frame_waited >= previous_frame_timestamp;
+             });
+         } else {
+ #ifdef VITA3K_UWP
+@@ -903,7 +904,7 @@ void new_frame(VKContext &context) {
+     context.last_vert_texture_count = ~0;
+     context.last_frag_texture_count = ~0;
+ 
+-    frame.frame_timestamp = context.frame_timestamp;
++    frame.frame_timestamp = state.frame_timestamp;
+ }
+ 
+ void signal_sync_object(VKState &state, SceGxmSyncObject *sync_object, uint32_t timestamp) {
+diff --git a/vita3k/renderer/src/vulkan/creation.cpp b/vita3k/renderer/src/vulkan/creation.cpp
+index 0aa395b..cfcacbc 100644
+--- a/vita3k/renderer/src/vulkan/creation.cpp
++++ b/vita3k/renderer/src/vulkan/creation.cpp
+@@ -58,7 +58,8 @@ VKContext::VKContext(VKState &state, MemState &mem)
+         std::fill_n(vertex_stream_buffers, SCE_GXM_MAX_VERTEX_STREAMS, state.default_buffer.buffer);
+ 
+         // also initialize the gpu wait thread
+-        gpu_request_wait_thread = std::thread(&VKContext::wait_thread_function, this, std::ref(mem));
++        if (!state.gpu_request_wait_thread.joinable())
++            state.gpu_request_wait_thread = std::thread(&VKState::wait_thread_function, &state, std::cref(mem));
+     } else {
+         // these are not needed when using memory mapping
+         vertex_stream_ring_buffer.create();
+@@ -150,9 +151,6 @@ VKContext::VKContext(VKState &state, MemState &mem)
+ }
+ 
+ VKContext::~VKContext() {
+-    if (gpu_request_wait_thread.joinable())
+-        gpu_request_wait_thread.join();
+-
+     for (auto pool : visibility_query_pools)
+         state.device.destroy(pool);
+     visibility_buffers.clear();
+diff --git a/vita3k/renderer/src/vulkan/pipeline_cache.cpp b/vita3k/renderer/src/vulkan/pipeline_cache.cpp
+index 1768ae8..8697241 100644
+--- a/vita3k/renderer/src/vulkan/pipeline_cache.cpp
++++ b/vita3k/renderer/src/vulkan/pipeline_cache.cpp
+@@ -49,6 +49,8 @@ void *vita3k_uwp_dzn_proc(const char *name);
+ int vita3k_uwp_quad_wait_ms = 0;
+ #endif
+ 
++#include <algorithm>
++
+ namespace renderer::vulkan {
+ 
+ // Size of the record containing what is needed for the pipeline construction (what is after is dynamic state)
+@@ -862,6 +864,13 @@ static const vk::SpecializationInfo srgb_info_false = {
+     .pData = &srgb_entry_false
+ };
+ 
++static bool manifest_lists(VKState &state, std::mutex &shaders_mutex, const Sha256Hash &hash) {
++    std::lock_guard<std::mutex> guard(shaders_mutex);
++    return std::ranges::any_of(state.shaders_cache_hashs, [&hash](const ShadersHash &entry) {
++        return entry.vert == hash || entry.frag == hash;
++    });
++}
++
+ vk::PipelineShaderStageCreateInfo PipelineCache::retrieve_shader(const SceGxmProgram *program, const Sha256Hash &hash, bool is_vertex, bool maskupdate, MemState &mem, const shader::Hints &hints, bool is_srgb) {
+     const vk::ShaderModule shader_compiling = std::bit_cast<vk::ShaderModule>(~0ULL);
+     const bool masked_fetch = !is_vertex && hints.masked_framebuffer_fetch;
+@@ -893,7 +902,9 @@ vk::PipelineShaderStageCreateInfo PipelineCache::retrieve_shader(const SceGxmPro
+             *shader_module = shader_compiling;
+     }
+ 
+-    if (*shader_module == shader_compiling && !masked_fetch) {
++    const bool listed = manifest_lists(state, shaders_mutex, hash);
++
++    if (*shader_module == shader_compiling && !masked_fetch && listed) {
+         precompile_shader(hash, false);
+     }
+ 
+@@ -916,7 +927,7 @@ vk::PipelineShaderStageCreateInfo PipelineCache::retrieve_shader(const SceGxmPro
+     if (masked_fetch)
+         features.direct_fragcolor = true;
+     const std::string version = masked_fetch ? shader_version + "-masked-fetch1" : shader_version;
+-    shader::usse::SpirvCode source = load_spirv_shader(*program, features, true, hints, maskupdate, state.shaders_path, state.shaders_log_path, version, true);
++    shader::usse::SpirvCode source = load_spirv_shader(*program, features, true, hints, maskupdate, state.shaders_path, state.shaders_log_path, version, listed);
+ 
+     vk::ShaderModuleCreateInfo shader_info{
+         .codeSize = sizeof(uint32_t) * source.size(),
+@@ -1631,6 +1642,9 @@ vk::ShaderModule PipelineCache::precompile_shader(const Sha256Hash &hash, bool s
+     if (!fs::exists(state.shaders_path) || fs::is_empty(state.shaders_path))
+         return nullptr;
+ 
++    if (!manifest_lists(state, shaders_mutex, hash))
++        return nullptr;
++
+     Sha256Hash shader_hash;
+     memcpy(shader_hash.data(), hash.data(), sizeof(Sha256Hash));
+     const std::string shader_file_name = fmt::format("vk{}-{}.spv", shader::CURRENT_VERSION, hex_string(shader_hash));
+diff --git a/vita3k/renderer/src/vulkan/renderer.cpp b/vita3k/renderer/src/vulkan/renderer.cpp
+index e57e960..02c2d2e 100644
+--- a/vita3k/renderer/src/vulkan/renderer.cpp
++++ b/vita3k/renderer/src/vulkan/renderer.cpp
+@@ -1396,6 +1396,8 @@ void VKState::cleanup() {
+     device.waitIdle();
+ 
+     request_queue.abort();
++    if (gpu_request_wait_thread.joinable())
++        gpu_request_wait_thread.join();
+ 
+     context = nullptr;
+ 
+@@ -1489,7 +1491,9 @@ void VKState::cleanup() {
+     gxp_ptr_map.clear();
+     shaders_cache_hashs.clear();
+     request_queue.reset();
++    frame_timestamp = 1;
+     current_frame_idx = 1;
++    last_frame_waited = 0;
+     last_scene_id = 0;
+     shaders_count_compiled = 0;
+     programs_count_pre_compiled = 0;
+@@ -2184,7 +2188,6 @@ void VKState::precompile_shader(const ShadersHash &hash) {
+ 
+ void VKState::preclose_action() {
+     // Stop the GPU request wait thread before destruction begins.
+-    // VKState (owns the queue) is destroyed before VKContext (owns the thread).
+     request_queue.abort();
+ 
+     // make sure we are in a game
+diff --git a/vita3k/renderer/src/vulkan/surface_cache.cpp b/vita3k/renderer/src/vulkan/surface_cache.cpp
+index 75e6a5f..0b04342 100644
+--- a/vita3k/renderer/src/vulkan/surface_cache.cpp
++++ b/vita3k/renderer/src/vulkan/surface_cache.cpp
+@@ -371,8 +371,8 @@ SurfaceRetrieveResult VKSurfaceCache::retrieve_color_surface_for_framebuffer(Mem
+ 
+             // if this surface has not been rendered to for the last 60 frames, consider it is not safe not to render all shaders to it
+             constexpr uint64_t big_delay_between_frames = 60;
+-            state.pipeline_cache.can_use_deferred_compilation = context->frame_timestamp - info.last_frame_rendered < big_delay_between_frames;
+-            info.last_frame_rendered = context->frame_timestamp;
++            state.pipeline_cache.can_use_deferred_compilation = state.frame_timestamp - info.last_frame_rendered < big_delay_between_frames;
++            info.last_frame_rendered = state.frame_timestamp;
+ 
+             if (state.features.support_shader_interlock && vk_format == vk::Format::eR8G8B8A8Srgb) {
+                 return { retrieve_surface_gamma_view(state.device, info), &info.texture };
+@@ -405,7 +405,7 @@ SurfaceRetrieveResult VKSurfaceCache::retrieve_color_surface_for_framebuffer(Mem
+         color_address_lookup.erase(info_added.data.address());
+ 
+     color_surface_queue.set_as_mru(&info_added);
+-    info_added.last_frame_rendered = context->frame_timestamp;
++    info_added.last_frame_rendered = state.frame_timestamp;
+ 
+     color_address_lookup[address] = &info_added;
+ 
+@@ -1341,7 +1341,7 @@ bool VKSurfaceCache::check_for_surface(MemState &mem, Address source_address, Ca
+     // if the frame is already rendered skip
+     // Note: that's not the best behavior but it should be fine
+     // also it prevents invalidated surfaces from causing issues
+-    if (surface.last_frame_rendered + MAX_FRAMES_RENDERING <= context.frame_timestamp)
++    if (surface.last_frame_rendered + MAX_FRAMES_RENDERING <= state.frame_timestamp)
+         return false;
+ 
+     // we found something
+diff --git a/vita3k/renderer/src/vulkan/texture.cpp b/vita3k/renderer/src/vulkan/texture.cpp
+index a17d679..2795293 100644
+--- a/vita3k/renderer/src/vulkan/texture.cpp
++++ b/vita3k/renderer/src/vulkan/texture.cpp
+@@ -184,7 +184,7 @@ void VKTextureCache::prepare_staging_buffer(bool is_configure) {
+     // if we are not using the previous buffer, we wait if the buffer was used at least once,
+     // less than MAX_FRAMES_RENDERING frames ago and we have not yet waited for its fence
+     const bool need_wait = !use_previous_buffer
+-        && is_frame_timestamp_in_flight(staging_buffer->frame_timestamp, context->frame_timestamp)
++        && is_frame_timestamp_in_flight(staging_buffer->frame_timestamp, state.frame_timestamp)
+         && staging_buffer->scene_timestamp > last_waited_scene;
+     const vk::Fence current_fence = context->next_fence;
+ 
+@@ -240,7 +240,7 @@ void VKTextureCache::prepare_staging_buffer(bool is_configure) {
+     cmd_buffer = context->prerender_cmd;
+     if (!use_previous_buffer) {
+         staging_buffer->scene_timestamp = current_scene_timestamp;
+-        staging_buffer->frame_timestamp = context->frame_timestamp;
++        staging_buffer->frame_timestamp = state.frame_timestamp;
+         staging_buffer->waiting_fence = current_fence;
+         staging_buffer->used_so_far = 0;
+ 
+diff --git a/vita3k/threads/include/threads/queue.h b/vita3k/threads/include/threads/queue.h
+index a781df2..48d2779 100644
+--- a/vita3k/threads/include/threads/queue.h
++++ b/vita3k/threads/include/threads/queue.h
+@@ -77,18 +77,25 @@ public:
+         return std::make_unique<T>(item);
+     }
+ 
+-    void push(const T &item) {
++    bool push(const T &item) {
+         {
+             std::unique_lock<std::mutex> mlock(mutex_);
+-            while (!aborted && queue_.size() == maxPendingCount_) {
++            while (!aborted && queue_.size() >= maxPendingCount_) {
+                 cond_.wait(mlock);
+             }
+             if (aborted) {
+-                return;
++                return false;
+             }
+             queue_.push(item);
+         }
+         condempty_.notify_one();
++        return true;
++    }
++
++    bool wait_space() {
++        std::unique_lock<std::mutex> mlock(mutex_);
++        cond_.wait(mlock, [&]() { return aborted || queue_.size() < maxPendingCount_; });
++        return !aborted;
+     }
+ 
+     size_t size() {
