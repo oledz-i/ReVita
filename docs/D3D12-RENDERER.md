@@ -1,0 +1,47 @@
+# Native Direct3D 12 renderer: plan
+
+ReVita's Vulkan renderer already draws through Direct3D 12: Dozen (Mesa's
+Vulkan-on-D3D12 driver) turns every Vulkan call into a D3D12 one. A native
+renderer would remove that layer. This page is the plan for building one
+without breaking the two renderers people play on.
+
+## Why it is worth doing
+
+- Fewer layers: Dozen builds pipeline variants at draw time (the
+  "draw-time variant" stalls in the logs), translates descriptor sets into
+  descriptor heaps and emulates render passes. A native backend can build
+  its pipelines up front and bind resources directly.
+- Features Dozen cannot give Vita3K: reading the render target being drawn
+  to (programmable blending), which both renderers now emulate with a copy
+  before each such draw, can use a rasterizer-ordered view (ROV) on D3D12.
+- No PSO serialization on the console (it removes the device), so pipeline
+  caching has to be ours anyway.
+
+## Shape
+
+The core's renderers implement `renderer::State` and `renderer::Context`
+(`vita3k/renderer`). The D3D12 backend is a third implementation, next to
+`gl/` and `vulkan/`, chosen by a third value of the Backend Renderer option.
+
+| Piece | Source |
+|---|---|
+| Shaders | The existing GXP to SPIR-V translator (`vita3k/shader`), then SPIRV-Cross (already in `external/`) to HLSL, then `D3DCompile` (Shader Model 5.1, DXBC; D3D12 accepts it, and `d3dcompiler_47` is available to UWP apps) |
+| Pipelines | One PSO per (vertex program, fragment program, blend, depth/stencil, formats, primitive type): the same key the Vulkan backend's pipeline cache uses |
+| Surfaces | Port of the Vulkan surface cache: textures and render targets in placed resources, copies with `CopyTextureRegion` |
+| Textures | Port of the Vulkan texture cache; uploads through a ring of upload heaps |
+| Vertex and uniform data | Ring buffers in upload heaps, as the Vulkan backend's ring buffers |
+| Programmable blending | Render target as a UAV in a rasterizer-ordered view where the hardware has them, else the copy the other renderers use |
+| Present | Straight into the app's own swap chain (the presenter in `D3D12Host.cpp` already owns one): no readback to the CPU, which both current renderers need |
+
+## Order of work
+
+1. A device shared with the presenter, a clear colour per frame, present:
+   the backend exists and can be picked.
+2. Shaders: translation and compilation, logged per game; no drawing.
+3. Untextured draws, then textures, then render targets: 2D games first
+   (Undertale), then 3D (Persona 4 Golden, Gravity Rush).
+4. Surface sync, programmable blending, mask bit.
+5. Shader and pipeline caches on disk.
+
+Each step ships only when the one before runs on the console, with Vulkan
+and OpenGL untouched.
