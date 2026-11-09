@@ -1,7 +1,7 @@
 name: Vita3K Cinematic Xbox UI
 on:
   push:
-    branches: [cinematic-ui-overhaul, undertale-boot, astra-undertale]
+    branches: [cinematic-ui-overhaul, undertale-boot, astra-undertale, revita-next]
   workflow_dispatch:
     inputs:
       release:

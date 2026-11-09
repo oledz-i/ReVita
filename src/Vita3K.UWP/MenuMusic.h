@@ -8,5 +8,8 @@ namespace vita3k_uwp {
 // Short, original UI cues: focus (0), select (1), back (2), shelf swipe (3),
 // page change (4) and confirm shimmer (5).
 constexpr unsigned kInterfaceCueCount = 6;
+// Cues 6 to 8 are the focus tick on other notes of the same scale: moving
+// around plays a small, never-repeating melody instead of one tick over and over.
+constexpr unsigned kInterfaceCueAll = 9;
 std::vector<std::uint8_t> GenerateInterfaceCue(unsigned cue);
 }

@@ -4,7 +4,7 @@ name: Dozen from source (OnyxEMU patches + Vita3K-UWP patches)
 # workflows take the newest successful run's artifact (scripts/get-dozen.ps1).
 on:
   push:
-    branches: [astra-undertale]
+    branches: [astra-undertale, revita-next]
     paths:
       - scripts/dozen-patches/**
       - scripts/build-onyx-dozen.ps1

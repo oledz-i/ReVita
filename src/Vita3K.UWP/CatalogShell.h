@@ -8,6 +8,7 @@
 #include <set>
 #include <map>
 #include "CueAudio.h"
+#include <deque>
 #include <functional>
 #include <collection.h>
 #include <ppltasks.h>
@@ -281,6 +282,7 @@ private:
     // SteamGridDB hero (up to 3840 wide) decoded again on every page build
     // froze the menus for a moment.
     std::map<std::wstring, Windows::UI::Xaml::Media::Imaging::BitmapImage^> bitmapCache_;
+    std::deque<std::wstring> bitmapOrder_;
     Windows::UI::Xaml::Media::Imaging::BitmapImage^ CachedBitmap(Platform::String^ uri, int decodeWidth);
     std::wstring screenshotPath_;
     bool screenshotTaken_ = false;
@@ -343,6 +345,12 @@ private:
     void ReadSfo(size_t index, Windows::Storage::StorageFolder^ folder);
     void ChooseCustomArtwork(size_t index);
     void SaveTheme(int theme);
+    void SaveDynamicTheme();
+    void ShowSpotlightArt();
+    Windows::UI::Xaml::DispatcherTimer^ spotTimer_ = nullptr;
+    void ApplyTheme(int theme);
+    int ThemeForNow() const;
+    bool dynamicTheme_ = false;
     void SetMusic(int track);
     void PlayBundledMusic(int track);
     void PrepareCues();

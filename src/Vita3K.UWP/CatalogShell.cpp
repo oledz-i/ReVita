@@ -446,6 +446,8 @@ CatalogShell::CatalogShell() {
             PutPref(L"revita.theme", StringOf(std::to_wstring(theme_)));
         }
         if (theme_ < 0 || theme_ > 7) theme_ = 0;
+        dynamicTheme_ = Pref(L"revita.theme.dynamic", L"0")->Equals(L"1");
+        if (dynamicTheme_) theme_ = ThemeForNow();
     }
     xmbMode_ = Pref(L"ui.layout", L"cinematic")->Equals(L"xmb");
     xmbTheme_ = _wtoi(Pref(L"xmb.theme", L"1")->Data());
@@ -1529,12 +1531,14 @@ Platform::String^ CatalogShell::ArtworkUri(size_t index) {
         return L"ms-appdata:///local/Artwork/" + file;
     return Pref(L"art.remote." + key);
 }
-// A cover as a game case: the front turned a little, and the case's side
-// (the spine) beside it, so the cover reads as a box with depth instead of a
-// flat picture. Settings > Artwork turns it off.
+// A cover as a game case: the front as it is, the case's side (the spine)
+// beside it leaning back, a sheen across the plastic and a soft shadow. Plain
+// 2D transforms only: a 3D projection per cover made every tile its own
+// offscreen surface, which a page of them could feel. Settings > Artwork
+// turns it off.
 Windows::UI::Xaml::UIElement^ CatalogShell::BoxWrap(Border^ poster) {
     if (Pref(L"art.box3d", L"1")->Equals(L"0")) return poster;
-    const double spineWidth = 18;
+    const double spineWidth = 12;
     auto grid = ref new Grid();
     grid->HorizontalAlignment = poster->HorizontalAlignment;
     grid->VerticalAlignment = poster->VerticalAlignment;
@@ -1553,24 +1557,33 @@ Windows::UI::Xaml::UIElement^ CatalogShell::BoxWrap(Border^ poster) {
     grid->ColumnDefinitions->Append(side);
     grid->ColumnDefinitions->Append(front);
 
-    // the side of the case folds back from the front's left edge
+    // the shadow the case drops behind it, down and to the right
+    auto shadow = ref new Border();
+    shadow->CornerRadius = Windows::UI::Xaml::CornerRadius(10);
+    shadow->Background = Solid(Alpha(70, 0, 0, 0));
+    shadow->Margin = Thickness(5, 7, -5, -7);
+    shadow->IsHitTestVisible = false;
+    Grid::SetColumn(shadow, 1);
+    grid->Children->Append(shadow);
+
+    // the spine leans back from the front's left edge
     auto spine = ref new Border();
-    spine->Width = 36;
-    spine->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Right;
-    spine->Background = Gradient(RgbColor(58, 62, 112), RgbColor(16, 17, 38));
-    spine->BorderBrush = Solid(Alpha(60, 255, 255, 255));
+    spine->Background = Gradient(RgbColor(70, 74, 128), RgbColor(18, 19, 42));
+    spine->BorderBrush = Solid(Alpha(70, 255, 255, 255));
     spine->BorderThickness = Thickness(1, 0, 0, 0);
-    spine->CornerRadius = Windows::UI::Xaml::CornerRadius(6, 0, 0, 6);
-    auto spineTurn = ref new PlaneProjection();
-    spineTurn->CenterOfRotationX = 1.0;
-    spineTurn->RotationY = -66;
-    spine->Projection = spineTurn;
+    spine->CornerRadius = Windows::UI::Xaml::CornerRadius(5, 0, 0, 5);
+    spine->Margin = Thickness(0, 4, 0, 4);
+    spine->IsHitTestVisible = false;
+    spine->RenderTransformOrigin = Point(1, 0.5);
+    auto lean = ref new CompositeTransform();
+    lean->SkewY = 14;
+    spine->RenderTransform = lean;
     Grid::SetColumn(spine, 0);
     grid->Children->Append(spine);
 
-    // the front, with a soft sheen across the plastic
+    // the front, with a sheen across the plastic and a light edge where it meets the spine
     auto face = ref new Grid();
-    poster->CornerRadius = Windows::UI::Xaml::CornerRadius(4, 10, 10, 4);
+    poster->CornerRadius = Windows::UI::Xaml::CornerRadius(3, 10, 10, 3);
     face->Children->Append(poster);
     auto sheen = ref new Border();
     sheen->IsHitTestVisible = false;
@@ -1578,18 +1591,20 @@ Windows::UI::Xaml::UIElement^ CatalogShell::BoxWrap(Border^ poster) {
     auto gloss = ref new LinearGradientBrush();
     gloss->StartPoint = Point(0, 0);
     gloss->EndPoint = Point(1, 1);
-    auto stopA = ref new GradientStop(); stopA->Color = Alpha(70, 255, 255, 255); stopA->Offset = 0.0;
-    auto stopB = ref new GradientStop(); stopB->Color = Alpha(0, 255, 255, 255); stopB->Offset = 0.42;
-    auto stopC = ref new GradientStop(); stopC->Color = Alpha(46, 0, 0, 0); stopC->Offset = 1.0;
+    auto stopA = ref new GradientStop(); stopA->Color = Alpha(60, 255, 255, 255); stopA->Offset = 0.0;
+    auto stopB = ref new GradientStop(); stopB->Color = Alpha(0, 255, 255, 255); stopB->Offset = 0.38;
+    auto stopC = ref new GradientStop(); stopC->Color = Alpha(40, 0, 0, 0); stopC->Offset = 1.0;
     gloss->GradientStops->Append(stopA);
     gloss->GradientStops->Append(stopB);
     gloss->GradientStops->Append(stopC);
     sheen->Background = gloss;
     face->Children->Append(sheen);
-    auto faceTurn = ref new PlaneProjection();
-    faceTurn->CenterOfRotationX = 0.0;
-    faceTurn->RotationY = 24;
-    face->Projection = faceTurn;
+    auto edge = ref new Border();
+    edge->IsHitTestVisible = false;
+    edge->Width = 2;
+    edge->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Left;
+    edge->Background = Solid(Alpha(90, 255, 255, 255));
+    face->Children->Append(edge);
     Grid::SetColumn(face, 1);
     grid->Children->Append(face);
     return grid;
@@ -1743,7 +1758,15 @@ BitmapImage^ CatalogShell::CachedBitmap(Platform::String^ uri, int decodeWidth) 
     const std::wstring key = std::wstring(uri->Data()) + L"|" + std::to_wstring(decodeWidth);
     auto found = bitmapCache_.find(key);
     if (found != bitmapCache_.end()) return found->second;
-    if (bitmapCache_.size() > 96) bitmapCache_.clear();
+    // a big library no longer empties the whole cache (and decodes every
+    // cover again) each time it fills: the oldest pictures go first
+    if (bitmapCache_.size() >= 320) {
+        for (int drop = 0; drop < 64 && !bitmapOrder_.empty(); ++drop) {
+            bitmapCache_.erase(bitmapOrder_.front());
+            bitmapOrder_.pop_front();
+        }
+    }
+    bitmapOrder_.push_back(key);
     auto bitmap = ref new BitmapImage();
     // set before the source, so that only this size is ever decoded
     bitmap->DecodePixelWidth = decodeWidth;
@@ -2025,8 +2048,24 @@ void CatalogShell::UpdateSpotlight(int index) {
         spotlightArt_->Opacity = 0;
         return;
     }
+    // Scrolling through the shelf no longer decodes a full-screen picture for
+    // every poster passed: the picture follows once the focus rests (150 ms).
+    if (spotTimer_ == nullptr) {
+        spotTimer_ = ref new DispatcherTimer();
+        spotTimer_->Interval = Millis(150);
+        spotTimer_->Tick += ref new EventHandler<Platform::Object^>([this](Platform::Object^, Platform::Object^) {
+            spotTimer_->Stop();
+            ShowSpotlightArt();
+        });
+    }
+    spotTimer_->Stop();
+    spotlightArt_->Opacity = 0.0;
+    spotTimer_->Start();
+}
+void CatalogShell::ShowSpotlightArt() {
+    if (spotlightArt_ == nullptr || spotArtUri_.empty()) return;
     try {
-        spotlightArt_->Source = CachedBitmap(uri, 1600);
+        spotlightArt_->Source = CachedBitmap(ref new Platform::String(spotArtUri_.c_str()), 1600);
     } catch (Platform::Exception^) {
         spotlightArt_->Opacity = 0;
         return;
@@ -3394,7 +3433,7 @@ void CatalogShell::Settings() {
     }
     if (settingsTab_ == 1) EmulationSettings();
     if (settingsTab_ == 2) {
-    Section(L"Appearance", L"Eight moods in ReVita's neon colours, each with its own living scene and its own song.");
+    Section(L"Appearance", L"Eight moods in ReVita's neon colours, each with its own living scene and its own song, or Dynamic, which moves through them with the time of day.");
     const wchar_t* styles[] = {
         L"ReVita", L"Synthwave", L"Miami Night", L"Pastel Dream",
         L"Ultraviolet", L"Cotton Sky", L"Midnight Arcade", L"Starfall"
@@ -3412,8 +3451,8 @@ void CatalogShell::Settings() {
     palettes->Orientation = Orientation::Horizontal;
     palettes->ItemWidth = 158;
     palettes->ItemHeight = 96;
-    for (int i = 0; i < 8; ++i) {
-        const bool active = theme_ == i;
+    for (int i = 0; i < 9; ++i) {
+        const bool active = i == 8 ? dynamicTheme_ : (!dynamicTheme_ && theme_ == i);
         auto choice = ref new Windows::UI::Xaml::Controls::Button();
         choice->Width = 148;
         choice->Height = 84;
@@ -3425,14 +3464,28 @@ void CatalogShell::Settings() {
         choice->VerticalContentAlignment = Windows::UI::Xaml::VerticalAlignment::Stretch;
         Skin(choice, 14);
         auto swatch = ref new Border();
-        swatch->Background = Gradient(RgbColor(23, 23, 29), samples[i]);
+        if (i == 8) {
+            auto sweep = ref new LinearGradientBrush();
+            sweep->StartPoint = Point(0, 0);
+            sweep->EndPoint = Point(1, 1);
+            const Color hours[] = { RgbColor(90, 140, 210), RgbColor(190, 120, 180), RgbColor(30, 150, 190), RgbColor(150, 36, 160), RgbColor(40, 30, 90) };
+            for (int k = 0; k < 5; ++k) {
+                auto stop = ref new GradientStop();
+                stop->Offset = k / 4.0;
+                stop->Color = hours[k];
+                sweep->GradientStops->Append(stop);
+            }
+            swatch->Background = sweep;
+        } else {
+            swatch->Background = Gradient(RgbColor(23, 23, 29), samples[i]);
+        }
         swatch->Padding = Thickness(12);
         swatch->CornerRadius = Windows::UI::Xaml::CornerRadius(13);
         auto caption = Vertical();
         caption->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Bottom;
-        auto name = Text(ref new Platform::String(styles[i]), 15, true);
+        auto name = Text(ref new Platform::String(i == 8 ? L"Dynamic" : styles[i]), 15, true);
         caption->Children->Append(name);
-        auto sub = Text(ref new Platform::String(captions[i]), 11, false, true);
+        auto sub = Text(ref new Platform::String(i == 8 ? L"Follows the time of day" : captions[i]), 11, false, true);
         sub->Foreground = Solid(RgbColor(214, 212, 225));
         sub->Margin = Thickness(0, 4, 0, 0);
         caption->Children->Append(sub);
@@ -3441,7 +3494,7 @@ void CatalogShell::Settings() {
         choice->GotFocus += ref new RoutedEventHandler(
             [this](Platform::Object^, RoutedEventArgs^) { PlayCue(0); });
         choice->Click += ref new RoutedEventHandler(
-            [this,i](Platform::Object^, RoutedEventArgs^) { SaveTheme(i); });
+            [this,i](Platform::Object^, RoutedEventArgs^) { if (i == 8) SaveDynamicTheme(); else SaveTheme(i); });
         palettes->Children->Append(choice);
     }
     content_->Children->Append(palettes);
@@ -3881,14 +3934,51 @@ void CatalogShell::UpdateClock() {
         swprintf_s(text, L"%d/%d   %d:%02d %s", now.wMonth, now.wDay, hour12, now.wMinute, now.wHour < 12 ? L"AM" : L"PM");
         xmbClock_->Text = ref new Platform::String(text);
     }
+    if (dynamicTheme_ && !inGame_ && bootstrapped_) {
+        const int wanted = ThemeForNow();
+        if (wanted != theme_) ApplyTheme(wanted);
+    }
     if (greeting_ != nullptr) {
         const wchar_t* line = now.wHour < 5 ? L"Late-night session." : now.wHour < 12 ? L"Good morning." :
                               now.wHour < 17 ? L"Good afternoon." : now.wHour < 22 ? L"Good evening." : L"Late-night session.";
         greeting_->Text = ref new Platform::String(line);
     }
 }
+// Dynamic: the theme follows the time of day, from Cotton Sky in the morning
+// to Synthwave in the evening and Starfall at night.
+int CatalogShell::ThemeForNow() const {
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    const int h = now.wHour;
+    if (h >= 5 && h < 9) return 5;    // Cotton Sky
+    if (h >= 9 && h < 13) return 0;   // ReVita
+    if (h >= 13 && h < 17) return 3;  // Pastel Dream
+    if (h >= 17 && h < 20) return 2;  // Miami Night
+    if (h >= 20 && h < 23) return 1;  // Synthwave
+    return 7;                         // Starfall
+}
+void CatalogShell::ApplyTheme(int theme) {
+    theme_ = theme;
+    ApplySurfaceColors();
+    backdrop_.SetTheme(theme_, Bg(), Accent(), Glow());
+    BuildNavigation();
+    if (track_ == 10) {
+        musicPlayer_->Stop();
+        PlayBundledMusic(10);
+    }
+    Render();
+}
+void CatalogShell::SaveDynamicTheme() {
+    dynamicTheme_ = true;
+    PutPref(L"revita.theme.dynamic", L"1");
+    PlayCue(5);
+    ApplyTheme(ThemeForNow());
+    SetStatus(L"Dynamic theme on: ReVita's colours follow the time of day.");
+}
 void CatalogShell::SaveTheme(int theme) {
     if (theme < 0 || theme > 7) return;
+    dynamicTheme_ = false;
+    PutPref(L"revita.theme.dynamic", L"0");
     theme_ = theme;
     PutPref(L"revita.theme", StringOf(std::to_wstring(theme)));
     PlayCue(5);
@@ -6889,7 +6979,17 @@ void CatalogShell::PlayCue(unsigned kind) {
     if (!bootstrapped_ || !uiSounds_ || uiSoundVolume_ <= 0) return;
     kind %= vita3k_uwp::kInterfaceCueCount;
     if (cueAudio_.Ready()) {
-        cueAudio_.Play(kind, static_cast<float>(uiSoundVolume_));
+        unsigned index = kind;
+        if (kind == 0) {
+            // the focus tick on a note of the scale, never the same twice running
+            static unsigned last = 0, seed = 0x2545F491u;
+            seed = seed * 1103515245u + 12345u;
+            unsigned pick = (seed >> 16) % 4;
+            if (pick == last) pick = (pick + 1) % 4;
+            last = pick;
+            index = pick == 0 ? 0 : 5 + pick;
+        }
+        cueAudio_.Play(index, static_cast<float>(uiSoundVolume_));
         return;
     }
     if (!cueReady_[kind] || cuePlayers_[kind] == nullptr) return;
@@ -6900,7 +7000,7 @@ void CatalogShell::PlayCue(unsigned kind) {
 void CatalogShell::PrepareCues() {
     {
         std::vector<std::vector<std::uint8_t>> wavs;
-        for (unsigned i = 0; i < vita3k_uwp::kInterfaceCueCount; ++i) wavs.push_back(vita3k_uwp::GenerateInterfaceCue(i));
+        for (unsigned i = 0; i < vita3k_uwp::kInterfaceCueAll; ++i) wavs.push_back(vita3k_uwp::GenerateInterfaceCue(i));
         if (cueAudio_.Start(wavs, 32000)) return;
         libretro_.LogLine("Interface sounds: XAudio2 unavailable, using media elements");
     }

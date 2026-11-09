@@ -7,7 +7,7 @@ on:
         type: boolean
         default: false
   push:
-    branches: [astra-undertale]
+    branches: [astra-undertale, revita-next]
     paths:
       - .github/workflows/full-core-appx.yml
       - scripts/collect-core-runtime.ps1
