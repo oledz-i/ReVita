@@ -1012,7 +1012,30 @@ void CatalogShell::BuildNavigation() {
     if (contentScroll_ != nullptr)
         contentScroll_->Margin = Thickness(0, page_ == 2 ? 124 : 70, 0, 0);
     UpdateClock();
-    if (keepKey >= 0) FocusMenu(keepKey);
+    // The dock that was just drawn is not laid out yet; keep trying until the
+    // tab takes the focus, and keep the page from taking it meanwhile.
+    dockFocusWanted_ = keepKey >= 0 ? keepKey : -1;
+    if (keepKey >= 0) FocusMenuSoon(keepKey, 10);
+}
+void CatalogShell::FocusMenuSoon(int key, int attempts) {
+    if (dockFocusWanted_ != key) return;   // another move replaced this one
+    auto focused = dynamic_cast<DependencyObject^>(Windows::UI::Xaml::Input::FocusManager::GetFocusedElement());
+    if (focused != nullptr && InWindow(focused) && MenuKeyOf(focused) >= 0) { dockFocusWanted_ = -1; return; }
+    Windows::UI::Xaml::Controls::Button^ target = nullptr;
+    for (const auto& item : menuItems_)
+        if (item.first == key) target = item.second;
+    if (target == nullptr && key >= 100)
+        for (const auto& item : menuItems_)
+            if (item.first == 2) target = item.second;
+    if (target != nullptr && target->Focus(Windows::UI::Xaml::FocusState::Keyboard)) { dockFocusWanted_ = -1; return; }
+    if (attempts <= 0) { dockFocusWanted_ = -1; return; }
+    auto timer = ref new DispatcherTimer();
+    timer->Interval = Millis(40);
+    timer->Tick += ref new EventHandler<Platform::Object^>([this,timer,key,attempts](Platform::Object^, Platform::Object^) {
+        timer->Stop();
+        FocusMenuSoon(key, attempts - 1);
+    });
+    timer->Start();
 }
 void CatalogShell::StyleSettingsRail() {
     const Color dim = RgbColor(176, 178, 194);
@@ -1087,6 +1110,7 @@ void CatalogShell::FocusContentSoon(int attempts, bool fromMenu) {
     // holds the focus, and that is exactly what this call is here to move.
     auto focused = dynamic_cast<DependencyObject^>(Windows::UI::Xaml::Input::FocusManager::GetFocusedElement());
     if (focused != nullptr && InWindow(focused) && !(fromMenu && MenuKeyOf(focused) >= 0)) return;
+    if (dockFocusWanted_ >= 0 && !fromMenu) return;   // the dock is about to take the focus
     if (FocusContent()) return;
     if (attempts <= 0) {
         libretro_.LogLine("nav: no control on this page could take the focus; using the dock");

@@ -207,6 +207,8 @@ private:
     unsigned long long actionTick_[16] = {};
     void EnsureVisible(Windows::UI::Xaml::Controls::Control^ control);
     void FocusContentSoon(int attempts, bool fromMenu = false);
+    void FocusMenuSoon(int key, int attempts);
+    int dockFocusWanted_ = -1;
     void CollectNavStops(Windows::UI::Xaml::DependencyObject^ node, std::vector<Windows::UI::Xaml::Controls::Control^>& out);
     void UpdateSpotlight(int index);
     void HideSpotlight();
