@@ -1,0 +1,48 @@
+diff --git a/vita3k/shader/src/translator/alu.cpp b/vita3k/shader/src/translator/alu.cpp
+index f5c075e3..34164c38 100644
+--- a/vita3k/shader/src/translator/alu.cpp
++++ b/vita3k/shader/src/translator/alu.cpp
+@@ -260,7 +260,8 @@ bool USSETranslatorVisitor::vmad2(
+     inst.opr.src2.flags = decode_modifier(src2_mod);
+ 
+     // Log the instruction
+-    LOG_DISASM("{:016x}: {}{}2 {} {} {} {}", m_instr, disasm::e_predicate_str(static_cast<ExtPredicate>(pred)), disasm::opcode_str(op), disasm::operand_to_str(inst.opr.dest, dest_mask),
++    static constexpr ExtPredicate short_vec_pred[] = { ExtPredicate::NONE, ExtPredicate::P0, ExtPredicate::NEGP0, ExtPredicate::PN };
++    LOG_DISASM("{:016x}: {}{}2 {} {} {} {}", m_instr, disasm::e_predicate_str(short_vec_pred[pred]), disasm::opcode_str(op), disasm::operand_to_str(inst.opr.dest, dest_mask),
+         disasm::operand_to_str(inst.opr.src0, dest_mask), disasm::operand_to_str(inst.opr.src1, dest_mask), disasm::operand_to_str(inst.opr.src2, dest_mask));
+ 
+     m_b.setDebugSourceLocation(m_recompiler.cur_pc, nullptr);
+@@ -1236,6 +1237,10 @@ bool shader::usse::USSETranslatorVisitor::sop2m(Imm2 pred,
+ 
+     result = utils::convert_to_int(m_b, m_util_funcs, result, DataType::UINT8, true);
+ 
++    const bool lanes_packed_from_x = (wmask & (wmask + 1)) == 0;
++    if (!lanes_packed_from_x)
++        result = utils::finalize(m_b, result, result, SWIZZLE_CHANNEL_4_DEFAULT, m_b.makeIntConstant(0), wmask);
++
+     // Final result. Do binary operation and then store
+     store(inst.opr.dest, result, wmask, 0);
+ 
+diff --git a/vita3k/shader/src/usse_program_analyzer.cpp b/vita3k/shader/src/usse_program_analyzer.cpp
+index c468c55a..acf03e05 100644
+--- a/vita3k/shader/src/usse_program_analyzer.cpp
++++ b/vita3k/shader/src/usse_program_analyzer.cpp
+@@ -68,10 +68,6 @@ bool does_write_to_predicate(const std::uint64_t inst, std::uint8_t &pred) {
+ 
+ std::uint8_t get_predicate(const std::uint64_t inst) {
+     switch (inst >> 59) {
+-    // VMAD2
+-    case 0b00000:
+-        return ((inst >> 32) & ~0xFCFFFFFF) >> 24;
+-
+     // V32NMAD, V16NMAD, VMAD
+     case 0b00001:
+     case 0b00010:
+@@ -81,6 +77,7 @@ std::uint8_t get_predicate(const std::uint64_t inst) {
+     }
+ 
+     // VMAD normal version, predicates only occupied two bits
++    case 0b00000:
+     case 0b00100:
+     case 0b00101: {
+         uint8_t predicate = ((inst >> 32) & ~0xFCFFFFFF) >> 24;

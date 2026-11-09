@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: oledz-i <x@x>
+Date: Sat, 31 Oct 2026 13:20:00 -0400
+Subject: [PATCH] dzn: log a refused pipeline's shader signatures
+
+---
+
+diff --git a/src/microsoft/vulkan/dzn_pipeline.c b/src/microsoft/vulkan/dzn_pipeline.c
+--- a/src/microsoft/vulkan/dzn_pipeline.c
++++ b/src/microsoft/vulkan/dzn_pipeline.c
+@@ -2821,6 +2821,50 @@
+    return hres;
+ }
+ 
++/* VITA3K: a refused pipeline's shader signatures (vertex inputs, the vertex
++ * shader's outputs, the pixel shader's inputs), read from each DXIL container,
++ * so the log says which element the console won't link. */
++static uint32_t
++onyx_rd32(const uint8_t *p)
++{
++   uint32_t v;
++   memcpy(&v, p, sizeof(v));
++   return v;
++}
++
++static void
++onyx_log_signatures(const void *bytecode, size_t len, const char *stage)
++{
++   const uint8_t *p = bytecode;
++   if (!p || len < 32 || memcmp(p, "DXBC", 4))
++      return;
++   const uint32_t parts = onyx_rd32(p + 28);
++   for (uint32_t i = 0; i < parts && i < 32 && 32 + 4 * i + 4 <= len; i++) {
++      const uint32_t off = onyx_rd32(p + 32 + 4 * i);
++      if (off + 8 > len)
++         continue;
++      const uint8_t *part = p + off;
++      if (memcmp(part, "ISG1", 4) && memcmp(part, "OSG1", 4))
++         continue;
++      const uint32_t size = onyx_rd32(part + 4);
++      const uint8_t *d = part + 8;
++      if (size < 8 || off + 8 + size > len)
++         continue;
++      const uint32_t count = onyx_rd32(d), first = onyx_rd32(d + 4);
++      mesa_logw("dzn: refused pipeline's %s shader %.4s: %u elements", stage, (const char *)part, count);
++      for (uint32_t e = 0; e < count && e < 16; e++) {
++         const uint32_t at = first + e * 32;
++         if (at + 32 > size)
++            break;
++         const uint8_t *el = d + at;
++         const uint32_t name = onyx_rd32(el + 4);
++         mesa_logw("dzn:   %.24s%u register %u mask %x type %u system value %u",
++                   name < size ? (const char *)d + name : "?", onyx_rd32(el + 8),
++                   onyx_rd32(el + 20), el[24], onyx_rd32(el + 16), onyx_rd32(el + 12));
++      }
++   }
++}
++
+ ID3D12PipelineState *
+ dzn_graphics_pipeline_get_state(struct dzn_graphics_pipeline *pipeline,
+                                 const struct dzn_graphics_pipeline_variant_key *key)
+@@ -2922,6 +2966,7 @@
+                snprintf(what, sizeof(what), "refused pipeline's %s shader", stage_names[st]);
+                dxil_onyx_log_validation(instance->dxil_validator, bc->pShaderBytecode,
+                                         bc->BytecodeLength, what);
++               onyx_log_signatures(bc->pShaderBytecode, bc->BytecodeLength, stage_names[st]);
+             }
+          }
+       }

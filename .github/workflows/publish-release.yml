@@ -1,0 +1,83 @@
+name: Publish a release
+
+# Takes the signed package from a finished "Full Vita3K core" run and puts the
+# .appx and its x64 dependency on a GitHub release. Nothing else is attached.
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: ID of the finished full-core run to publish
+        required: true
+      tag:
+        description: Release tag (e.g. v0.1.85-alpha)
+        required: true
+      title:
+        description: Release title
+        required: true
+      notes:
+        description: Release notes file in the repository
+        required: true
+      target:
+        description: Commit the tag points at (the published build's)
+        required: true
+      notes_ref:
+        description: Branch that holds the notes file
+        default: astra-undertale
+      prerelease:
+        description: Mark as a pre-release
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.notes_ref }}
+      - name: Download the package from that run
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          pattern: Vita3K-UWP-full-core-x64-*
+          path: package
+      - name: Pick the .appx and its x64 dependency
+        id: files
+        run: |
+          set -euo pipefail
+          find package -type f | sort
+          mkdir -p release
+          main=$(find package -type f -name '*.appx' ! -path '*Dependencies*' | head -n 1)
+          [ -n "$main" ] || { echo "No Vita3K .appx in the run's package"; exit 1; }
+          cp "$main" "release/$(basename "$main")"
+          deps=$(find package -type f -path '*Dependencies*' \( -name '*x64*.appx' -o -name '*x64*.msix' \) || true)
+          [ -n "$deps" ] || { echo "No x64 dependency in the run's package"; exit 1; }
+          for d in $deps; do cp "$d" "release/$(basename "$d")"; done
+          ls -la release
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "${{ inputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # The release exists already: make its files match release/ exactly.
+            gh release upload "${{ inputs.tag }}" release/* --clobber --repo "$GITHUB_REPOSITORY"
+            for a in $(gh release view "${{ inputs.tag }}" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'); do
+              [ -f "release/$a" ] || gh release delete-asset "${{ inputs.tag }}" "$a" -y --repo "$GITHUB_REPOSITORY"
+            done
+            gh release edit "${{ inputs.tag }}" --repo "$GITHUB_REPOSITORY" --title "${{ inputs.title }}" --notes-file "${{ inputs.notes }}"
+            exit 0
+          fi
+          flags=()
+          if [ "${{ inputs.prerelease }}" = "true" ]; then flags+=(--prerelease); fi
+          gh release create "${{ inputs.tag }}" release/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "${{ inputs.target }}" \
+            --title "${{ inputs.title }}" \
+            --notes-file "${{ inputs.notes }}" \
+            "${flags[@]}"

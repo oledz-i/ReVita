@@ -1,0 +1,49 @@
+diff --git a/vita3k/shader/include/shader/usse_types.h b/vita3k/shader/include/shader/usse_types.h
+index e31942f2..280c1e4c 100644
+--- a/vita3k/shader/include/shader/usse_types.h
++++ b/vita3k/shader/include/shader/usse_types.h
+@@ -48,6 +48,7 @@ enum class ExtPredicate : uint8_t {
+     P3,
+     NEGP0,
+     NEGP1,
++    NEGP2,
+     PN
+ };
+ 
+@@ -99,10 +100,7 @@ inline ExtPredicate ext_vec_predicate_to_ext(ExtVecPredicate pred) {
+     case ExtVecPredicate::NEGP1:
+         return ExtPredicate::NEGP1;
+     case ExtVecPredicate::NEGP2:
+-        // TODO
+-        assert(false);
+-        LOG_CRITICAL("ExtVecPredicate::NEGP2 case hit, report this to devs.");
+-        [[fallthrough]];
++        return ExtPredicate::NEGP2;
+     default:
+         return ExtPredicate::NONE;
+     }
+diff --git a/vita3k/shader/src/usse_disasm.cpp b/vita3k/shader/src/usse_disasm.cpp
+index 00c041e1..9f82cbd9 100644
+--- a/vita3k/shader/src/usse_disasm.cpp
++++ b/vita3k/shader/src/usse_disasm.cpp
+@@ -50,6 +50,7 @@ const char *e_predicate_str(ExtPredicate p) {
+     case ExtPredicate::P3: return "p3 ";
+     case ExtPredicate::NEGP0: return "!p0 ";
+     case ExtPredicate::NEGP1: return "!p1 ";
++    case ExtPredicate::NEGP2: return "!p2 ";
+     case ExtPredicate::PN: return "pN ";
+     default: return "invalid";
+     }
+diff --git a/vita3k/shader/src/usse_translator_entry.cpp b/vita3k/shader/src/usse_translator_entry.cpp
+index e9f0e42f..b24d3440 100644
+--- a/vita3k/shader/src/usse_translator_entry.cpp
++++ b/vita3k/shader/src/usse_translator_entry.cpp
+@@ -899,7 +899,7 @@ spv::Id USSERecompiler::get_condition_value(const std::uint8_t pred, const bool
+ 
+     if (predicator >= ExtPredicate::P0 && predicator <= ExtPredicate::P3) {
+         pred_opr.num = static_cast<int>(predicator) - static_cast<int>(ExtPredicate::P0);
+-    } else if (predicator >= ExtPredicate::NEGP0 && predicator <= ExtPredicate::NEGP1) {
++    } else if (predicator >= ExtPredicate::NEGP0 && predicator <= ExtPredicate::NEGP2) {
+         pred_opr.num = static_cast<int>(predicator) - static_cast<int>(ExtPredicate::NEGP0);
+         do_neg = !do_neg;
+     }

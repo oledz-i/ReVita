@@ -1,0 +1,389 @@
+name: Full Vita3K core + Dozen signed APPX (gameplay path)
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Public release build (hides the developer Tools page)
+        type: boolean
+        default: false
+  push:
+    branches: [astra-undertale]
+    paths:
+      - .github/workflows/full-core-appx.yml
+      - scripts/collect-core-runtime.ps1
+      - scripts/summarize-core-errors.ps1
+      - scripts/annotate-errors.ps1
+      - scripts/probe-vita3k-uwp.ps1
+      - scripts/patch-vita3k-uwp.py
+      - scripts/patch-vita3k-uwp-round2.py
+      - scripts/patch-vita3k-uwp-round3.py
+      - scripts/core-patches/**
+      - scripts/build-keep-going.ps1
+      - third_party/ffmpeg-internal/**
+      - scripts/fix-sdl-uwp-vcxproj.ps1
+      - scripts/uwp-core-flags.cmake
+      - scripts/test-uwp-memory-faults.ps1
+      - tests/uwp-memory-fault-test.cpp
+      - tests/uwp-path-format-test.cpp
+      - scripts/test-uwp-path-format.ps1
+      - scripts/apply-onyx-dynarmic.ps1
+      - scripts/apply-core-merge.ps1
+      - scripts/core-merge/**
+      - core-candidates.lock.json
+      - render-abi.lock.json
+      - scripts/build-appx.ps1
+      - scripts/prepare-render-abi.py
+      - src/**
+concurrency:
+  group: full-core-appx-${{ github.ref }}
+  cancel-in-progress: false
+permissions:
+  contents: read
+  actions: read
+jobs:
+  core:
+    name: Build real Vita3K core for UWP (full length)
+    runs-on: windows-2022
+    timeout-minutes: 350
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-cache
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Check PowerShell scripts before fetching dependencies
+        shell: pwsh
+        run: |
+          $invalid = @()
+          Get-ChildItem scripts -Filter '*.ps1' | ForEach-Object {
+            $tokens = $null
+            $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$parseErrors) | Out-Null
+            foreach ($parseIssue in $parseErrors) { $invalid += "$($_.Name): $parseIssue" }
+          }
+          if ($invalid.Count) { throw ($invalid -join "`n") }
+      - name: Verify protected guest memory faults can resume
+        shell: pwsh
+        run: ./scripts/test-uwp-memory-faults.ps1
+      - name: Fetch pinned libretro Vita3K source with submodules
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force artifacts/core-port | Out-Null
+          Start-Transcript -Path artifacts/core-port/steps.log -Append
+          try {
+            $ErrorActionPreference = 'Stop'
+            $lock = Get-Content core-candidates.lock.json -Raw | ConvertFrom-Json
+            git clone --branch $lock.libretro_candidate.branch --depth 25 $lock.libretro_candidate.repository upstream-core
+            if ($LASTEXITCODE -ne 0) { throw 'Git clone failed' }
+            # the branch moves on: fetch the pinned commit itself, not just the newest 25
+            git -C upstream-core fetch --depth 25 origin $lock.libretro_candidate.commit
+            if ($LASTEXITCODE -ne 0) { throw 'Pinned libretro fetch failed' }
+            git -C upstream-core checkout --detach $lock.libretro_candidate.commit
+            if ($LASTEXITCODE -ne 0) { throw 'Pinned libretro checkout failed' }
+            git -C upstream-core submodule update --init --recursive --depth 1
+            if ($LASTEXITCODE -ne 0) { throw 'Submodule retrieval failed' }
+            $actual = (git -C upstream-core rev-parse HEAD).Trim()
+            if ($actual -ne $lock.libretro_candidate.commit) { throw 'Pinned core SHA mismatch' }
+          } finally { Stop-Transcript }
+      - name: Merge upstream Vita3K into the pinned core
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force artifacts/core-port | Out-Null
+          Start-Transcript -Path artifacts/core-port/steps.log -Append
+          try {
+            ./scripts/apply-core-merge.ps1 -Source upstream-core
+          } finally { Stop-Transcript }
+      - name: Use pinned UWP SDL3 platform port
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force artifacts/core-port | Out-Null
+          Start-Transcript -Path artifacts/core-port/steps.log -Append
+          try {
+            $ErrorActionPreference = 'Stop'
+            $lock = Get-Content core-candidates.lock.json -Raw | ConvertFrom-Json
+            git -C upstream-core/external/sdl fetch --depth 1 $lock.sdl_uwp.repository $lock.sdl_uwp.commit
+            if ($LASTEXITCODE) { throw 'Could not fetch pinned UWP SDL3 source' }
+            git -C upstream-core/external/sdl checkout --detach $lock.sdl_uwp.commit
+            if ($LASTEXITCODE) { throw 'Could not select UWP SDL3 source' }
+          } finally { Stop-Transcript }
+      - name: Apply Xbox JIT memory port to Dynarmic
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force artifacts/core-port | Out-Null
+          Start-Transcript -Path artifacts/core-port/steps.log -Append
+          try {
+            ./scripts/apply-onyx-dynarmic.ps1 -DynarmicSource upstream-core/external/dynarmic
+          } finally { Stop-Transcript }
+      - name: Restore compiled UWP dependencies
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .vcpkg-cache
+          key: uwp-vcpkg-${{ hashFiles('core-candidates.lock.json', 'scripts/patch-vita3k-uwp.py') }}-${{ github.run_id }}
+          restore-keys: |
+            uwp-vcpkg-
+      - name: Prepare dependency cache
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force artifacts/core-port | Out-Null
+          Start-Transcript -Path artifacts/core-port/steps.log -Append
+          try {
+            New-Item -ItemType Directory -Force $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          } finally { Stop-Transcript }
+      - name: Configure and build the real core for WindowsStore x64
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force artifacts/core-port | Out-Null
+          Start-Transcript -Path artifacts/core-port/steps.log -Append
+          try {
+            New-Item -ItemType Directory -Force artifacts/core-port | Out-Null
+            ./scripts/probe-vita3k-uwp.ps1
+          } finally { Stop-Transcript }
+      - name: Upload primary build logs before downstream diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: vita3k-core-primary-logs
+          path: artifacts/core-port/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Publish primary build errors as annotations
+        if: failure()
+        shell: pwsh
+        run: ./scripts/annotate-errors.ps1
+      - name: Compile downstream core modules to collect remaining errors
+        if: failure()
+        shell: pwsh
+        run: |
+          if (Test-Path build/core-uwp-probe/vita3k) {
+            ./scripts/build-keep-going.ps1 -BuildDir build/core-uwp-probe -OutDir artifacts/core-port
+          } else {
+            Write-Host 'No generated core projects: inspect the primary configure/fetch logs.'
+          }
+      - name: Stage core DLL and runtime dependencies for the APPX
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force artifacts/core-port | Out-Null
+          Start-Transcript -Path artifacts/core-port/steps.log -Append
+          try {
+            ./scripts/collect-core-runtime.ps1
+          } finally { Stop-Transcript }
+      - name: Preserve compiled dependencies even on failure
+        if: always()
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .vcpkg-cache
+          key: uwp-vcpkg-${{ hashFiles('core-candidates.lock.json', 'scripts/patch-vita3k-uwp.py') }}-${{ github.run_id }}
+      - name: Summarize distinct build errors
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force artifacts/core-port | Out-Null
+          Start-Transcript -Path artifacts/core-port/steps.log -Append
+          try {
+            ./scripts/summarize-core-errors.ps1
+          } finally { Stop-Transcript }
+      - name: Publish distinct errors as annotations
+        if: always()
+        shell: pwsh
+        run: ./scripts/annotate-errors.ps1
+      - name: Upload build logs and error summary
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: vita3k-core-uwp-logs
+          path: artifacts/core-port/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Upload core runtime for packaging
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: vita3k-core-uwp-runtime
+          path: artifacts/core-runtime/
+          if-no-files-found: error
+          retention-days: 14
+  appx:
+    name: Package core, Dozen and runtime DLLs into signed APPX
+    needs: [core]
+    runs-on: windows-2022
+    env:
+      VITA3K_RELEASE: ${{ inputs.release && '1' || '0' }}
+    # Can wait for this commit's Dozen/OpenGL driver build (get-dozen.ps1).
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.1.8
+        with:
+          name: vita3k-core-uwp-runtime
+          path: artifacts/core-runtime/
+      - name: Retrieve Dozen (source build, else the pinned Onyx build)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force artifacts/logs | Out-Null
+          Start-Transcript -Path artifacts/logs/steps.log -Append
+          try {
+            $ErrorActionPreference = 'Stop'
+            # Newest Dozen built from source (Onyx patches + scripts/dozen-patches), else the pinned one.
+            ./scripts/get-dozen.ps1 -Destination artifacts/onyx-dozen
+          } finally { Stop-Transcript }
+      - name: Stage everything beside the app
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force artifacts/logs | Out-Null
+          Start-Transcript -Path artifacts/logs/steps.log -Append
+          try {
+            $ErrorActionPreference = 'Stop'
+            Copy-Item artifacts/core-runtime/*.dll src/Vita3K.UWP/ -Force
+            Copy-Item artifacts/onyx-dozen/vulkan_dzn.dll, artifacts/onyx-dozen/dxil.dll src/Vita3K.UWP/ -Force
+            if (Test-Path artifacts/onyx-dozen/onyx_gl.dll) { Copy-Item artifacts/onyx-dozen/onyx_gl.dll src/Vita3K.UWP/ -Force }
+            if (!(Test-Path src/Vita3K.UWP/vita3k_libretro.dll)) { throw 'core DLL not staged' }
+            python scripts/validate.py
+            if ($LASTEXITCODE -ne 0) { throw 'Repository validator failed' }
+          } finally { Stop-Transcript }
+      - name: Record packaging commands and errors
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force artifacts/logs | Out-Null
+          Start-Transcript -Path artifacts/logs/steps.log -Append
+          try {
+            New-Item -ItemType Directory -Force artifacts/logs | Out-Null
+          } finally { Stop-Transcript }
+      - name: Build and sign the APPX
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force artifacts/logs | Out-Null
+          Start-Transcript -Path artifacts/logs/steps.log -Append
+          try {
+            ./scripts/build-appx.ps1 -BuildNumber ${{ github.run_number }}
+          } finally { Stop-Transcript }
+      - name: Verify the APPX really contains the core and its dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force artifacts/logs | Out-Null
+          Start-Transcript -Path artifacts/logs/steps.log -Append
+          try {
+            $appx = @(Get-ChildItem artifacts/package -Recurse -Filter '*.appx' | Where-Object { $_.FullName -notmatch 'Dependencies' })
+            if ($appx.Count -ne 1) { throw 'Expected exactly one APPX' }
+            $zip = Join-Path $env:RUNNER_TEMP 'full-core.zip'
+            Copy-Item $appx[0].FullName $zip
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $archive = [IO.Compression.ZipFile]::OpenRead($zip)
+            try {
+              $dlls = @($archive.Entries | Where-Object { $_.FullName -like '*.dll' } | ForEach-Object { [IO.Path]::GetFileName($_.FullName) })
+              foreach ($need in (@('vulkan_dzn.dll','dxil.dll') + @(Get-ChildItem artifacts/core-runtime -Filter '*.dll' | ForEach-Object Name))) {
+                if (!($dlls | Where-Object { $_ -ieq $need })) { throw "$need not packaged" }
+              }
+              # The menu music plays from ms-appx:///Assets/Music: missing, the menu is
+              # silent. Reported (with what the package holds), not fatal.
+              $all = @($archive.Entries | ForEach-Object FullName)
+              $missing = @('starlight-drive','afterlight','neon-bloom','midnight-arcade','coastline-87','pastel-horizon','cotton-sky','ultraviolet' | Where-Object { $t = $_; !($all | Where-Object { $_ -ieq "Assets/Music/$t.m4a" }) })
+              if ($missing.Count) {
+                $seen = ($all | Where-Object { $_ -match '(?i)wav|music|^assets' }) -join ', '
+                Write-Host "::error title=Menu music not packaged::Missing Assets/Music/: $($missing -join ', '). Package has: $seen"
+              }
+              $manifestEntry = $archive.GetEntry('AppxManifest.xml')
+              if (!$manifestEntry) { throw 'Packaged manifest is missing' }
+              $reader = [IO.StreamReader]::new($manifestEntry.Open())
+              try { [xml]$packagedManifest = $reader.ReadToEnd() } finally { $reader.Dispose() }
+              $framework = @($packagedManifest.Package.Dependencies.PackageDependency | Where-Object { $_.Name -eq 'Microsoft.VCLibs.140.00' })
+              if (!$framework.Count) { throw 'Core requires the UWP VCLibs framework dependency' }
+              $frameworkPackages = @(Get-ChildItem artifacts/package -Recurse -Filter '*.appx' | Where-Object {
+                $_.Name -like '*VCLibs*' -and $_.FullName -match 'x64'
+              })
+              if (!$frameworkPackages.Count) { throw 'x64 VCLibs dependency APPX missing from installation bundle' }
+              "Packaged DLLs ($($dlls.Count)): $($dlls -join ', ')"
+            } finally { $archive.Dispose() }
+          } finally { Stop-Transcript }
+      - name: Keep only what the Xbox installs
+        shell: pwsh
+        run: |
+          # The SDK copies VCLibs for every architecture; the console only takes x64.
+          Get-ChildItem artifacts/package -Recurse -Directory |
+            Where-Object { $_.Parent.Name -eq 'Dependencies' -and $_.Name -ne 'x64' } |
+            ForEach-Object { Write-Host "Dropping $($_.FullName)"; Remove-Item -Recurse -Force $_.FullName }
+          Get-ChildItem artifacts/package -Recurse -Include *.pdb,*.appxsym | Remove-Item -Force -ErrorAction SilentlyContinue
+          Get-ChildItem artifacts/package -Recurse -File | Sort-Object Length -Descending |
+            ForEach-Object { "{0,8:N1} MB  {1}" -f ($_.Length / 1MB), $_.FullName.Substring((Resolve-Path artifacts/package).Path.Length) }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $main = Get-ChildItem artifacts/package -Recurse -Filter *.appx | Where-Object { $_.FullName -notmatch 'Dependencies' } | Select-Object -First 1
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($main.FullName)
+          try {
+            "Largest files inside $($main.Name):"
+            $zip.Entries | Sort-Object CompressedLength -Descending | Select-Object -First 15 |
+              ForEach-Object { "{0,8:N1} MB packed  {1,8:N1} MB  {2}" -f ($_.CompressedLength / 1MB), ($_.Length / 1MB), $_.FullName }
+          } finally { $zip.Dispose() }
+      - name: Upload signed Xbox package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: Vita3K-UWP-full-core-x64-${{ github.run_number }}
+          path: artifacts/package/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload packaging logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: Vita3K-full-core-appx-logs-${{ github.run_number }}
+          path: artifacts/logs/
+          if-no-files-found: warn
+
+  build-output:
+    name: Publish package and readable error logs together
+    needs: [core, appx]
+    if: always()
+    runs-on: windows-2022
+    steps:
+      - name: Download this run's artifacts
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: build-output
+      - name: Write build result and combined error log
+        if: always()
+        shell: pwsh
+        env:
+          CORE_RESULT: ${{ needs.core.result }}
+          APPX_RESULT: ${{ needs.appx.result }}
+        run: |
+          New-Item -ItemType Directory -Force build-output | Out-Null
+          $report = 'build-output/ERROR-LOG.txt'
+          @(
+            "Source commit: $env:GITHUB_SHA",
+            "Run: https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID",
+            "Core job: $env:CORE_RESULT",
+            "APPX job: $env:APPX_RESULT",
+            'A successful build does not verify Xbox gameplay.',
+            'Full core logs, dependency reports and packaging logs are included in subfolders.',
+            'If an early step failed before logs were created, download the GitHub Actions job logs from this run.'
+          ) | Set-Content $report
+          $pattern = 'error\s+(?:C|D|LNK|MSB)\d+|fatal error|CMake Error|Could NOT find|error: |FAILED|Exception:|unresolved external'
+          Get-ChildItem build-output -Recurse -File | Where-Object { $_.Extension -in '.log','.txt' -and $_.Name -ne 'ERROR-LOG.txt' } | ForEach-Object {
+            $filePattern = $pattern
+            if (Select-String -Path $_.FullName -Pattern 'error C2220' -Quiet) { $filePattern += '|warning C\d+' }
+            $matches = @(Select-String -Path $_.FullName -Pattern $filePattern | ForEach-Object { $_.Line.Trim() } | Select-Object -Unique)
+            if ($matches.Count) {
+              "`n== $($_.Name)" | Add-Content $report
+              $matches | Add-Content $report
+            }
+          }
+          Get-Content $report -TotalCount 120
+      - name: Upload APPX and error logs in one download
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: Vita3K-Build-Output-x64-${{ github.run_number }}
+          path: build-output/
+          if-no-files-found: error
+          retention-days: 14

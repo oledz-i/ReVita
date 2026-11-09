@@ -1,0 +1,57 @@
+From 7eb9551e8e4fd4bc719e6918257f4863a2d9eef4 Mon Sep 17 00:00:00 2001
+From: oledz-i <x@x>
+Date: Mon, 26 Oct 2026 22:38:52 -0400
+Subject: [PATCH] dzn: no native 16-bit shader ops on Xbox; widen 16-bit math
+ to 32-bit
+
+---
+ src/microsoft/vulkan/dzn_device.c   | 9 +++++++++
+ src/microsoft/vulkan/dzn_pipeline.c | 7 +++++++
+ 2 files changed, 16 insertions(+)
+
+diff --git a/src/microsoft/vulkan/dzn_device.c b/src/microsoft/vulkan/dzn_device.c
+index dbef7f4..7ac8a4a 100644
+--- a/src/microsoft/vulkan/dzn_device.c
++++ b/src/microsoft/vulkan/dzn_device.c
+@@ -451,6 +451,15 @@ dzn_physical_device_cache_caps(struct dzn_physical_device *pdev)
+    ID3D12Device1_CheckFeatureSupport(pdev->dev, D3D12_FEATURE_D3D12_OPTIONS2, &pdev->options2, sizeof(pdev->options2));
+    ID3D12Device1_CheckFeatureSupport(pdev->dev, D3D12_FEATURE_D3D12_OPTIONS3, &pdev->options3, sizeof(pdev->options3));
+    ID3D12Device1_CheckFeatureSupport(pdev->dev, D3D12_FEATURE_D3D12_OPTIONS4, &pdev->options4, sizeof(pdev->options4));
++#ifdef MESA_UWP
++   /* VITA3K: the Xbox reports native 16-bit shader ops, yet its D3D12 refuses
++    * shaders that use them ("CreatePixelShader: Shader uses native 16bit ops,
++    * but the device does not support this", D3D12 debug layer, Series S).
++    * Every Vita3K game pipeline was refused for it and drawn as nothing.
++    * Treated as unsupported: no 16-bit features to the app, and 16-bit
++    * (half-precision) math widened to 32-bit when compiling to DXIL. */
++   pdev->options4.Native16BitShaderOpsSupported = false;
++#endif
+    ID3D12Device1_CheckFeatureSupport(pdev->dev, D3D12_FEATURE_D3D12_OPTIONS12, &pdev->options12, sizeof(pdev->options12));
+    ID3D12Device1_CheckFeatureSupport(pdev->dev, D3D12_FEATURE_D3D12_OPTIONS13, &pdev->options13, sizeof(pdev->options13));
+    ID3D12Device1_CheckFeatureSupport(pdev->dev, D3D12_FEATURE_D3D12_OPTIONS14, &pdev->options14, sizeof(pdev->options14));
+diff --git a/src/microsoft/vulkan/dzn_pipeline.c b/src/microsoft/vulkan/dzn_pipeline.c
+index 05eab2b..dfec855 100644
+--- a/src/microsoft/vulkan/dzn_pipeline.c
++++ b/src/microsoft/vulkan/dzn_pipeline.c
+@@ -456,11 +456,18 @@ dzn_pipeline_compile_shader(struct dzn_device *device,
+       container_of(device->vk.physical, struct dzn_physical_device, vk);
+    struct nir_to_dxil_options opts = {
+       .environment = DXIL_ENVIRONMENT_VULKAN,
++#ifdef MESA_UWP
++      /* VITA3K: 16-bit math left in a shader becomes native 16-bit DXIL,
++       * which the Xbox's D3D12 refuses: widen all of it, min-precision
++       * (mediump) included, to 32-bit. */
++      .lower_int16 = true,
++#else
+       .lower_int16 = !pdev->options4.Native16BitShaderOpsSupported &&
+       /* Don't lower 16-bit types if they can only come from min-precision */
+          (device->vk.enabled_extensions.KHR_shader_float16_int8 ||
+           device->vk.enabled_features.shaderFloat16 ||
+           device->vk.enabled_features.shaderInt16),
++#endif
+       .shader_model_max = dzn_get_shader_model(pdev),
+       .input_clip_size = input_clip_size,
+       .advanced_texture_ops = pdev->options14.AdvancedTextureOpsSupported,
+-- 
+2.43.0
+

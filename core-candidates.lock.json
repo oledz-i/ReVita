@@ -27,5 +27,20 @@
     "license": "GPL-3.0-or-later (OnyxEMU), Mesa MIT",
     "xbox_evidence": "OnyxEMU reports hardware Vulkan/Dozen gameplay; not equivalent to Vita3K compatibility",
     "status": "source reuse targeted for UWP Dozen build; game boot unverified"
+  },
+  "sdl_uwp": {
+    "repository": "https://github.com/SternXD/SDL3-uwp.git",
+    "commit": "b3852a0076c358f65ee19765e85ef9eded6e50df",
+    "purpose": "UWP platform implementation for SDL3; runtime integration unverified"
+  },
+  "upstream_merge": {
+    "repository": "https://github.com/Vita3K/Vita3K.git",
+    "commit": "17a8b34017a94f4a5914cc0700ae061a3c506a06",
+    "patch": "scripts/core-merge/upstream-17a8b340.patch",
+    "note": "Full merge of upstream Vita3K (113 commits after build 4123) into the pinned libretro core, conflicts resolved for the libretro build; .upstream-excluded paths removed (plus vita3k/sdl-frontend).",
+    "submodules": {
+      "external/spdlog": "d6c93f38a08b4ea0f8ffcfd7f7857307d5d5c3fa",
+      "external/printf": "f08e577d31a8270a14e64603ff6bfdca614ff4d3"
+    }
   }
 }

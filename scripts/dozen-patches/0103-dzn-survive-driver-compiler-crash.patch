@@ -1,0 +1,62 @@
+From b6bcf66f82aca6756e9881cef268f1057b0c69dc Mon Sep 17 00:00:00 2001
+From: oledz-i <x@x>
+Date: Wed, 28 Oct 2026 14:49:13 -0400
+Subject: [PATCH] dzn: survive the Xbox shader compiler crashing on a pipeline
+ (skip its draws)
+
+---
+ src/microsoft/vulkan/dzn_pipeline.c | 31 +++++++++++++++++++++++++++--
+ 1 file changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/src/microsoft/vulkan/dzn_pipeline.c b/src/microsoft/vulkan/dzn_pipeline.c
+index dfec855..bb056b7 100644
+--- a/src/microsoft/vulkan/dzn_pipeline.c
++++ b/src/microsoft/vulkan/dzn_pipeline.c
+@@ -2664,6 +2664,34 @@ onyx_pso_name(const D3D12_PIPELINE_STATE_STREAM_DESC *sd, WCHAR name[40])
+    return true;
+ }
+ 
++/* VITA3K: on the Xbox the driver's own shader compiler can crash while it
++ * makes a pipeline (Gravity Rush, after its opening cutscene: an access
++ * violation reading 0x8 inside the console's compiler, which ended the app).
++ * The fault is taken here and the pipeline treated as refused, so its draws
++ * are skipped as for any other refused pipeline and the game goes on. */
++static HRESULT
++vita3k_create_pso_guarded(struct dzn_device *device, const D3D12_PIPELINE_STATE_STREAM_DESC *sd,
++                          ID3D12PipelineState **out)
++{
++#if defined(_MSC_VER)
++   __try {
++      return ID3D12Device4_CreatePipelineState(device->dev, sd, &IID_ID3D12PipelineState,
++                                               (void **)out);
++   } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
++                                                                : EXCEPTION_CONTINUE_SEARCH) {
++      static unsigned vita3k_compiler_faults;
++      if (vita3k_compiler_faults++ < 8)
++         mesa_loge("dzn: VITA3K: the console's shader compiler crashed making a pipeline; "
++                   "its draws are skipped (fault %u)", vita3k_compiler_faults);
++      *out = NULL;
++      return E_FAIL;
++   }
++#else
++   return ID3D12Device4_CreatePipelineState(device->dev, sd, &IID_ID3D12PipelineState,
++                                            (void **)out);
++#endif
++}
++
+ /* CreatePipelineState through the library: load when known, compile and keep when not. */
+ static HRESULT
+ onyx_create_pso(struct dzn_device *device, const D3D12_PIPELINE_STATE_STREAM_DESC *sd,
+@@ -2683,8 +2711,7 @@ onyx_create_pso(struct dzn_device *device, const D3D12_PIPELINE_STATE_STREAM_DES
+       }
+       *out = NULL;
+    }
+-   HRESULT hres = ID3D12Device4_CreatePipelineState(device->dev, sd, &IID_ID3D12PipelineState,
+-                                                    (void **)out);
++   HRESULT hres = vita3k_create_pso_guarded(device, sd, out);
+    if (keyed && SUCCEEDED(hres)) {
+       mtx_lock(&onyx_pso.lock);
+       onyx_pso.misses++;
+-- 
+2.43.0
+

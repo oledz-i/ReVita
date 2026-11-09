@@ -1,0 +1,48 @@
+diff --git a/vita3k/renderer/src/vulkan/surface_cache.cpp b/vita3k/renderer/src/vulkan/surface_cache.cpp
+index 92c6f5df..75e6a5fe 100644
+--- a/vita3k/renderer/src/vulkan/surface_cache.cpp
++++ b/vita3k/renderer/src/vulkan/surface_cache.cpp
+@@ -734,11 +734,16 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
+                     0,
+                     0 },
+                 .extent = {
+-                    // Don't try to copy what is in the stride
+-                    std::min<uint32_t>(width, info.width),
+-                    std::min<uint32_t>(height, info.height),
++                    // Don't try to copy what is in the stride, or past the end of the surface
++                    std::min<uint32_t>(width, info.width > start_x ? info.width - start_x : 0),
++                    std::min<uint32_t>(height, info.height > start_sourced_line ? info.height - start_sourced_line : 0),
+                     1 }
+             };
++            if (image_copy.extent.width == 0 || image_copy.extent.height == 0) {
++                LOG_WARN_ONCE("Texture starts past the end of its surface; skipping the copy");
++                image_copy.extent = vk::Extent3D{ 1, 1, 1 };
++                image_copy.srcOffset = vk::Offset3D{ 0, 0, 0 };
++            }
+ #ifdef VITA3K_UWP
+             {
+                 const vkutil::ImageLayout prev_layout = info.texture.layout == vkutil::ImageLayout::Undefined ? vkutil::ImageLayout::ColorAttachmentReadWrite : info.texture.layout;
+@@ -770,8 +775,10 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
+                 .imageOffset = { 0,
+                     static_cast<int32_t>(start_sourced_line),
+                     0 },
+-                .imageExtent = { info.width, height, 1 }
++                .imageExtent = { info.width, std::max<uint32_t>(1, std::min<uint32_t>(height, info.height > start_sourced_line ? info.height - start_sourced_line : 0)), 1 }
+             };
++            if (start_sourced_line >= info.height)
++                copy_image_buffer.imageOffset.y = 0;
+ #ifdef VITA3K_UWP
+             {
+                 const vkutil::ImageLayout prev_layout = info.texture.layout == vkutil::ImageLayout::Undefined ? vkutil::ImageLayout::ColorAttachmentReadWrite : info.texture.layout;
+diff --git a/vita3k/shader/src/spirv_recompiler.cpp b/vita3k/shader/src/spirv_recompiler.cpp
+index 4016a5ca..370059e8 100644
+--- a/vita3k/shader/src/spirv_recompiler.cpp
++++ b/vita3k/shader/src/spirv_recompiler.cpp
+@@ -795,6 +795,7 @@ static void create_fragment_inputs(spv::Builder &b, SpirvShaderParameters &param
+                 spv::Id uiv4 = b.makeVectorType(b.makeUintType(32), 4);
+ 
+                 color_attachment_raw = create_builtin_sampler_for_raw(b, features, translation_state, "f_colorAttachment_rawUI");
++                b.addDecoration(color_attachment_raw, spv::DecorationCoherent);
+                 if (translation_state.is_vulkan) {
+                     b.addDecoration(color_attachment_raw, spv::DecorationBinding, 2);
+                     b.addDecoration(color_attachment_raw, spv::DecorationDescriptorSet, 1);

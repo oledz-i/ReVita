@@ -26,6 +26,13 @@ if ($actual -ne $lock.commit) { throw 'Onyx pinned revision mismatch' }
 $mesaBase = (Get-Content (Join-Path $work 'patches/mesa/BASE_COMMIT') -Raw).Trim()
 if ($mesaBase -ne $lock.mesa_patch_base) { throw 'Mesa patch base mismatch (do not apply unreviewed patch set)' }
 
+# This port's own Dozen fixes, applied after OnyxEMU's series (Onyx's
+# Apply-Patches takes every patches/mesa/*.patch in name order; ours are 01xx).
+$ours = @(Get-ChildItem (Join-Path $root 'scripts/dozen-patches') -Filter '*.patch' -ErrorAction SilentlyContinue | Sort-Object Name)
+foreach ($patch in $ours) {
+    Copy-Item -LiteralPath $patch.FullName -Destination (Join-Path $work 'patches/mesa') -Force
+}
+
 @(
     "Vita3K-UWP renderer build from OnyxEMU (GPL-3.0-or-later)",
     "Reused project: $($lock.repository)",
@@ -33,6 +40,7 @@ if ($mesaBase -ne $lock.mesa_patch_base) { throw 'Mesa patch base mismatch (do n
     "Mesa patch base: $mesaBase",
     "Primary Mesa license: MIT; Onyx patches/host: GPL-3.0-or-later",
     "Builder: original Onyx tools/fetch-deps.ps1 and tools/build-dozen.ps1",
+    "Vita3K-UWP Dozen patches: $((@(Get-ChildItem (Join-Path $root 'scripts/dozen-patches') -Filter '*.patch' -ErrorAction SilentlyContinue | ForEach-Object Name)) -join ', ')",
     "This compiles a Vulkan-over-D3D12 ICD only. Vita GXM execution/guest CPU remain unavailable.",
     "No Sony firmware, commercial games, keys or dumped content included."
 ) | Set-Content (Join-Path $out 'SOURCE-AND-STATUS.txt')

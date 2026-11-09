@@ -1,0 +1,53 @@
+name: Dozen from source (OnyxEMU patches + Vita3K-UWP patches)
+# Builds vulkan_dzn.dll and stages dxil.dll for the Xbox: Mesa at OnyxEMU's
+# pinned commit, OnyxEMU's patch series, then scripts/dozen-patches. The app
+# workflows take the newest successful run's artifact (scripts/get-dozen.ps1).
+on:
+  push:
+    branches: [astra-undertale]
+    paths:
+      - scripts/dozen-patches/**
+      - scripts/build-onyx-dozen.ps1
+      - scripts/build-onyx-gl.ps1
+      - .github/workflows/dozen-source.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: dozen-source-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  dozen:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build tools (meson, ninja, mako, win_flex_bison)
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade meson ninja mako pyyaml packaging
+          if ($LASTEXITCODE -ne 0) { throw 'pip failed' }
+          choco install winflexbison3 -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'winflexbison3 install failed' }
+      - name: Build Dozen (UWP)
+        shell: pwsh
+        run: ./scripts/build-onyx-dozen.ps1
+      - name: Build OpenGL on D3D12 (onyx_gl, UWP)
+        shell: pwsh
+        run: ./scripts/build-onyx-gl.ps1
+      - name: Show build errors on the run page
+        if: failure()
+        shell: pwsh
+        run: |
+          foreach ($log in Get-ChildItem artifacts/onyx-dozen -Filter '*.log' -ErrorAction SilentlyContinue) {
+            Select-String -Path $log.FullName -Pattern 'error|FAILED|failed to apply|patch does not apply' |
+              Select-Object -First 25 | ForEach-Object { Write-Host "::error title=$($log.Name)::$($_.Line.Trim())" }
+          }
+      - name: Upload Dozen
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: vita3k-dozen-uwp
+          path: artifacts/onyx-dozen/
+          retention-days: 90
+          if-no-files-found: error

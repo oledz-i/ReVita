@@ -1,0 +1,140 @@
+From 2da423e20a0e455ceb6b3de7cbf77885c8ac5a09 Mon Sep 17 00:00:00 2001
+From: oledz-i <x@x>
+Date: Mon, 26 Oct 2026 21:30:07 -0400
+Subject: [PATCH] dzn: retry pipelines the Xbox refuses without stencil, then
+ without depth/stencil
+
+---
+ src/microsoft/vulkan/dzn_pipeline.c | 68 +++++++++++++++++++++++++++++
+ src/microsoft/vulkan/dzn_private.h  |  1 +
+ 2 files changed, 69 insertions(+)
+
+diff --git a/src/microsoft/vulkan/dzn_pipeline.c b/src/microsoft/vulkan/dzn_pipeline.c
+index 617f4ed..05eab2b 100644
+--- a/src/microsoft/vulkan/dzn_pipeline.c
++++ b/src/microsoft/vulkan/dzn_pipeline.c
+@@ -26,6 +26,9 @@
+ 
+ static HRESULT onyx_create_pso(struct dzn_device *device, const D3D12_PIPELINE_STATE_STREAM_DESC *sd,
+                                ID3D12PipelineState **out);
++struct dzn_graphics_pipeline;
++static HRESULT vita3k_pso_fallbacks(struct dzn_device *device, struct dzn_graphics_pipeline *pipeline,
++                                    D3D12_PIPELINE_STATE_STREAM_DESC *sd, ID3D12PipelineState **out);
+ #include "dxil_nir_lower_int_samplers.h"
+ 
+ #include "spirv/nir_spirv.h"
+@@ -2086,6 +2089,8 @@ dzn_graphics_pipeline_create(struct dzn_device *device,
+ 
+    if (zs_fmt != VK_FORMAT_UNDEFINED) {
+       d3d12_gfx_pipeline_state_stream_new_desc(stream_desc, DEPTH_STENCIL_FORMAT, DXGI_FORMAT, ds_fmt);
++      pipeline->templates.desc_offsets.ds_fmt =
++         (uintptr_t)ds_fmt - (uintptr_t)stream_desc->pPipelineStateSubobjectStream;
+       *ds_fmt =
+          dzn_image_get_dxgi_format(pdev, zs_fmt,
+                                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+@@ -2137,6 +2142,10 @@ dzn_graphics_pipeline_create(struct dzn_device *device,
+    if (!pipeline->variants) {
+       hres = DZN_HR(device->dev, "CreatePipelineState", onyx_create_pso(device, stream_desc,
+                                                &pipeline->base.state));
++      if (FAILED(hres)) {
++         pipeline->base.state = NULL;
++         hres = vita3k_pso_fallbacks(device, pipeline, stream_desc, &pipeline->base.state);
++      }
+       if (FAILED(hres)) {
+          ret = vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+          goto out;
+@@ -2684,6 +2693,59 @@ onyx_create_pso(struct dzn_device *device, const D3D12_PIPELINE_STATE_STREAM_DES
+    return hres;
+ }
+ 
++/* VITA3K: the Xbox's D3D12 refused (E_INVALIDARG) every pipeline Vita3K's games
++ * draw with, while both shaders passed DXIL validation, and Dozen then skipped
++ * every draw: the games ran behind a black screen. The overlay pipeline, with
++ * no depth/stencil, was accepted. As rpcs3-xbox did for its refused pipelines,
++ * retry with less: first without stencil test, then without depth and stencil
++ * (and no depth/stencil format). A draw with less depth/stencil state beats a
++ * skipped one; which step was needed is logged once per step. */
++static HRESULT
++vita3k_pso_fallbacks(struct dzn_device *device, struct dzn_graphics_pipeline *pipeline,
++                     D3D12_PIPELINE_STATE_STREAM_DESC *sd, ID3D12PipelineState **out)
++{
++   struct dzn_physical_device *pdev =
++      container_of(device->vk.physical, struct dzn_physical_device, vk);
++   uint8_t *buf = (uint8_t *)sd->pPipelineStateSubobjectStream;
++   static const char *const what[] = { "", "without stencil test", "without depth and stencil" };
++   static unsigned logged[3];
++   HRESULT hres = E_FAIL;
++   for (int step = 1; step <= 2; step++) {
++      if (pdev->options14.IndependentFrontAndBackStencilRefMaskSupported) {
++         D3D12_DEPTH_STENCIL_DESC2 *ds = dzn_graphics_pipeline_get_desc(pipeline, buf, ds);
++         if (ds) {
++            ds->StencilEnable = false;
++            if (step == 2)
++               ds->DepthEnable = false;
++         }
++      } else {
++         D3D12_DEPTH_STENCIL_DESC1 *ds = dzn_graphics_pipeline_get_desc(pipeline, buf, ds);
++         if (ds) {
++            ds->StencilEnable = false;
++            if (step == 2) {
++               ds->DepthEnable = false;
++               ds->DepthBoundsTestEnable = false;
++            }
++         }
++      }
++      if (step == 2) {
++         DXGI_FORMAT *fmt = dzn_graphics_pipeline_get_desc(pipeline, buf, ds_fmt);
++         if (fmt)
++            *fmt = DXGI_FORMAT_UNKNOWN;
++      }
++      hres = onyx_create_pso(device, sd, out);
++      if (SUCCEEDED(hres)) {
++         if (logged[step]++ < 4)
++            mesa_logw("dzn: VITA3K: refused pipeline accepted %s", what[step]);
++         return hres;
++      }
++   }
++   static unsigned failed;
++   if (failed++ < 4)
++      mesa_loge("dzn: VITA3K: refused pipeline still refused without depth and stencil (0x%08x)", (unsigned)hres);
++   return hres;
++}
++
+ ID3D12PipelineState *
+ dzn_graphics_pipeline_get_state(struct dzn_graphics_pipeline *pipeline,
+                                 const struct dzn_graphics_pipeline_variant_key *key)
+@@ -2743,6 +2805,10 @@ dzn_graphics_pipeline_get_state(struct dzn_graphics_pipeline *pipeline,
+       const int64_t onyx_t0 = os_time_get_nano();
+       ASSERTED HRESULT hres = DZN_HR(device->dev, "CreatePipelineState", onyx_create_pso(device, &stream_desc,
+                                                                 &variant->state));
++      if (FAILED(hres)) {
++         /* VITA3K: the original refusal is still logged below; then retry with less. */
++         variant->state = NULL;
++      }
+       if (FAILED(hres)) {
+          /* ONYX: the Xbox driver can refuse a variant (E_INVALIDARG seen). A
+           * NULL state was later bound and crashed the app in D3D12. Remember the
+@@ -2784,6 +2850,8 @@ dzn_graphics_pipeline_get_state(struct dzn_graphics_pipeline *pipeline,
+             }
+          }
+       }
++      if (!variant->state)
++         vita3k_pso_fallbacks(device, pipeline, &stream_desc, &variant->state);
+       /* ONYX: variants are compiled while commands are recorded, so a slow one
+        * stalls the frame. Log what forced each one. */
+       {
+diff --git a/src/microsoft/vulkan/dzn_private.h b/src/microsoft/vulkan/dzn_private.h
+index 51b72ab..eb7865d 100644
+--- a/src/microsoft/vulkan/dzn_private.h
++++ b/src/microsoft/vulkan/dzn_private.h
+@@ -1066,6 +1066,7 @@ struct dzn_graphics_pipeline {
+          uint32_t ib_strip_cut;
+          uint32_t rast;
+          uint32_t ds;
++         uint32_t ds_fmt; /* VITA3K: the DEPTH_STENCIL_FORMAT subobject, for fallbacks */
+       } desc_offsets;
+       D3D12_INPUT_ELEMENT_DESC inputs[D3D12_VS_INPUT_REGISTER_COUNT];
+       struct {
+-- 
+2.43.0
+

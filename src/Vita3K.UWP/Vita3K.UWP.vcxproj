@@ -33,21 +33,34 @@
     <GenerateAppInstallerFile>false</GenerateAppInstallerFile>
     <AppxSymbolPackageEnabled>false</AppxSymbolPackageEnabled>
   </PropertyGroup>
+  <PropertyGroup>
+    <!-- msbuild /p:Vita3KRelease=true hides the developer Tools page. See docs/RELEASING.md. -->
+    <Vita3KReleaseDefine Condition="'$(Vita3KRelease)' == 'true'">VITA3K_RELEASE_BUILD;</Vita3KReleaseDefine>
+  </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
+      <AdditionalOptions>/bigobj /utf-8 %(AdditionalOptions)</AdditionalOptions>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <CompileAsWinRT>true</CompileAsWinRT>
       <WarningLevel>Level4</WarningLevel>
-      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>$(Vita3KReleaseDefine)NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
-      <AdditionalIncludeDirectories>$(MSBuildProjectDirectory)\\..\\..\\third_party\\vita3k\\mem\\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(MSBuildProjectDirectory)\..\..\build\abi\include;$(MSBuildProjectDirectory)\..\..\build\abi\Vulkan-Headers\include;$(MSBuildProjectDirectory)\\..\\..\\third_party\\vita3k\\mem\\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
-    <Link><SubSystem>Console</SubSystem><GenerateWindowsMetadata>true</GenerateWindowsMetadata><AdditionalDependencies>d3d12.lib;dxgi.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
+    <Link><SubSystem>Console</SubSystem><StackReserveSize>8388608</StackReserveSize><GenerateWindowsMetadata>true</GenerateWindowsMetadata><AdditionalDependencies>d3d12.lib;dxgi.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp">
       <LanguageStandard>stdcpp17</LanguageStandard>
       <CompileAsWinRT>true</CompileAsWinRT>
+    </ClCompile>
+    <ClCompile Include="LivingBackdrop.cpp">
+      <CompileAsWinRT>true</CompileAsWinRT>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+    </ClCompile>
+    <ClCompile Include="GameInfo.cpp">
+      <CompileAsWinRT>true</CompileAsWinRT>
+      <LanguageStandard>stdcpp17</LanguageStandard>
     </ClCompile>
     <ClCompile Include="CatalogShell.cpp">
       <CompileAsWinRT>true</CompileAsWinRT>
@@ -81,6 +94,10 @@
       <CompileAsWinRT>false</CompileAsWinRT>
       <LanguageStandard>stdcpp17</LanguageStandard>
     </ClCompile>
+    <ClCompile Include="UwpFileRedirect.cpp"><CompileAsWinRT>false</CompileAsWinRT><LanguageStandard>stdcpp17</LanguageStandard></ClCompile>
+    <ClCompile Include="CrashLog.cpp"><CompileAsWinRT>false</CompileAsWinRT><LanguageStandard>stdcpp17</LanguageStandard></ClCompile>
+    <ClCompile Include="VitaVulkanBridge.cpp"><CompileAsWinRT>false</CompileAsWinRT><LanguageStandard>stdcpp17</LanguageStandard></ClCompile>
+    <ClCompile Include="GlHost.cpp"><CompileAsWinRT>false</CompileAsWinRT><LanguageStandard>stdcpp17</LanguageStandard></ClCompile>
     <ClCompile Include="D3D12Host.cpp">
       <CompileAsWinRT>false</CompileAsWinRT>
       <LanguageStandard>stdcpp17</LanguageStandard>
@@ -93,6 +110,12 @@
   <ItemGroup>
     <ClInclude Include="D3D12Host.h" />
     <ClInclude Include="VitaLibretroHost.h" />
+    <ClInclude Include="GlHost.h" />
+    <ClInclude Include="GameInfo.h" />
+    <ClInclude Include="UwpFileRedirect.h" />
+    <ClInclude Include="CrashLog.h" />
+    <ClInclude Include="LivingBackdrop.h" />
+    <ClInclude Include="CoreOptions.h" />
     <ClInclude Include="VitaGuestCpuUwpProbe.h" />
     <ClInclude Include="VulkanDznProbe.h" />
     <ClInclude Include="UwpJitProbe.h" />
@@ -107,6 +130,12 @@
        An Xbox-native Vulkan device must still be verified on hardware. -->
   <ItemGroup Condition="Exists('$(MSBuildProjectDirectory)\vulkan_dzn.dll')">
     <Content Include="vulkan_dzn.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+  <!-- OpenGL on D3D12 (Mesa's d3d12 gallium driver, window-less onyx_gl front end). -->
+  <ItemGroup Condition="Exists('$(MSBuildProjectDirectory)\onyx_gl.dll')">
+    <Content Include="onyx_gl.dll">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>
@@ -130,5 +159,22 @@
   </ItemGroup>
   <ItemGroup><AppxManifest Include="Package.appxmanifest" /></ItemGroup>
   <ItemGroup><Image Include="Assets\*.png" /></ItemGroup>
+  <!-- Menu music. C++ UWP projects package audio as Media items (as Visual
+       Studio adds them); Content items with DeploymentContent were left out. -->
+  <ItemGroup>
+    <Media Include="Assets\Music\starlight-drive.m4a"><DeploymentContent>true</DeploymentContent></Media>
+    <Media Include="Assets\Music\afterlight.m4a"><DeploymentContent>true</DeploymentContent></Media>
+    <Media Include="Assets\Music\neon-bloom.m4a"><DeploymentContent>true</DeploymentContent></Media>
+    <Media Include="Assets\Music\midnight-arcade.m4a"><DeploymentContent>true</DeploymentContent></Media>
+    <Media Include="Assets\Music\coastline-87.m4a"><DeploymentContent>true</DeploymentContent></Media>
+    <Media Include="Assets\Music\pastel-horizon.m4a"><DeploymentContent>true</DeploymentContent></Media>
+    <Media Include="Assets\Music\cotton-sky.m4a"><DeploymentContent>true</DeploymentContent></Media>
+    <Media Include="Assets\Music\ultraviolet.m4a"><DeploymentContent>true</DeploymentContent></Media>
+  </ItemGroup>
+  <ItemGroup>
+    <Content Include="*.dll" Exclude="vulkan_dzn.dll;dxil.dll;vita3k_libretro.dll;vita_guest_cpu_probe.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

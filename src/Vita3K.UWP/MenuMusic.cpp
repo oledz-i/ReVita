@@ -16,74 +16,56 @@ void append32(std::vector<std::uint8_t>& v, std::uint32_t n) {
 }
 double note(int semitone) { return 220.0 * std::pow(2.0, semitone / 12.0); }
 }
-std::vector<std::uint8_t> GenerateMenuWav(unsigned track) {
-    constexpr unsigned rate = 22050;
-    constexpr unsigned duration = 16;
-    constexpr unsigned samples = rate * duration;
-    constexpr double tau = 6.283185307179586;
-    // Four independent harmonic themes: Drift, Pulse, Stargaze, and Tide.
-    constexpr int chords[4][4][3] = {
-        {{0, 3, 7}, {-2, 3, 7}, {-4, 0, 5}, {-2, 2, 7}},
-        {{0, 4, 7}, {2, 5, 9}, {-3, 0, 4}, {-5, 0, 4}},
-        {{3, 7, 10}, {0, 5, 8}, {-2, 3, 7}, {0, 4, 7}},
-        {{-5, 0, 4}, {-3, 0, 5}, {-2, 2, 5}, {-5, 0, 4}}
-    };
-    track %= 4;
-    std::vector<std::uint8_t> wav;
-    wav.reserve(44 + samples * 2);
-    for (char c : "RIFF") { if (c) wav.push_back(static_cast<std::uint8_t>(c)); }
-    append32(wav, 36 + samples * 2);
-    for (char c : "WAVEfmt ") { if (c) wav.push_back(static_cast<std::uint8_t>(c)); }
-    append32(wav, 16);
-    append16(wav, 1);       // PCM
-    append16(wav, 1);       // mono
-    append32(wav, rate);
-    append32(wav, rate * 2);
-    append16(wav, 2);
-    append16(wav, 16);
-    for (char c : "data") { if (c) wav.push_back(static_cast<std::uint8_t>(c)); }
-    append32(wav, samples * 2);
-    for (unsigned i = 0; i < samples; ++i) {
-        const double t = static_cast<double>(i) / rate;
-        const unsigned chord = static_cast<unsigned>(t / 4) % 4;
-        const auto& notes = chords[track][chord];
-        const double slow = 0.5 - 0.5 * std::cos(tau * std::fmod(t, 4.0) / 4.0);
-        double sound = 0.0;
-        for (int n = 0; n < 3; ++n) {
-            const double f = note(notes[n]);
-            sound += std::sin(tau * f * t + n * .4) * (0.15 + 0.1 * slow);
-            sound += std::sin(tau * (f * 2.0) * t) * .022;
-        }
-        const int arpeggio = static_cast<int>(t * (track == 1 ? 3.0 : 2.0)) % 3;
-        const double bell = std::exp(-8.0 * std::fmod(t * (track == 1 ? 3.0 : 2.0), 1.0));
-        sound += .18 * bell * std::sin(tau * note(notes[arpeggio] + 12) * t);
-        if (track == 1) {
-            sound += .09 * std::sin(tau * 55.0 * t) * std::exp(-15.0 * std::fmod(t * 2.0, 1.0));
-        }
-        if (track == 2) {
-            sound += .075 * std::sin(tau * note(notes[0] - 12) * t);
-        }
-        if (track == 3) {
-            sound *= 0.8 + 0.2 * std::sin(tau * .125 * t);
-        }
-        const double fade = std::min({1.0, t / .05, (duration - t) / .05});
-        const double clamped = std::max(-1.0, std::min(1.0, sound * fade * .54));
-        const auto pcm = static_cast<std::int16_t>(clamped * 32767);
-        append16(wav, static_cast<std::uint16_t>(pcm));
-    }
-    return wav;
-}
-
 std::vector<std::uint8_t> GenerateInterfaceCue(unsigned cue) {
-    // Warm two-tone glass taps instead of clicks, with 3 ms attack and
-    // 60-125 ms exponential release. No audio samples or copyrighted cues.
-    constexpr unsigned rate = 22050;
+    // Soft glass tones layered into small phrases. Everything is synthesized
+    // here from sine partials and filtered noise: no samples, no borrowed cues.
+    constexpr unsigned rate = 32000;
     constexpr double tau = 6.283185307179586;
-    cue %= 4;
-    const double durations[4] = {0.095, 0.150, 0.130, 0.075};
-    const double startFrequencies[4] = {690, 590, 490, 840};
-    const double targetFrequencies[4] = {760, 900, 380, 630};
-    const auto count = static_cast<unsigned>(rate * durations[cue]);
+    cue %= kInterfaceCueCount;
+
+    struct Voice {
+        double start;   // seconds from the beginning of the cue
+        double freq;    // Hz at the voice's start
+        double glide;   // Hz change over the voice's length
+        double length;  // seconds
+        double gain;
+        double decay;   // exponential release rate; higher dies faster
+    };
+    std::vector<Voice> voices;
+    double total = 0.1;
+    double noiseGain = 0.0;     // filtered-noise swell mixed under the tones
+    double noiseLength = 0.0;
+    switch (cue) {
+    case 0:  // focus: one quiet, dry tick
+        voices = {{0.0, 1318.5, -60.0, 0.075, 0.50, 7.5}};
+        total = 0.085;
+        break;
+    case 1:  // select: two rising glass notes
+        voices = {{0.0, 987.8, 0.0, 0.17, 0.55, 5.8}, {0.05, 1480.0, 0.0, 0.21, 0.46, 5.4}};
+        total = 0.27;
+        break;
+    case 2:  // back: two falling notes
+        voices = {{0.0, 784.0, -90.0, 0.13, 0.55, 6.0}, {0.055, 587.3, -70.0, 0.17, 0.46, 5.8}};
+        total = 0.23;
+        break;
+    case 3:  // shelf swipe: a tiny downward flick
+        voices = {{0.0, 960.0, -260.0, 0.07, 0.34, 8.5}};
+        total = 0.08;
+        break;
+    case 4:  // page change: low sine lift with an airy swell
+        voices = {{0.0, 196.0, 120.0, 0.30, 0.30, 4.2}};
+        noiseGain = 0.26;
+        noiseLength = 0.30;
+        total = 0.32;
+        break;
+    default: // confirm / theme applied: four-note shimmer
+        voices = {{0.00, 659.3, 0.0, 0.22, 0.42, 6.0}, {0.06, 830.6, 0.0, 0.22, 0.40, 6.0},
+                  {0.12, 987.8, 0.0, 0.22, 0.38, 6.0}, {0.18, 1318.5, 0.0, 0.30, 0.36, 5.2}};
+        total = 0.50;
+        break;
+    }
+
+    const auto count = static_cast<unsigned>(rate * total);
     std::vector<std::uint8_t> wav;
     wav.reserve(44 + count * 2);
     for (char c : "RIFF") if (c) wav.push_back(static_cast<std::uint8_t>(c));
@@ -98,20 +80,36 @@ std::vector<std::uint8_t> GenerateInterfaceCue(unsigned cue) {
     append16(wav, 16);
     for (char c : "data") if (c) wav.push_back(static_cast<std::uint8_t>(c));
     append32(wav, count * 2);
-    double phase = 0;
+
+    std::vector<double> phases(voices.size(), 0.0);
+    std::uint32_t seed = 0x9E3779B9u;
+    double lowpass = 0.0;
     for (unsigned i = 0; i < count; ++i) {
         const double t = static_cast<double>(i) / rate;
-        const double progress = t / durations[cue];
-        const double freq = startFrequencies[cue] +
-            (targetFrequencies[cue] - startFrequencies[cue]) * progress;
-        phase += tau * freq / rate;
-        const double attack = std::min(1.0, t / 0.003);
-        const double release = std::exp(-5.6 * progress);
-        const double edgeFade = std::min(1.0, (durations[cue] - t) / 0.010);
-        const double tone = std::sin(phase) * .72 +
-            std::sin(phase * 2.005) * .16 + std::sin(phase * 3.01) * .045;
-        const double sample = std::max(-1.0, std::min(1.0,
-            tone * attack * release * edgeFade * 0.32));
+        double mix = 0.0;
+        for (std::size_t v = 0; v < voices.size(); ++v) {
+            const Voice& voice = voices[v];
+            const double local = t - voice.start;
+            if (local < 0.0 || local > voice.length) continue;
+            const double progress = local / voice.length;
+            phases[v] += tau * (voice.freq + voice.glide * progress) / rate;
+            const double attack = std::min(1.0, local / 0.004);
+            const double release = std::exp(-voice.decay * progress);
+            const double tail = std::min(1.0, (voice.length - local) / 0.012);
+            const double tone = std::sin(phases[v]) * .74 +
+                std::sin(phases[v] * 2.003) * .15 + std::sin(phases[v] * 3.01) * .04;
+            mix += tone * attack * release * tail * voice.gain;
+        }
+        if (noiseGain > 0.0 && t < noiseLength) {
+            seed = seed * 1664525u + 1013904223u;
+            const double white = (static_cast<double>(seed >> 8) / 8388608.0) - 1.0;
+            lowpass += (white - lowpass) * 0.12;   // keeps only the soft, airy part
+            const double progress = t / noiseLength;
+            const double swell = std::sin(3.14159265358979 * progress);
+            mix += lowpass * swell * swell * noiseGain * 2.2;
+        }
+        const double edge = std::min(1.0, (total - t) / 0.010);
+        const double sample = std::max(-1.0, std::min(1.0, mix * edge * 1.1));
         append16(wav, static_cast<std::uint16_t>(
             static_cast<std::int16_t>(sample * 32767)));
     }

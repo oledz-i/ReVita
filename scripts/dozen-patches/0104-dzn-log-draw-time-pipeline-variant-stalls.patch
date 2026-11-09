@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: oledz-i <x@x>
+Date: Thu, 29 Oct 2026 21:30:00 -0400
+Subject: [PATCH] dzn: say which pipeline variant compiles stall the render
+ thread
+
+---
+ src/microsoft/vulkan/dzn_pipeline.c | 40 ++++++++++++++++++++++++++++++++++
+ 1 file changed
+
+diff --git a/src/microsoft/vulkan/dzn_pipeline.c b/src/microsoft/vulkan/dzn_pipeline.c
+--- a/src/microsoft/vulkan/dzn_pipeline.c
++++ b/src/microsoft/vulkan/dzn_pipeline.c
+@@ -1945,6 +1945,14 @@
+    vk_free2(&pipeline->base.base.device->alloc, alloc, pipeline);
+ }
+ 
++/* VITA3K: set while a pipeline's variants are built at creation (off the render
++ * thread); clear for variants built while a draw is being recorded. */
++#ifdef _MSC_VER
++static __declspec(thread) bool onyx_in_precompile;
++#else
++static __thread bool onyx_in_precompile;
++#endif
++
+ static VkResult
+ dzn_graphics_pipeline_create(struct dzn_device *device,
+                              VkPipelineCache cache,
+@@ -2169,6 +2177,7 @@
+        * dynamic values zero (what pipelines without stencil test always hit),
+        * plus full stencil masks when stencil test is on. */
+       const struct dzn_graphics_pipeline_variant_key zero_key = { 0 };
++      onyx_in_precompile = true;
+       dzn_graphics_pipeline_get_state(pipeline, &zero_key);
+       const D3D12_DEPTH_STENCIL_DESC1 *ds =
+          pdev->options14.IndependentFrontAndBackStencilRefMaskSupported ? NULL :
+@@ -2184,6 +2193,7 @@
+          full_key.stencil_test.back.write_mask = 0xff;
+          dzn_graphics_pipeline_get_state(pipeline, &full_key);
+       }
++      onyx_in_precompile = false;
+    }
+ 
+    dzn_graphics_pipeline_cleanup_nir_shaders(pipeline);
+@@ -2892,6 +2902,18 @@
+          static unsigned onyx_variants, onyx_logged;
+          const unsigned n = ++onyx_variants;
+          const double ms = (os_time_get_nano() - onyx_t0) / 1e6;
++         if (!onyx_in_precompile && ms > 5.0) {
++            static unsigned onyx_stalls;
++            onyx_stalls++;
++            mesa_logw("dzn: DRAW-TIME variant compile stalled the render thread %.0f ms "
++                      "(#%u so far; stencil cmp %x/%x write %x/%x ref %u/%u, strip cut %d)",
++                      ms, onyx_stalls, masked_key.stencil_test.front.compare_mask,
++                      masked_key.stencil_test.back.compare_mask,
++                      masked_key.stencil_test.front.write_mask,
++                      masked_key.stencil_test.back.write_mask,
++                      masked_key.stencil_test.front.ref, masked_key.stencil_test.back.ref,
++                      (int)masked_key.ib_strip_cut);
++         }
+          if (onyx_logged < 60 && (n <= 20 || ms > 30.0)) {
+             onyx_logged++;
+             mesa_logw("dzn: pipeline variant #%u compiled in %.0f ms (strip cut %d, depth bias "

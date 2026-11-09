@@ -1,30 +1,20 @@
-# Renderer strategy
+# Renderers
 
-Three full emulator backend goals are tracked separately. The integration branch contains a **native D3D12 presentation host** (device, queue, swap chain, GPU clear, and BGRA framebuffer upload), but no Vita GXM renderer backend or shader translator yet.
+The core's Vulkan and OpenGL backends both run on the console, through Mesa translation layers to Direct3D 12, with a choice per game. The earlier plan for a hand-written D3D12 backend was dropped in favour of these.
 
-| Backend | Reviewed upstream | Windows desktop potential | Xbox UWP plan |
-| --- | --- | --- | --- |
-| D3D12 | No backend in the reviewed renderer source list | New implementation | **Presentation/bootstrap implemented**; PS Vita GPU rendering and shader translation pending |
-| Vulkan | Implemented upstream | Retain on a supported Vulkan host | No native driver path assumed; translation feasibility unproven |
-| OpenGL | Implemented upstream | Retain on a supported OpenGL host | No native driver path assumed; translation feasibility unproven |
+| Backend | How it runs | Notes |
+| --- | --- | --- |
+| Vulkan | Mesa **Dozen** (Vulkan on D3D12), patched by `scripts/dozen-patches` | Default. The patches work around console limits, and one catches a crash in the console's shader compiler so the affected draws are skipped. |
+| OpenGL | Mesa OpenGL on D3D12 (`onyx_gl.dll`) | Programmable blending reads from a render-target copy rather than shader images. Some games do better here, others only work on Vulkan. |
 
-Microsoft documents D3D12 feature level **11.0** for UWP on Series X|S. API version 12 does not mean feature level 12_0/12_1. Query actual feature support, formats, shader models and resource budgets on-device. Xbox One is not the initial validation target.
+Console limits that shaped the work:
 
-## Dedicated D3D12 work
+- No UAVs in pixel shaders.
+- Dozen maps some scaled vertex formats to `DXGI_FORMAT_UNKNOWN`, which the console rejects. Vulkan therefore converts those attributes in the shader.
+- The console compiles each new pipeline in 30 to 750 ms, so pipelines are built on a background thread by default.
+- Frames are read back through a ring of three slots and handed to the UI, so the game does not wait for the previous frame.
 
-1. **Code present; on-device testing pending:** UWP device creation, SwapChainPanel composition, clear and BGRA buffer upload. Resize, suspend/resume and device-loss recovery remain unfinished.
-2. Integrate with upstream `renderer::State` and the GXM command pipeline; map draws, render targets, textures, samplers and synchronization.
-3. Add shader translation appropriate to D3D12/HLSL and validate Vita-specific semantics. Existing GLSL/SPIR-V generation is useful reference material, not a complete D3D12 shader solution.
-4. Implement descriptors, resource transitions, upload allocation, fences, pipeline caching, surface aliasing and readbacks.
-5. Compare homebrew output with upstream; then document per-title correctness and performance with precise revisions and hardware.
-
-A D3D12 clear or CPU framebuffer copy is an infrastructure milestone, not a functioning emulator backend. The current host does **not** understand Vita GXM draw commands.
-
-## Vulkan / OpenGL research
-
-Preserve the goal of separate backend choices where feasible. A Windows desktop driver is not available to an Xbox UWP package simply because its DLL is bundled. Microsoft has described GL-on-D3D12 work for Xbox **GDK** titles; that is not evidence of a ready-made Developer Mode UWP solution. Investigate public-source translation options separately for UWP API compatibility, required GL/Vulkan extensions, shader features, synchronization, packaging, licensing and speed. ANGLE's OpenGL ES support alone is not a drop-in guarantee for upstream's desktop OpenGL backend.
-
-Only expose a selectable renderer after runtime capability checks pass. Unsupported choices should carry an explicit reason; do not silently label a D3D12 translation path as native Vulkan or native OpenGL.
+Microsoft documents D3D12 feature level 11.0 for UWP on Series X|S; features are checked at runtime.
 
 ## Sources
 

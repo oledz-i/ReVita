@@ -1,74 +1,80 @@
-<p align="center"><img src="docs/assets/banner.svg" alt="Vita3K UWP — A new home for Vita emulation" width="100%"></p>
+<p align="center"><img src="docs/assets/banner.png" alt="ReVita — PS Vita games on your Xbox Series X|S" width="100%"></p>
 
 <p align="center">
-  <a href="https://github.com/oledz-i/Vita3K-UWP/actions/workflows/uwp-package.yml"><img src="https://github.com/oledz-i/Vita3K-UWP/actions/workflows/uwp-package.yml/badge.svg" alt="UWP package build"></a>
-  <img src="https://img.shields.io/badge/stage-pre--alpha-38bdf8" alt="Pre-alpha">
-  <img src="https://img.shields.io/badge/target-Xbox%20Dev%20Mode-107c10" alt="Xbox Dev Mode target">
+  <img src="https://img.shields.io/badge/stage-beta-7c5cff" alt="Beta">
+  <img src="https://img.shields.io/badge/runs%20on-Xbox%20Series%20X%7CS-107c10" alt="Xbox Series X|S">
   <a href="COPYING.txt"><img src="https://img.shields.io/badge/license-GPL--2.0--or--later-blue" alt="GPL license"></a>
 </p>
 
-<p align="center"><b>An independent, experimental Vita3K port targeting Xbox Series X|S through UWP.</b><br>Native console foundations. Open development. Built on the work of the Vita3K community.</p>
+<p align="center"><b>PS Vita games on your Xbox Series X|S.</b><br>ReVita is the Vita3K emulator brought to Xbox, with a frontend built for the couch.</p>
 
-<p align="center"><a href="docs/BUILDING.md">Build</a> · <a href="docs/INSTALL.md">Install the shell</a> · <a href="docs/ROADMAP.md">Roadmap</a> · <a href="docs/RENDERERS.md">Renderers</a> · <a href="docs/UPSTREAM.md">Upstream research</a> · <a href="CONTRIBUTING.md">Contribute</a></p>
+<p align="center"><a href="docs/INSTALL.md">Install</a> · <a href="docs/COMPATIBILITY.md">Compatibility</a> · <a href="docs/UI.md">The frontend</a> · <a href="docs/ROADMAP.md">Roadmap</a> · <a href="CONTRIBUTING.md">Contribute</a></p>
 
-## Where things stand
+<p align="center"><img src="docs/assets/screens/home.png" alt="ReVita home: the cover flow" width="100%"></p>
 
-**This is a catalog frontend and port foundation, not a playable emulator yet.** The repository contains a small native C++/CX UWP development shell and a GitHub Actions pipeline that builds an x64 APPX. The integration branch links and executes Vita3K's original bitmap memory allocator, plus a native D3D12 graphics host; the full Vita3K CPU, kernel, firmware services, and GXM renderer are not linked. There are no supported games, performance claims, or implemented emulation renderers in this port today.
+<table>
+<tr>
+<td width="50%"><img src="docs/assets/screens/library.png" alt="Library of posters"></td>
+<td width="50%"><img src="docs/assets/screens/game.png" alt="Game page with backdrop art"></td>
+</tr>
+<tr>
+<td width="50%"><img src="docs/assets/screens/settings.png" alt="Settings: firmware straight from PlayStation"></td>
+<td width="50%"><img src="docs/assets/screens/xmb.png" alt="PS3-style XMB home screen"></td>
+</tr>
+</table>
+<p align="center"><sub>Previews of the frontend. Game names and art are placeholders.</sub></p>
 
-| Area | Current status |
-| --- | --- |
-| UWP application and packaging | Signed x64 APPX with native D3D12 and real upstream memory allocator on `core-integration` |
-| Xbox Series X\|S | Primary target; hardware installation and launch need testing |
-| Vita3K core | Upstream bitmap allocator imported and linked; Dynarmic, kernel and full boot pending |
-| D3D12 | Native device, flip swap chain, GPU clear and BGRA framebuffer upload; Vita GXM draw backend not implemented |
-| Vulkan / OpenGL | Existing upstream backends; Xbox feasibility research pending |
-| Game compatibility | Not available; upstream compatibility does not describe this port |
-| UI, controls, storage, audio | **Discover/Library/Settings UI**, five themes, four generated soundtracks plus four UI focus/select/back/swipe cues, folder + individual game pickers, saved firmware and owned PKG license selection, game metadata and custom/SteamGridDB artwork; Xbox UI validation pending |
+## What this is
 
-## Development builds
+**ReVita** brings PS Vita games to Xbox. Under the hood is [Vita3K](https://github.com/Vita3K/Vita3K), the PS Vita emulator for PC and Android: the full emulator core runs as a UWP app in Xbox Developer Mode, wrapped in a frontend made for a controller and a TV.
 
-Open **[Actions → UWP development package](https://github.com/oledz-i/Vita3K-UWP/actions/workflows/uwp-package.yml)** and choose a successful run. Download `Vita3K-UWP-core-d3d12-x64-<run number>` from a successful `core-integration` run (or the separately named shell artifact from `main`). GitHub may require sign-in. Builds run on pushes to `main`, pull requests, and manual dispatch.
+It's a **beta**. Plenty of games boot and play, some play well, and some don't work yet. Each update moves things forward, and every log you send helps.
 
-The artifact contains a development-signed **APPX**, any generated runtime dependencies, a public test certificate, source-commit metadata, a SHA-256 checksum, and installation instructions. Artifacts expire after 14 days. No stable release is available. The workflow does not publish releases automatically.
+*ReVita was called Vita3K-UWP until build 116. Updating keeps your games, saves and settings.*
 
-Read the **[installation guide](docs/INSTALL.md)** before deploying. These packages are not playable Vita emulators yet. The integration build includes the full streaming-style **catalog frontend**, music and artwork options, Vita3K allocator tests and the D3D12 presentation test. See [frontend guide](docs/UI.md) and [real core port guide](docs/CORE_PORT.md) to navigate the Xbox controls and report real console behavior. APPX is the initial Xbox packaging format; an MSIX/desktop packaging target can be added separately if needed.
+## What works
 
-## Frontend and artwork
+- **Real games, two renderers.** Vulkan (through Mesa's Dozen) and OpenGL (through Mesa), both running on the Xbox's Direct3D 12. Some games prefer one over the other, so you can switch.
+- **Games known to play:** Terraria (a steady 60 fps), Undertale, Danganronpa: Trigger Happy Havoc and Ultra Despair Girls. Gravity Rush, Persona 4 Golden and Minecraft: PS Vita Edition run, with some rough edges. Details per game are on the [compatibility page](docs/COMPATIBILITY.md).
+- **Your games, your way.** VPKs, ZIPs, PKGs with their licenses, or plain game folders, from internal storage or a USB drive. Updates and DLC install from a folder you point the app at.
+- **Firmware in one go.** Download the system software straight from PlayStation's update server inside the app, or pick firmware files you have under whatever names they have. The app works out which is which and installs them.
+- **Game fixes from across the Vita3K community**, including Helldivers, Killzone, Silent Hill, Spider-Man, God of War's stencil shadows, MGS3 audio and Unity games' loading.
+- **Saves, trophies and the system dialogs**: save screens, messages and the on-screen keyboard.
 
-The integration branch includes five visual themes, four original menu loops, four original UI interaction sounds with separate volume, and Xbox B/back navigation. The library recognizes **VPK, ZIP, PKG, VCI, eboot.bin, and extracted game folders**. It checks file headers without loading multi-gigabyte files, and lets users select their own PKG license file for later installation support. **These files cannot be installed or launched yet.** SteamGridDB support requires the user's own API key and exact-title match; **automatic correct art for every title cannot be promised**. See [frontend documentation](docs/UI.md). Upstream CPU/kernel, installation and GXM rendering remain incomplete.
+## The extras
 
-## Reusing OnyxEMU's Xbox Vulkan/Direct3D 12 renderer
+- **Two home screens.** A **cover flow** where your posters turn toward the one you're on and its artwork fills the screen, or a **PS3-style XMB** with eleven colours: pick one you like, or let it follow the month the way the PS3 did.
+- **Art from SteamGridDB.** Add your own API key and the app finds covers and wide backdrops for your games, with a picker for when you want a different one. If a game has no backdrop, the app takes a screenshot while you play and uses that.
+- **Neon themes and an original soundtrack.** Eight themes in ReVita's blue, pink and purple, Synthwave included, each with its own animated scene and its own song: eight calm, upbeat synthwave tracks written for ReVita. Play your own track or turn the music off if you like.
+- **A touch cursor** on the right stick for games that need the touch screen.
+- **Game fixes built in.** Some games need a certain setup, and the app applies it for you. Danganronpa, for example, always starts on OpenGL with surface sync on, because that's the combination that gets it past its interaction bug.
+- **Diagnostics when you need them.** A report from Settings, plus a short performance line in the log every minute, so a problem report actually says what went wrong.
 
-The `onyx-dozen-integration` branch now pins the original [OnyxEMU](https://github.com/oledz-i/OnyxEMU) sources and runs its **proven, Xbox-patched Mesa Dozen build** (including its Mesa patch series). It ports Onyx's direct Vulkan ICD loader to the Vita3K frontend and can probe a real Vulkan 1.1 device and graphics queue. A separate GitHub Actions build can produce a signed APPX with `vulkan_dzn.dll` and `dxil.dll` **only when the patched Mesa UWP build succeeds**.
+## Known issues
 
-This reuses the Xbox **graphics host**, not the Azahar 3DS emulator. Vita3K must still compile for UWP, execute Vita ARM guest code, and connect its Vulkan/GXM renderer to libretro's graphics lifecycle before homebrew or commercial games can run. See [Onyx GPU integration](docs/ONYX_GPU_PORT.md) for the exact adapted files, test plan and GPLv3 attribution. No gameplay has yet been demonstrated.
+- Minecraft crashes on OpenGL (use Vulkan) and has some garbled text. It runs at around 24 fps in the world, but the creative inventory drops it to about 8 fps while it's open.
+- Uncharted: Golden Abyss gets stuck on its splash screen on Vulkan (the quick menu still works). A fix is planned for the next patch.
+- The first time a game uses a new shader, the Xbox can take a moment to compile it. Until it's ready, whatever that shader draws is briefly missing. Nothing freezes.
+- Some games only work on one of the two renderers.
 
-## Real upstream Vita3K core port (in progress)
+## Getting started
 
-The `core-integration` branch now pins an **existing full Vita3K libretro emulator core** from [WizzardSK/vita3k-libretro](https://github.com/WizzardSK/vita3k-libretro), derived from the Vita3K source tree. A separate Windows CI job attempts to compile this *actual* source for the Windows Store API family, including the CPU and existing Vulkan backend. The source build is **not** equivalent to game booting or an Xbox-compatible binary until the port passes all platform checks.
+You'll need an Xbox Series X or S in [Developer Mode](https://learn.microsoft.com/en-us/windows/uwp/xbox-apps/devkit-activation), your own Vita firmware and your own games. This project ships no games, firmware or keys.
 
-The UWP app now has a native libretro C ABI loader/initializer and a Vulkan 1.1 hardware-device test in the Developer page. The loader works **only for DLLs already bundled in and signed with the APPX**; it cannot load random desktop DLLs from a games folder. **No full UWP core DLL or Mesa Dozen ICD is bundled in the standard package**, so those probes are expected to report missing components. See [core and Dozen technical status](docs/CORE_PORT.md).
+1. Download the latest package from [Releases](https://github.com/oledz-i/Vita3K-UWP/releases).
+2. Install it through the Xbox Device Portal and set it to run as a **Game**, not an App, so it gets enough memory.
+3. Open ReVita, pick where it keeps its data, download the firmware (Settings > System) and choose your games folder.
 
-## Homebrew and game-boot status
+The [install guide](docs/INSTALL.md) walks through each step.
 
-**Neither homebrew nor commercial Vita software boots in the Xbox UWP port yet.** Recognizing a file, storing a license or rendering a BGRA test frame is not a game boot. Upstream Vita3K supports homebrew and some commercial titles, but the port must still integrate its Dynarmic CPU implementation, Vita ELF/SELF executable loader, kernel/module services, filesystem and Vulkan-on-Direct3D12 graphics on Xbox. A standalone Vita3K or libretro DLL cannot be copied into UWP and assumed to work because the required graphics backends and platform dependencies are different. See [roadmap](docs/ROADMAP.md).
+## Helping out
 
-## Graphics direction
+Bug reports are most useful with the game, its title ID, the renderer you used and `vita3k-runtime.log`; the install guide shows where to find the log. Please report problems **here**, not to the Vita3K team: this port's bugs aren't theirs. Building it yourself is covered in [BUILDING.md](docs/BUILDING.md), and how to contribute in [CONTRIBUTING.md](CONTRIBUTING.md).
 
-The goal is a dedicated **D3D12** backend for Xbox and retention of **Vulkan** and **OpenGL** where the host supports them. Upstream's renderer is not a drop-in Xbox component: Xbox exposes DirectX, and a loader DLL alone cannot provide a native Vulkan/OpenGL driver. Translation layers are a separate research task with capability, performance and UWP compatibility requirements.
+## Credits
 
-See the [renderer matrix and implementation plan](docs/RENDERERS.md). The native D3D12 device, clear and CPU BGRA upload paths are graphics plumbing, not an implementation of the Vita GXM command/draw backend.
+The emulation is **[Vita3K](https://github.com/Vita3K/Vita3K)**: years of work by its developers and the authors of everything it builds on. The libretro core this port starts from is [WizzardSK's vita3k-libretro](https://github.com/WizzardSK/vita3k-libretro), several game fixes come from [nckstwrt's Vita3K-Plus](https://github.com/nckstwrt/Vita3K-Plus), and graphics run through [Mesa](https://www.mesa3d.org/). Thank you to all of them.
 
-## Building and helping
+New code here is GPL-2.0-or-later; everything upstream keeps its own license. See [COPYING.txt](COPYING.txt) and [NOTICE.md](NOTICE.md).
 
-The shell uses Visual Studio 2022, C++ UWP tools, and Windows SDK 10.0.22621.0. The hosted workflow uses `windows-2022`; you do not need to register a self-hosted runner or provide signing secrets. See [BUILDING.md](docs/BUILDING.md) for the local command and [CONTRIBUTING.md](CONTRIBUTING.md) for scope and issue reporting.
-
-Useful first contributions include reproducible Xbox launch reports, UWP dependency audits, JIT/memory feasibility tests, and D3D12 capability investigations. Please report port issues **in this repository**, not to upstream Vita3K.
-
-## Credits and licensing
-
-The planned emulation foundation is **[Vita3K](https://github.com/Vita3K/Vita3K)**. Full credit belongs to its developers and dependency authors for their existing emulator. Our reviewed upstream revision and source map are in [UPSTREAM.md](docs/UPSTREAM.md).
-
-New original code here is GPL-2.0-or-later; upstream and dependencies retain their own licenses and notices. See [COPYING.txt](COPYING.txt) and [NOTICE.md](NOTICE.md). No games, firmware, keys, or proprietary SDK files are included.
-
-This is an independent community project, not an official Vita3K release and not affiliated with or endorsed by Sony or Microsoft. PlayStation and Xbox names belong to their respective owners.
+ReVita is an independent community project. It isn't an official Vita3K release, and it isn't affiliated with or endorsed by Sony or Microsoft. PlayStation and Xbox are trademarks of their respective owners.

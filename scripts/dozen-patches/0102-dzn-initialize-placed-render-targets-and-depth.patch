@@ -1,0 +1,96 @@
+From 7803986f8c7067222cab0e8919913a12dcb1b211 Mon Sep 17 00:00:00 2001
+From: oledz-i <x@x>
+Date: Mon, 26 Oct 2026 23:37:04 -0400
+Subject: [PATCH] dzn: discard render-target/depth images on their first
+ transition (initializes placed resources)
+
+---
+ src/microsoft/vulkan/dzn_cmd_buffer.c | 49 ++++++++++++++++++++++++---
+ 1 file changed, 45 insertions(+), 4 deletions(-)
+
+diff --git a/src/microsoft/vulkan/dzn_cmd_buffer.c b/src/microsoft/vulkan/dzn_cmd_buffer.c
+index c3cfe67..f6a3b30 100644
+--- a/src/microsoft/vulkan/dzn_cmd_buffer.c
++++ b/src/microsoft/vulkan/dzn_cmd_buffer.c
+@@ -193,6 +193,37 @@ dzn_cmd_buffer_queue_image_range_state_transition(struct dzn_cmd_buffer *cmdbuf,
+    return VK_SUCCESS;
+ }
+ 
++/* VITA3K: D3D12 wants a placed render-target or depth-stencil resource
++ * initialized (Discard, Clear or Copy) before it is used ("Placed resources ...
++ * with either render target or depth stencil flags must be initialized",
++ * D3D12 debug layer on the Xbox), and Dozen places every image in a heap. A
++ * Vulkan transition out of UNDEFINED says the contents do not matter: the
++ * resource is discarded there, which initializes it. Left uninitialized, its
++ * compression metadata is whatever the memory held, and the Xbox's GPU can
++ * reject every depth test or blend garbage into the first frames. */
++static VkResult
++vita3k_queue_and_init(struct dzn_cmd_buffer *cmdbuf, const struct dzn_image *image,
++                      uint32_t first, uint32_t count,
++                      D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after,
++                      uint32_t flags, bool discard, D3D12_RESOURCE_STATES init_state)
++{
++   if (!discard)
++      return dzn_cmd_buffer_queue_transition_barriers(cmdbuf, image->res, first, count,
++                                                      before, after, flags);
++   VkResult ret = dzn_cmd_buffer_queue_transition_barriers(cmdbuf, image->res, first, count,
++                                                           before, init_state,
++                                                           flags | DZN_QUEUE_TRANSITION_FLUSH);
++   if (ret != VK_SUCCESS)
++      return ret;
++   D3D12_DISCARD_REGION region = { 0, NULL, first, count };
++   ID3D12GraphicsCommandList1_DiscardResource(cmdbuf->cmdlist, image->res, &region);
++   if (after == init_state)
++      return VK_SUCCESS;
++   return dzn_cmd_buffer_queue_transition_barriers(cmdbuf, image->res, first, count,
++                                                   init_state, after,
++                                                   flags & ~DZN_QUEUE_TRANSITION_BEFORE_IS_UNDEFINED);
++}
++
+ static VkResult
+ dzn_cmd_buffer_queue_image_range_layout_transition(struct dzn_cmd_buffer *cmdbuf,
+                                                    const struct dzn_image *image,
+@@ -208,6 +239,14 @@ dzn_cmd_buffer_queue_image_range_layout_transition(struct dzn_cmd_buffer *cmdbuf
+    if (old_layout == VK_IMAGE_LAYOUT_UNDEFINED)
+       flags |= DZN_QUEUE_TRANSITION_BEFORE_IS_UNDEFINED;
+ 
++   const bool vita3k_discard =
++      (old_layout == VK_IMAGE_LAYOUT_UNDEFINED || old_layout == VK_IMAGE_LAYOUT_PREINITIALIZED) &&
++      cmdbuf->type == D3D12_COMMAND_LIST_TYPE_DIRECT &&
++      (image->desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
++   const D3D12_RESOURCE_STATES vita3k_init_state =
++      (image->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ?
++      D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_RENDER_TARGET;
++
+    dzn_foreach_aspect(aspect, range->aspectMask) {
+       D3D12_RESOURCE_STATES after =
+          dzn_image_layout_to_state(image, new_layout, aspect, cmdbuf->type);
+@@ -230,9 +269,10 @@ dzn_cmd_buffer_queue_image_range_layout_transition(struct dzn_cmd_buffer *cmdbuf
+             continue;
+          }
+ 
+-         ret = dzn_cmd_buffer_queue_transition_barriers(cmdbuf, image->res,
++         ret = vita3k_queue_and_init(cmdbuf, image,
+                                                         first_barrier, barrier_count,
+-                                                        before, after, flags);
++                                                        before, after, flags,
++                                                        vita3k_discard, vita3k_init_state);
+          if (ret != VK_SUCCESS)
+             return ret;
+ 
+@@ -240,9 +280,10 @@ dzn_cmd_buffer_queue_image_range_layout_transition(struct dzn_cmd_buffer *cmdbuf
+       }
+ 
+       if (barrier_count) {
+-         ret = dzn_cmd_buffer_queue_transition_barriers(cmdbuf, image->res,
++         ret = vita3k_queue_and_init(cmdbuf, image,
+                                                         first_barrier, barrier_count,
+-                                                        before, after, flags);
++                                                        before, after, flags,
++                                                        vita3k_discard, vita3k_init_state);
+          if (ret != VK_SUCCESS)
+             return ret;
+       }
+-- 
+2.43.0
+

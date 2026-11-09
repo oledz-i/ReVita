@@ -1,0 +1,8 @@
+{
+  "core_commit": "ab4891a3f53a22264f88233a3238f0e887104cb3",
+  "vulkan_headers_commit": "b379292b2ab6df5771ba9870d53cf8b2c9295daf",
+  "headers": {
+    "libretro.h": "bd3398d29c3763d18617087020ff56b5450a48a63123403a4b674f8e79947acb",
+    "libretro_vulkan.h": "b563d4571fccb981e9aaee09389aa09f2cba84a497c435890d740b2c3d428f39"
+  }
+}

@@ -1,8 +1,13 @@
 name: Vita3K Cinematic Xbox UI
 on:
   push:
-    branches: [cinematic-ui-overhaul, undertale-boot]
+    branches: [cinematic-ui-overhaul, undertale-boot, astra-undertale]
   workflow_dispatch:
+    inputs:
+      release:
+        description: Public release build (hides the developer Tools page)
+        type: boolean
+        default: false
 permissions:
   contents: read
   actions: read
@@ -13,6 +18,8 @@ jobs:
   appx-with-onyx-dozen:
     runs-on: windows-2022
     timeout-minutes: 35
+    env:
+      VITA3K_RELEASE: ${{ inputs.release && '1' || '0' }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Reuse verified Onyx Mesa UWP GPU build from prior successful run
@@ -21,8 +28,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = 'Stop'
-          gh run download 40146146144 --repo oledz-i/Vita3K-UWP --name onyx-mesa-dozen-uwp --dir artifacts/onyx-cached-gpu
-          if ($LASTEXITCODE -ne 0) { throw 'Could not retrieve the actual Onyx-patched Mesa UWP build' }
+          ./scripts/get-dozen.ps1 -Destination artifacts/onyx-cached-gpu
           foreach ($dll in @('vulkan_dzn.dll', 'dxil.dll')) {
             $from = Join-Path 'artifacts/onyx-cached-gpu' $dll
             if (!(Test-Path $from)) { throw "$dll missing from the Onyx source-compiled GPU artifact" }
@@ -37,6 +43,10 @@ jobs:
       - name: Compile and sign cinematic UI plus genuine Onyx Dozen DLL
         shell: pwsh
         run: ./scripts/build-appx.ps1 -BuildNumber ${{ github.run_number }}
+      - name: Show build errors on the run page
+        if: failure()
+        shell: pwsh
+        run: ./scripts/annotate-msbuild.ps1
       - name: Verify both source-built GPU DLLs are inside signed APPX
         shell: pwsh
         run: |
@@ -52,6 +62,14 @@ jobs:
               if (!($entries | Where-Object { $_ -ieq $file -or $_ -ilike "*/$file" })) {
                 throw "$file was not found in the signed APPX"
               }
+            }
+            # The menu music plays from ms-appx:///Assets/Music: missing, the menu is
+            # silent. Reported (with what the package holds), not fatal.
+            $all = @($archive.Entries | ForEach-Object FullName)
+            $missing = @('starlight-drive','afterlight','neon-bloom','midnight-arcade','coastline-87','pastel-horizon','cotton-sky','ultraviolet' | Where-Object { $t = $_; !($all | Where-Object { $_ -ieq "Assets/Music/$t.m4a" }) })
+            if ($missing.Count) {
+              $seen = ($all | Where-Object { $_ -match '(?i)wav|music|^assets' }) -join ', '
+              Write-Host "::error title=Menu music not packaged::Missing Assets/Music/: $($missing -join ', '). Package has: $seen"
             }
           } finally { $archive.Dispose() }
       - name: Publish signed Xbox UI + Vulkan prototype

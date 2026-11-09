@@ -1,0 +1,152 @@
+diff --git a/vita3k/cpu/src/dynarmic_cpu.cpp b/vita3k/cpu/src/dynarmic_cpu.cpp
+index 2653633f..4d2c0748 100644
+--- a/vita3k/cpu/src/dynarmic_cpu.cpp
++++ b/vita3k/cpu/src/dynarmic_cpu.cpp
+@@ -27,11 +27,51 @@
+ #include <dynarmic/interface/A32/coprocessor.h>
+ #include <dynarmic/interface/exclusive_monitor.h>
+ 
++#include <atomic>
+ #include <bit>
++#include <chrono>
+ #include <memory>
++#include <mutex>
+ #include <optional>
+ #include <string>
+ 
++static std::uint64_t coproc_noop(void *, std::uint32_t, std::uint32_t) {
++    return 0;
++}
++
++static Dynarmic::A32::Coprocessor::Callback coproc_noop_callback() {
++    return Dynarmic::A32::Coprocessor::Callback{ &coproc_noop, std::nullopt };
++}
++
++// Coprocessor slots the Vita does not have: games that probe them get a no-op
++// instead of an exception the JIT cannot handle.
++class ArmDynarmicNullCP : public Dynarmic::A32::Coprocessor {
++public:
++    using CoprocReg = Dynarmic::A32::CoprocReg;
++    ~ArmDynarmicNullCP() override = default;
++    std::optional<Callback> CompileInternalOperation(bool, unsigned, CoprocReg, CoprocReg, CoprocReg, unsigned) override {
++        return coproc_noop_callback();
++    }
++    CallbackOrAccessOneWord CompileSendOneWord(bool, unsigned, CoprocReg, CoprocReg, unsigned) override {
++        return coproc_noop_callback();
++    }
++    CallbackOrAccessTwoWords CompileSendTwoWords(bool, unsigned, CoprocReg) override {
++        return coproc_noop_callback();
++    }
++    CallbackOrAccessOneWord CompileGetOneWord(bool, unsigned, CoprocReg, CoprocReg, unsigned) override {
++        return coproc_noop_callback();
++    }
++    CallbackOrAccessTwoWords CompileGetTwoWords(bool, unsigned, CoprocReg) override {
++        return coproc_noop_callback();
++    }
++    std::optional<Callback> CompileLoadWords(bool, bool, CoprocReg, std::optional<std::uint8_t>) override {
++        return coproc_noop_callback();
++    }
++    std::optional<Callback> CompileStoreWords(bool, bool, CoprocReg, std::optional<std::uint8_t>) override {
++        return coproc_noop_callback();
++    }
++};
++
+ class ArmDynarmicCP15 : public Dynarmic::A32::Coprocessor {
+     uint32_t tpidruro;
+     uint32_t tpidrurw;
+@@ -178,7 +218,83 @@ public:
+         LOG_TRACE("{} ({}): {} {}", log_hex(self_), self.parent->thread_id, log_hex(address), disassembly);
+     }
+ 
++    // Unity (mono) games: mono builds its loader lock out on the Vita, so two
++    // threads loading assemblies at once corrupt mono's tables (hangs and
++    // crashes in Unity titles). The lock functions are found by their code and
++    // serialised on the host.
++    inline static std::recursive_timed_mutex loader_lock_mutex;
++    inline static std::atomic<int> loader_lock_timeouts{ 0 };
++    int loader_lock_held = 0;
++
++    static void MonoLoaderLockAcquire(uint64_t self_, uint64_t, uint64_t) {
++        ArmDynarmicCallback &self = *reinterpret_cast<ArmDynarmicCallback *>(self_);
++        if (self.loader_lock_held > 0) {
++            ++self.loader_lock_held;
++            return;
++        }
++        if (!loader_lock_mutex.try_lock_for(std::chrono::seconds(5))) {
++            if (loader_lock_timeouts.fetch_add(1) < 20)
++                LOG_WARN("Mono loader lock: waited 5 s on thread {}, going on without it", self.parent->thread_id);
++            return;
++        }
++        self.loader_lock_held = 1;
++    }
++
++    static void MonoLoaderLockRelease(uint64_t self_, uint64_t, uint64_t) {
++        ArmDynarmicCallback &self = *reinterpret_cast<ArmDynarmicCallback *>(self_);
++        if (self.loader_lock_held == 0)
++            return;
++        if (--self.loader_lock_held == 0)
++            loader_lock_mutex.unlock();
++    }
++
++    enum class MonoLoaderOp { None, Lock, Unlock };
++
++    static constexpr bool is_movw(uint32_t insn, uint32_t rd) {
++        return (insn & 0xFFF0F000) == (0xE3000000 | (rd << 12));
++    }
++    static constexpr bool is_movt(uint32_t insn, uint32_t rd) {
++        return (insn & 0xFFF0F000) == (0xE3400000 | (rd << 12));
++    }
++
++    // Both functions share a 19-word ARM body; only the +1 / -1 on the nesting count differs.
++    MonoLoaderOp classify_mono_loader_lock(Dynarmic::A32::VAddr pc) {
++        constexpr size_t BODY_WORDS = 19;
++        uint32_t w[BODY_WORDS];
++        for (size_t i = 0; i < BODY_WORDS; i++) {
++            const Ptr<uint32_t> word{ static_cast<Address>(pc + i * 4) };
++            if (!word.valid(*parent->mem))
++                return MonoLoaderOp::None;
++            w[i] = *word.get(*parent->mem);
++            if (i == 0 && w[0] != 0xE92D4010) // push {r4, lr}
++                return MonoLoaderOp::None;
++        }
++        const bool shape = is_movw(w[1], 0) && is_movt(w[2], 0) && w[3] == 0xE5900000 /* ldr r0,[r0] */
++            && w[4] == 0xE3500000 /* cmp r0,#0 */ && w[5] == 0x0A00000B /* beq epilogue */
++            && is_movw(w[6], 0) && is_movt(w[7], 0) && w[8] == 0xE5904000 /* ldr r4,[r0] */
++            && is_movw(w[9], 12) && is_movt(w[10], 12) && w[11] == 0xE1A00004 /* mov r0,r4 */ && w[12] == 0xE12FFF3C /* blx ip */
++            && is_movw(w[13], 12) && is_movt(w[15], 12) && w[16] == 0xE1A00004 && w[17] == 0xE12FFF3C
++            && w[18] == 0xE8BD8010; // pop {r4, pc}
++        if (!shape)
++            return MonoLoaderOp::None;
++        if (w[14] == 0xE2801001) // add r1, r0, #1
++            return MonoLoaderOp::Lock;
++        if (w[14] == 0xE2401001) // sub r1, r0, #1
++            return MonoLoaderOp::Unlock;
++        return MonoLoaderOp::None;
++    }
++
+     void PreCodeTranslationHook(bool is_thumb, Dynarmic::A32::VAddr pc, Dynarmic::A32::IREmitter &ir) override {
++        if (!is_thumb) {
++            if (const MonoLoaderOp op = classify_mono_loader_lock(pc); op != MonoLoaderOp::None) {
++                static std::once_flag announced;
++                std::call_once(announced, [pc] {
++                    LOG_INFO("Mono loader lock found at 0x{:X}: serialising it (Unity game)", pc);
++                });
++                ir.CallHostFunction(op == MonoLoaderOp::Lock ? &MonoLoaderLockAcquire : &MonoLoaderLockRelease,
++                    ir.Imm64(reinterpret_cast<uint64_t>(this)), ir.Imm64(0), ir.Imm64(0));
++            }
++        }
+         if (cpu->log_code) {
+             ir.CallHostFunction(&TraceInstruction, ir.Imm64(reinterpret_cast<uint64_t>(this)), ir.Imm64(pc), ir.Imm64(is_thumb));
+         }
+@@ -396,6 +512,11 @@ std::unique_ptr<Dynarmic::A32::Jit> DynarmicCPU::make_jit() {
+     config.hook_hint_instructions = true;
+     config.global_monitor = &shared_monitor;
+     config.coprocessors[15] = cp15;
++    static const std::shared_ptr<ArmDynarmicNullCP> null_cp = std::make_shared<ArmDynarmicNullCP>();
++    for (auto &coproc : config.coprocessors) {
++        if (!coproc)
++            coproc = null_cp;
++    }
+     config.processor_id = core_id;
+     config.optimizations = cpu_opt ? Dynarmic::all_safe_optimizations : Dynarmic::no_optimizations;
+ #ifdef VITA3K_UWP

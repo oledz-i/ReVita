@@ -1,0 +1,835 @@
+diff --git a/vita3k/interface.cpp b/vita3k/interface.cpp
+index c1e6b0a3..9cab4a01 100644
+--- a/vita3k/interface.cpp
++++ b/vita3k/interface.cpp
+@@ -182,7 +182,8 @@ static bool install_archive_content(EmuEnvState &emuenv, const ZipPtr &zip, cons
+ 
+     auto output_path{ emuenv.vita_fs_path / "ux0" };
+     if (mz_zip_reader_extract_file_to_callback(zip.get(), (content_path + sfo_path).c_str(), &write_to_buffer, &buffer, 0)) {
+-        sfo::get_param_info(emuenv.app_info, buffer, emuenv.cfg.sys_lang);
++        if (!sfo::get_param_info(emuenv.app_info, buffer, emuenv.cfg.sys_lang))
++            return false;
+         if (!set_content_path(emuenv, is_theme, output_path))
+             return false;
+     } else if (is_theme) {
+diff --git a/vita3k/io/include/io/state.h b/vita3k/io/include/io/state.h
+index 14b85e8c..4799028d 100644
+--- a/vita3k/io/include/io/state.h
++++ b/vita3k/io/include/io/state.h
+@@ -113,6 +113,7 @@ struct IOState {
+     struct DevicePaths {
+         std::string app0;
+         std::string savedata0;
++        std::string savedata1; // another title's save data mounted by sceAppUtilSaveDataMount, empty when none
+         std::string addcont0;
+         std::string cache0;
+     } device_paths;
+diff --git a/vita3k/io/src/io.cpp b/vita3k/io/src/io.cpp
+index 46b7ec58..675fc9b1 100644
+--- a/vita3k/io/src/io.cpp
++++ b/vita3k/io/src/io.cpp
+@@ -167,6 +167,7 @@ void io_deinit(IOState &io) {
+ 
+ void init_device_paths(IOState &io) {
+     io.device_paths.savedata0 = "user/" + io.user_id + "/savedata/" + io.savedata;
++    io.device_paths.savedata1.clear();
+     io.device_paths.app0 = "app/" + io.app_path;
+     io.device_paths.addcont0 = "addcont/" + io.addcont;
+     io.device_paths.cache0.clear();
+@@ -239,12 +240,16 @@ std::string translate_path(const char *path, VitaIoDevice &device, const IOState
+     // TODO: Handle dot-dot paths
+ 
+     switch (device) {
+-    case VitaIoDevice::savedata0: // Redirect savedata0: to ux0:user/00/savedata/<title_id>
+-    case VitaIoDevice::savedata1: {
++    case VitaIoDevice::savedata0: { // Redirect savedata0: to ux0:user/00/savedata/<title_id>
+         relative_path = device::remove_device_from_path(relative_path, device, device_paths.savedata0);
+         device = VitaIoDevice::ux0;
+         break;
+     }
++    case VitaIoDevice::savedata1: { // Redirect savedata1: to the save data mounted by sceAppUtilSaveDataMount
++        relative_path = device::remove_device_from_path(relative_path, device, device_paths.savedata1.empty() ? "savedata1_not_mounted" : device_paths.savedata1);
++        device = VitaIoDevice::ux0;
++        break;
++    }
+     case VitaIoDevice::app0: { // Redirect app0: to ux0:app/<title_id>
+         relative_path = device::remove_device_from_path(relative_path, device, device_paths.app0);
+         device = VitaIoDevice::ux0;
+diff --git a/vita3k/io/src/state_functions.cpp b/vita3k/io/src/state_functions.cpp
+index 28361393..af2ed3b4 100644
+--- a/vita3k/io/src/state_functions.cpp
++++ b/vita3k/io/src/state_functions.cpp
+@@ -51,14 +51,14 @@ SceOff FileStats::read(void *input_data, const int element_size, const SceSize e
+     if (element_size == 0 || element_count == 0)
+         return 0;
+ 
+-    // we are filling this buffer this data, why would we have to set some parts to 0 before ?
++    // we are filling this buffer this data, why would we have to touch some parts before ?
+     // that's because host io does not work well with memory trapping and read-only buffer
+-    // so set 1 byte to 0 in all pages to trigger all possible pagefaults in this range
++    // so rewrite 1 byte of every page with its own value to trigger all possible pagefaults in this range
+     // todo: call a mem function to check this instead
+     volatile uint8_t *input_addr = reinterpret_cast<volatile uint8_t *>(input_data);
+     for (int i = 0; i < element_size * element_count; i += page_size)
+-        input_addr[i] = 0;
+-    input_addr[element_size * element_count - 1] = 0;
++        input_addr[i] = input_addr[i];
++    input_addr[element_size * element_count - 1] = input_addr[element_size * element_count - 1];
+ 
+     return fread(input_data, element_size, element_count, wrapped_file.get());
+ }
+diff --git a/vita3k/kernel/include/kernel/relocation.h b/vita3k/kernel/include/kernel/relocation.h
+index 3b982b3c..92295bf7 100644
+--- a/vita3k/kernel/include/kernel/relocation.h
++++ b/vita3k/kernel/include/kernel/relocation.h
+@@ -20,6 +20,7 @@
+ #include <mem/util.h>
+ 
+ #include <map>
++#include <vector>
+ 
+ struct MemState;
+ 
+@@ -33,6 +34,7 @@ using SegmentInfosForReloc = std::map<uint16_t, SegmentInfoForReloc>;
+ /**
+  * \param is_var_import True when alternate format 1 should be used (it's used for var import relocations)
+  * \param explicit_symval Used only if is_var_import is true, specifies the value to be written to the relocation target
++ * \param patched Used only if is_var_import is true (receives the guest address of each rewritten word)
+  * \return True on success, false on error
+  */
+-bool relocate(const void *entries, uint32_t size, const SegmentInfosForReloc &segments, const MemState &mem, bool is_var_import = false, uint32_t explicit_symval = 0);
++bool relocate(const void *entries, uint32_t size, const SegmentInfosForReloc &segments, const MemState &mem, bool is_var_import = false, uint32_t explicit_symval = 0, std::vector<Address> *patched = nullptr);
+diff --git a/vita3k/kernel/src/load_self.cpp b/vita3k/kernel/src/load_self.cpp
+index 5b466998..a63ab562 100644
+--- a/vita3k/kernel/src/load_self.cpp
++++ b/vita3k/kernel/src/load_self.cpp
+@@ -397,18 +397,13 @@ static bool load_var_exports(const uint32_t *nids, const Ptr<uint32_t> *entries,
+                 }
+             }
+ 
+-            // Note: We make the assumption that variables are not imported into executable code (wouldn't make a lot of sense)
+-            // If this is not the case, uncomment the following
+-            /* if (!seg.empty()) {
+-                for (const auto &[key, value] : seg) {
+-                    kernel.invalidate_jit_cache(value.addr, value.size);
+-                }
+-            }*/
+-
+             if (!seg.empty()) {
+-                if (!relocate(var_binding_info.entries, var_binding_info.size, seg, mem, true, entry.address())) {
++                std::vector<Address> patched;
++                if (!relocate(var_binding_info.entries, var_binding_info.size, seg, mem, true, entry.address(), &patched)) {
+                     LOG_ERROR("Failed to relocate late binding info");
+                 }
++                for (const Address word : patched)
++                    kernel.invalidate_jit_cache(word, sizeof(uint32_t));
+             }
+         }
+         if (old_entry_address)
+diff --git a/vita3k/kernel/src/relocation.cpp b/vita3k/kernel/src/relocation.cpp
+index 100d1fcb..e51d6dcd 100644
+--- a/vita3k/kernel/src/relocation.cpp
++++ b/vita3k/kernel/src/relocation.cpp
+@@ -300,7 +300,7 @@ static bool relocate_entry(void *data, uint32_t code, uint32_t symval, uint32_t
+     return true; // ignore unhandled relocations
+ }
+ 
+-bool relocate(const void *entries, uint32_t size, const SegmentInfosForReloc &segments, const MemState &mem, bool is_var_import, uint32_t explicit_symval) {
++bool relocate(const void *entries, uint32_t size, const SegmentInfosForReloc &segments, const MemState &mem, bool is_var_import, uint32_t explicit_symval, std::vector<Address> *patched) {
+     const void *const end = static_cast<const uint8_t *>(entries) + size;
+     const Entry *entry = static_cast<const Entry *>(entries);
+ 
+@@ -425,6 +425,8 @@ bool relocate(const void *entries, uint32_t size, const SegmentInfosForReloc &se
+                 if (!relocate_entry(Ptr<uint32_t>(p).get(mem), format1_entry->code, s, a, p)) {
+                     return false;
+                 }
++                if (patched)
++                    patched->push_back(p);
+ 
+                 g_addr = patch_seg_start;
+                 g_offset = offset;
+@@ -486,6 +488,8 @@ bool relocate(const void *entries, uint32_t size, const SegmentInfosForReloc &se
+                 if (!relocate_entry(Ptr<uint32_t>(p).get(mem), format1_entry->code, s, a, p)) {
+                     return false;
+                 }
++                if (patched)
++                    patched->push_back(p);
+ 
+                 g_addr = patch_seg_start;
+                 g_offset = offset;
+diff --git a/vita3k/mem/src/mem.cpp b/vita3k/mem/src/mem.cpp
+index 919d8024..4f596c1a 100644
+--- a/vita3k/mem/src/mem.cpp
++++ b/vita3k/mem/src/mem.cpp
+@@ -498,6 +498,11 @@ void free(MemState &state, Address address) {
+     const uint32_t page_num = address / STANDARD_PAGE_SIZE;
+     assert(page_num >= 0);
+ 
++    if (state.alloc_table == nullptr) {
++        LOG_CRITICAL("Freeing unallocated alloc_table");
++        return;
++    }
++
+     AllocMemPage &page = state.alloc_table[page_num];
+     if (!page.allocated) {
+         LOG_CRITICAL("Freeing unallocated page");
+diff --git a/vita3k/modules/SceAppUtil/SceAppUtil.cpp b/vita3k/modules/SceAppUtil/SceAppUtil.cpp
+index 9dceb549..347d643e 100644
+--- a/vita3k/modules/SceAppUtil/SceAppUtil.cpp
++++ b/vita3k/modules/SceAppUtil/SceAppUtil.cpp
+@@ -366,9 +366,46 @@ EXPORT(int, sceAppUtilSaveDataGetQuota, SceSize *quotaSizeKiB, SceSize *usedSize
+     return 0;
+ }
+ 
+-EXPORT(int, sceAppUtilSaveDataMount) {
+-    TRACY_FUNC(sceAppUtilSaveDataMount);
+-    return UNIMPLEMENTED();
++struct SceAppUtilTitleId {
++    SceChar8 data[10];
++    SceChar8 padding[6];
++};
++
++struct SceAppUtilPassCode {
++    SceUChar8 data[32];
++};
++
++EXPORT(SceInt32, sceAppUtilSaveDataMount, const SceAppUtilTitleId *titleId, const SceAppUtilPassCode *passCode) {
++    TRACY_FUNC(sceAppUtilSaveDataMount, titleId, passCode);
++    if (!titleId || !passCode)
++        return RET_ERROR(SCE_APPUTIL_ERROR_PARAMETER);
++
++    const char *const id = reinterpret_cast<const char *>(titleId->data);
++    const std::string title_id(id, strnlen(id, sizeof(titleId->data)));
++    // the title must be listed in INSTALL_DIR_SAVEDATA_ADD_1..7 of the app's param.sfo
++    bool listed = false;
++    for (int i = 1; i <= 7 && !listed; i++) {
++        std::string listed_id;
++        if (sfo::get_data_by_key(listed_id, emuenv.sfo_handle, fmt::format("INSTALL_DIR_SAVEDATA_ADD_{}", i))
++            || sfo::get_data_by_key(listed_id, emuenv.sfo_handle, fmt::format("INSTALL_DIR_SAVEDATA_ADD{}", i)))
++            listed = listed_id.c_str() == title_id;
++    }
++    if (!listed) {
++        LOG_WARN("sceAppUtilSaveDataMount: {} is not in INSTALL_DIR_SAVEDATA_ADD of param.sfo", title_id);
++        return RET_ERROR(SCE_APPUTIL_ERROR_PARAMETER);
++    }
++    if (!emuenv.io.device_paths.savedata1.empty())
++        return RET_ERROR(SCE_APPUTIL_ERROR_BUSY);
++
++    // the passcode of the other title's package is not known here, so it is not checked
++    const std::string savedata_path = "user/" + emuenv.io.user_id + "/savedata/" + title_id;
++    if (!fs::is_directory(emuenv.vita_fs_path / "ux0" / savedata_path)) {
++        LOG_INFO("sceAppUtilSaveDataMount: no save data of {} at ux0:{}", title_id, savedata_path);
++        return SCE_ERROR_ERRNO_ENOENT;
++    }
++    emuenv.io.device_paths.savedata1 = savedata_path;
++    LOG_INFO("sceAppUtilSaveDataMount: savedata1: is ux0:{}", savedata_path);
++    return 0;
+ }
+ 
+ EXPORT(int, sceAppUtilSaveDataSlotCreate, unsigned int slotId, SceAppUtilSaveDataSlotParam *param, SceAppUtilMountPoint *mountPoint) {
+@@ -458,9 +495,12 @@ EXPORT(SceInt32, sceAppUtilSaveDataSlotSetParam, SceAppUtilSaveDataSlotId slotId
+     return 0;
+ }
+ 
+-EXPORT(int, sceAppUtilSaveDataUmount) {
++EXPORT(SceInt32, sceAppUtilSaveDataUmount) {
+     TRACY_FUNC(sceAppUtilSaveDataUmount);
+-    return UNIMPLEMENTED();
++    if (emuenv.io.device_paths.savedata1.empty())
++        return RET_ERROR(SCE_APPUTIL_ERROR_NOT_MOUNTED);
++    emuenv.io.device_paths.savedata1.clear();
++    return 0;
+ }
+ 
+ static SceInt32 SafeMemory(EmuEnvState &emuenv, void *buf, SceSize bufSize, SceOff offset, const char *export_name, bool save) {
+diff --git a/vita3k/modules/SceAudiodec/SceAudiodecUser.cpp b/vita3k/modules/SceAudiodec/SceAudiodecUser.cpp
+index 1d7fb1ed..c6667e99 100644
+--- a/vita3k/modules/SceAudiodec/SceAudiodecUser.cpp
++++ b/vita3k/modules/SceAudiodec/SceAudiodecUser.cpp
+@@ -434,7 +434,7 @@ EXPORT(int, sceAudiodecPartlyDecode, SceAudiodecCtrl *ctrl, SceUInt32 samples_of
+         decoder->receive(temp_storage.data() + old_size, &size);
+     }
+ 
+-    memcpy(pcm_data + samples_offset * bytes_per_sample, temp_storage.data() + samples_offset * bytes_per_sample, samples_to_decode * bytes_per_sample);
++    memcpy(pcm_data, temp_storage.data() + samples_offset * bytes_per_sample, samples_to_decode * bytes_per_sample);
+ 
+     return 0;
+ }
+diff --git a/vita3k/modules/SceNpManager/SceNpManager.cpp b/vita3k/modules/SceNpManager/SceNpManager.cpp
+index e9a884df..16b9def3 100644
+--- a/vita3k/modules/SceNpManager/SceNpManager.cpp
++++ b/vita3k/modules/SceNpManager/SceNpManager.cpp
+@@ -105,9 +105,28 @@ EXPORT(int, sceNpManagerGetAccountRegion) {
+     return UNIMPLEMENTED();
+ }
+ 
+-EXPORT(int, sceNpManagerGetCachedParam) {
+-    TRACY_FUNC(sceNpManagerGetCachedParam);
+-    return UNIMPLEMENTED();
++constexpr size_t SCE_NP_AVATAR_URL_MAX_LENGTH = 127;
++
++struct SceNpAvatarUrl {
++    char data[SCE_NP_AVATAR_URL_MAX_LENGTH];
++    char term;
++};
++
++struct SceNpManagerCacheParam {
++    np::SceNpId npId;
++    SceNpAvatarUrl avatarUrl;
++};
++static_assert(sizeof(SceNpManagerCacheParam) == 0xA4, "SceNpManagerCacheParam is an invalid size");
++
++EXPORT(int, sceNpManagerGetCachedParam, Ptr<SceNpManagerCacheParam> param) {
++    TRACY_FUNC(sceNpManagerGetCachedParam, param);
++    if (!param || !param.valid(emuenv.mem))
++        return RET_ERROR(SCE_NP_MANAGER_ERROR_INVALID_ARGUMENT);
++
++    // the NP ID and avatar URL the system cached in flash at the last sign-in
++    SceNpManagerCacheParam *const cache = param.get(emuenv.mem);
++    memset(cache, 0, sizeof(*cache));
++    return CALL_EXPORT(sceNpManagerGetNpId, &cache->npId);
+ }
+ 
+ EXPORT(int, sceNpManagerGetChatRestrictionFlag, SceInt *isRestricted) {
+diff --git a/vita3k/ngs/src/modules/atrac9.cpp b/vita3k/ngs/src/modules/atrac9.cpp
+index 5c2bc5b8..b34d926f 100644
+--- a/vita3k/ngs/src/modules/atrac9.cpp
++++ b/vita3k/ngs/src/modules/atrac9.cpp
+@@ -284,8 +284,8 @@ bool Atrac9Module::decode_more_data(KernelState &kern, const MemState &mem, cons
+ 
+     logical->superframe_staging.clear();
+ 
+-    state->samples_generated_since_key_on += decoded_size * params->channels;
+-    state->samples_generated_total += decoded_size * params->channels;
++    state->samples_generated_since_key_on += decoded_size * SCE_NGS_MAX_SYSTEM_CHANNELS;
++    state->samples_generated_total += decoded_size * SCE_NGS_MAX_SYSTEM_CHANNELS;
+     state->bytes_consumed_since_key_on += superframe_size;
+     state->total_bytes_consumed += superframe_size;
+     runtime->decoder->export_state(&logical->saved_state);
+diff --git a/vita3k/packages/include/packages/sfo.h b/vita3k/packages/include/packages/sfo.h
+index a2e1a30f..d4543455 100644
+--- a/vita3k/packages/include/packages/sfo.h
++++ b/vita3k/packages/include/packages/sfo.h
+@@ -97,5 +97,5 @@ bool load(SfoFile &sfile, const std::vector<uint8_t> &content);
+  * @param param File buffer pointing to the `param.sfo` file to parse
+  * @param sys_lang System language. It is used to get translated strings from `param.sfo`
+  */
+-void get_param_info(sfo::SfoAppInfo &app_info, const vfs::FileBuffer &param, int sys_lang);
++bool get_param_info(sfo::SfoAppInfo &app_info, const vfs::FileBuffer &param, int sys_lang);
+ } // namespace sfo
+diff --git a/vita3k/packages/src/sfo.cpp b/vita3k/packages/src/sfo.cpp
+index 0073f6ad..5cfa9b1e 100644
+--- a/vita3k/packages/src/sfo.cpp
++++ b/vita3k/packages/src/sfo.cpp
+@@ -74,9 +74,10 @@ bool get_data_by_key(std::string &out_data, SfoFile &file, const std::string &ke
+     return true;
+ }
+ 
+-void get_param_info(sfo::SfoAppInfo &app_info, const vfs::FileBuffer &param, int sys_lang) {
++bool get_param_info(sfo::SfoAppInfo &app_info, const vfs::FileBuffer &param, int sys_lang) {
+     SfoFile sfo_handle;
+-    sfo::load(sfo_handle, param);
++    if (!sfo::load(sfo_handle, param))
++        return false;
+     sfo::get_data_by_key(app_info.app_version, sfo_handle, "APP_VER");
+     if (app_info.app_version[0] == '0')
+         app_info.app_version.erase(app_info.app_version.begin());
+@@ -103,6 +104,10 @@ bool load(SfoFile &sfile, const std::vector<uint8_t> &content) {
+ 
+     memcpy(&sfile.header, content.data(), sizeof(SfoHeader));
+ 
++    if (sfile.header.magic != 0x46535000) {
++        return false;
++    }
++
+     sfile.entries.resize(sfile.header.tables_entries + 1);
+ 
+     for (uint32_t i = 0; i < sfile.header.tables_entries; i++) {
+diff --git a/vita3k/renderer/src/shaders.cpp b/vita3k/renderer/src/shaders.cpp
+index 72a21b89..59e3c0f5 100644
+--- a/vita3k/renderer/src/shaders.cpp
++++ b/vita3k/renderer/src/shaders.cpp
+@@ -183,7 +183,7 @@ static shader::GeneratedShader load_shader_generic(shader::Target target, const
+         }
+     }
+ 
+-    LOG_INFO("Generating {} shader {}", shader_type_str, hash_text);
++    LOG_DEBUG("Generating {} shader {}", shader_type_str, hash_text);
+ 
+ #ifndef VITA3K_UWP
+     fs::create_directories(shaderlog_path);
+diff --git a/vita3k/renderer/src/vulkan/pipeline_cache.cpp b/vita3k/renderer/src/vulkan/pipeline_cache.cpp
+index 2b94eb07..04a93721 100644
+--- a/vita3k/renderer/src/vulkan/pipeline_cache.cpp
++++ b/vita3k/renderer/src/vulkan/pipeline_cache.cpp
+@@ -1222,8 +1222,9 @@ vk::Pipeline PipelineCache::compile_pipeline(SceGxmPrimitiveType type, vk::Rende
+         .depthCompareOp = translate_depth_func(record.front_depth_func),
+         .depthBoundsTestEnable = VK_FALSE,
+         .stencilTestEnable = !maskupdate,
+-        .front = convert_op_state(record.front_stencil_state_op),
+-        .back = convert_op_state(two_sided ? record.back_stencil_state_op : record.front_stencil_state_op)
++        // GXM gives its front two-sided state to clockwise triangles
++        .front = convert_op_state(two_sided ? record.back_stencil_state_op : record.front_stencil_state_op),
++        .back = convert_op_state(record.front_stencil_state_op)
+     };
+ 
+     vk::PipelineColorBlendStateCreateInfo color_blending{};
+diff --git a/vita3k/renderer/src/vulkan/surface_cache.cpp b/vita3k/renderer/src/vulkan/surface_cache.cpp
+index 2de0d89b..92c6f5df 100644
+--- a/vita3k/renderer/src/vulkan/surface_cache.cpp
++++ b/vita3k/renderer/src/vulkan/surface_cache.cpp
+@@ -680,7 +680,31 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
+             };
+             casted->texture.width = width;
+             casted->texture.height = height;
+-            casted->texture.format = vk_format;
++
++            auto store_is_f16 = [](SceGxmColorBaseFormat f) {
++                return f == SCE_GXM_COLOR_BASE_FORMAT_F16
++                    || f == SCE_GXM_COLOR_BASE_FORMAT_F16F16
++                    || f == SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16;
++            };
++
++            auto force_unsigned_reinterpret_format = [](vk::Format fmt) {
++                switch (fmt) {
++                case vk::Format::eR8Snorm: return vk::Format::eR8Unorm;
++                case vk::Format::eR8G8Snorm: return vk::Format::eR8G8Unorm;
++                case vk::Format::eR8G8B8A8Snorm: return vk::Format::eR8G8B8A8Unorm;
++                case vk::Format::eR16Snorm: return vk::Format::eR16Unorm;
++                case vk::Format::eR16G16Snorm: return vk::Format::eR16G16Unorm;
++                case vk::Format::eR16G16B16A16Snorm: return vk::Format::eR16G16B16A16Unorm;
++                case vk::Format::eR8Sint: return vk::Format::eR8Uint;
++                case vk::Format::eR8G8Sint: return vk::Format::eR8G8Uint;
++                case vk::Format::eR8G8B8A8Sint: return vk::Format::eR8G8B8A8Uint;
++                default: return fmt;
++                }
++            };
++
++            casted->texture.format = (bytes_per_pixel_requested != bytes_per_pixel_in_store && store_is_f16(info.format))
++                ? force_unsigned_reinterpret_format(vk_format)
++                : vk_format;
+ 
+             // find the swizzle we need to apply
+             const std::uint8_t components_in_store = vk::componentCount(info.texture.format);
+diff --git a/vita3k/renderer/src/vulkan/sync_state.cpp b/vita3k/renderer/src/vulkan/sync_state.cpp
+index da321fc6..07c3073a 100644
+--- a/vita3k/renderer/src/vulkan/sync_state.cpp
++++ b/vita3k/renderer/src/vulkan/sync_state.cpp
+@@ -90,7 +90,8 @@ void sync_stencil_func(VKContext &context, const bool is_back) {
+         face = vk::StencilFaceFlagBits::eFrontAndBack;
+         state = &context.record.front_stencil_state_values;
+     } else {
+-        face = is_back ? vk::StencilFaceFlagBits::eBack : vk::StencilFaceFlagBits::eFront;
++        // GXM gives its front two-sided state to clockwise triangles
++        face = is_back ? vk::StencilFaceFlagBits::eFront : vk::StencilFaceFlagBits::eBack;
+         state = is_back ? &context.record.back_stencil_state_values : &context.record.front_stencil_state_values;
+     }
+ 
+diff --git a/vita3k/shader/include/shader/spirv_recompiler.h b/vita3k/shader/include/shader/spirv_recompiler.h
+index d550f735..17bf0feb 100644
+--- a/vita3k/shader/include/shader/spirv_recompiler.h
++++ b/vita3k/shader/include/shader/spirv_recompiler.h
+@@ -36,7 +36,7 @@ static constexpr int COLOR_ATTACHMENT_RAW_TEXTURE_SLOT_IMAGE = 3;
+ // (a sampler2D, texelFetch) instead of an image; the game's use 0-31.
+ static constexpr int UWP_COLOR_ATTACHMENT_TEXTURE_UNIT = 32;
+ #endif
+-static constexpr uint32_t CURRENT_VERSION = 15;
++static constexpr uint32_t CURRENT_VERSION = 16;
+ // fragment shader using the rendering surface as a storage image (because of shader interlock) have a line
+ // layout (constant_id = GAMMA_CORRECTION_SPECIALIZATIO_ID) const bool is_srgb = false;
+ // Setting this constant to true performs gamma correction in the shader
+diff --git a/vita3k/shader/include/shader/usse_translator.h b/vita3k/shader/include/shader/usse_translator.h
+index 28fe5cbf..5b10987a 100644
+--- a/vita3k/shader/include/shader/usse_translator.h
++++ b/vita3k/shader/include/shader/usse_translator.h
+@@ -156,6 +156,9 @@ private:
+         if (repeat_mode == RepeatMode::EXTERNAL && bank != RegisterBank::FPINTERNAL) {
+             return repeat_index * 4;
+         }
++        if (repeat_mode == RepeatMode::EXTERNAL) {
++            return repeat_index;
++        }
+         if (repeat_mode == RepeatMode::SLMSI) {
+             auto inc = repeat_increase[op.index][repeat_index];
+ 
+diff --git a/vita3k/shader/include/shader/usse_translator_types.h b/vita3k/shader/include/shader/usse_translator_types.h
+index adec7d34..97814ac2 100644
+--- a/vita3k/shader/include/shader/usse_translator_types.h
++++ b/vita3k/shader/include/shader/usse_translator_types.h
+@@ -89,6 +89,16 @@ struct SpirvShaderParameters {
+     int viewport_ratio_id;
+     int viewport_offset_id;
+ 
++    // number of entries in the buffer_addresses[] uniform array. Used to clamp a
++    // dynamically-computed buffer index so a garbage value cannot read a stale/out-of-range
++    // slot (which yields a wild device address and a GPU page fault / device loss).
++    int buffer_count = 0;
++
++    // SECATTR register numbers that hold encoded (index<<28) uniform-buffer handles. A load whose
++    // base is one of these is a normal uniform-buffer access (encoded fast path); any other base is
++    // a junk computed "pointer" that is redirected to a safe buffer instead of being decoded.
++    std::vector<int> buffer_sa_offsets;
++
+     // when using a thread, texture or literal buffer, if not -1, this fields contain the sa register
+     // with the matching address, this assumes of course that this address is not copied somewhere
+     // else and that this register is not overwritten
+diff --git a/vita3k/shader/include/shader/usse_types.h b/vita3k/shader/include/shader/usse_types.h
+index 16d6a69f..03746991 100644
+--- a/vita3k/shader/include/shader/usse_types.h
++++ b/vita3k/shader/include/shader/usse_types.h
+@@ -49,6 +49,7 @@ enum class ExtPredicate : uint8_t {
+     P3,
+     NEGP0,
+     NEGP1,
++    NEGP2,
+     PN
+ };
+ 
+@@ -100,10 +101,7 @@ inline ExtPredicate ext_vec_predicate_to_ext(ExtVecPredicate pred) {
+     case ExtVecPredicate::NEGP1:
+         return ExtPredicate::NEGP1;
+     case ExtVecPredicate::NEGP2:
+-        // TODO
+-        assert(false);
+-        LOG_CRITICAL("ExtVecPredicate::NEGP2 case hit, report this to devs.");
+-        [[fallthrough]];
++        return ExtPredicate::NEGP2;
+     default:
+         return ExtPredicate::NONE;
+     }
+diff --git a/vita3k/shader/include/shader/usse_utilities.h b/vita3k/shader/include/shader/usse_utilities.h
+index 7f60020b..b897ae5d 100644
+--- a/vita3k/shader/include/shader/usse_utilities.h
++++ b/vita3k/shader/include/shader/usse_utilities.h
+@@ -51,7 +51,12 @@ spv::Id unpack_one(spv::Builder &b, SpirvUtilFunctions &utils, const FeatureStat
+ spv::Id pack_one(spv::Builder &b, SpirvUtilFunctions &utils, const FeatureState &features, spv::Id vec, const DataType source_type);
+ 
+ spv::Id fetch_memory(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFunctions &utils, spv::Id addr);
+-void buffer_address_access(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFunctions &utils, const FeatureState &features, Operand dest, int dest_offset, spv::Id addr, uint32_t component_size, uint32_t nb_components, int buffer_idx = -1, bool is_buffer_store = false);
++// translate_base: when true, the load's base is NOT an encoded uniform-buffer handle (it came from
++// a non-uniform register bank), so it is a junk computed "pointer"; the access is redirected to the
++// first uniform buffer (buffer_addresses[0], offset 0) so it reads harmless data instead of
++// faulting. When false, `addr` is an encoded index<<28 handle resolved through buffer_addresses[]
++// (the normal uniform-buffer fast path).
++void buffer_address_access(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFunctions &utils, const FeatureState &features, Operand dest, int dest_offset, spv::Id addr, uint32_t component_size, uint32_t nb_components, int buffer_idx = -1, bool is_buffer_store = false, bool translate_base = false);
+ 
+ spv::Id make_vector_or_scalar_type(spv::Builder &b, spv::Id component, int size);
+ 
+@@ -61,6 +66,7 @@ spv::Id convert_to_float(spv::Builder &b, const SpirvUtilFunctions &utils, spv::
+ spv::Id convert_to_int(spv::Builder &b, const SpirvUtilFunctions &utils, spv::Id opr, DataType type, bool normal);
+ 
+ spv::Id add_uvec2_uint(spv::Builder &b, spv::Id vec, spv::Id to_add);
++spv::Id add_uvec2_int(spv::Builder &b, spv::Id vec, spv::Id to_add_signed);
+ 
+ size_t dest_mask_to_comp_count(shader::usse::Imm4 dest_mask);
+ 
+diff --git a/vita3k/shader/src/spirv_recompiler.cpp b/vita3k/shader/src/spirv_recompiler.cpp
+index f0727cd0..4016a5ca 100644
+--- a/vita3k/shader/src/spirv_recompiler.cpp
++++ b/vita3k/shader/src/spirv_recompiler.cpp
+@@ -924,13 +924,17 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
+     spv::Id o_arr_type = b.makeArrayType(f32_v4_type, b.makeIntConstant(REG_O_COUNT / 4), 0);
+ 
+     // Create register banks
+-    spv_params.ins = b.createVariable(spv::NoPrecision, spv::StorageClassPrivate, pa_arr_type, "pa");
+-    spv_params.uniforms = b.createVariable(spv::NoPrecision, spv::StorageClassPrivate, sa_arr_type, "sa");
+-    spv_params.internals = b.createVariable(spv::NoPrecision, spv::StorageClassPrivate, i_arr_type, "internals");
+-    spv_params.temps = b.createVariable(spv::NoPrecision, spv::StorageClassPrivate, temp_arr_type, "r");
+-    spv_params.predicates = b.createVariable(spv::NoPrecision, spv::StorageClassPrivate, pred_arr_type, "p");
+-    spv_params.indexes = b.createVariable(spv::NoPrecision, spv::StorageClassPrivate, index_arr_type, "idx");
+-    spv_params.outs = b.createVariable(spv::NoPrecision, spv::StorageClassPrivate, o_arr_type, "outs");
++    auto make_zeroed_bank = [&](spv::Id arr_type, const char *name) {
++        return b.createVariable(spv::NoPrecision, spv::StorageClassPrivate, arr_type, name, b.makeNullConstant(arr_type));
++    };
++
++    spv_params.ins = make_zeroed_bank(pa_arr_type, "pa");
++    spv_params.uniforms = make_zeroed_bank(sa_arr_type, "sa");
++    spv_params.internals = make_zeroed_bank(i_arr_type, "internals");
++    spv_params.temps = make_zeroed_bank(temp_arr_type, "r");
++    spv_params.predicates = make_zeroed_bank(pred_arr_type, "p");
++    spv_params.indexes = make_zeroed_bank(index_arr_type, "idx");
++    spv_params.outs = make_zeroed_bank(o_arr_type, "outs");
+ 
+     SamplerMap samplers;
+ 
+@@ -1035,6 +1039,8 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
+     const uint16_t uniform_buffer_count = features.enable_memory_mapping ? buffer_count : 0;
+     const uint16_t uniform_texture_count = features.use_texture_viewport ? texture_count : 0;
+ 
++    spv_params.buffer_count = uniform_buffer_count;
++
+     if (program_type == SceGxmProgramType::Vertex) {
+         // Create the default reg uniform buffer
+         std::vector<spv::Id> uniform_composition = { v4, f32, f32, f32, f32, f32 };
+@@ -1367,6 +1373,7 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
+                                if (features.enable_memory_mapping) {
+                                    // encode the index in the upper 4 bits
+                                    base = (index << 28) + s.base;
++                                   spv_params.buffer_sa_offsets.push_back(input.offset);
+                                } else {
+                                    base = buffer_bases[index] + s.base;
+                                }
+@@ -1851,12 +1858,11 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
+ 
+                 b.createStore(o_val2, out_var);
+ 
+-                // Note: Depth range and user clip planes are ineffective in this mode
+-                // However, that can't be directly translated, so we just gonna set it to w here
+                 spv::Id z_ref = utils::create_access_chain(b, spv::StorageClassOutput, out_var, { b.makeIntConstant(2) });
+                 spv::Id w_ref = utils::create_access_chain(b, spv::StorageClassOutput, out_var, { b.makeIntConstant(3) });
+ 
+-                b.createStore(b.createLoad(w_ref, spv::NoPrecision), z_ref);
++                if (!translation_state.is_vulkan)
++                    b.createStore(b.createLoad(w_ref, spv::NoPrecision), z_ref);
+ 
+                 cond_builder.makeBeginElse();
+ 
+@@ -1886,7 +1892,11 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
+                     z = b.createBinOp(spv::OpFAdd, f32, z, z_offset);
+ 
+                     // z values below 0 get clamped
+-                    z = b.createBuiltinCall(f32, utils.std_builtins, GLSLstd450FMax, { z, zero });
++                    // z = b.createBuiltinCall(f32, utils.std_builtins, GLSLstd450FMax, { z, zero });      // Nick causes bad clamping - should be removed
++
++                    // Per-fragment depth clamping is handled by depthClampEnable (Vulkan)
++                    // or GL_ARB_depth_clamp (OpenGL), matching PowerVR hardware behavior.
++                    // Per-vertex clamping here would warp the triangle's depth plane equation.
+ 
+                     if (!translation_state.is_vulkan) {
+                         // convert [0,1] depth range (gxp, vulkan) to [-1,1] depth range (opengl)
+diff --git a/vita3k/shader/src/translator/branch_cond.cpp b/vita3k/shader/src/translator/branch_cond.cpp
+index 891b6a98..1ee7917b 100644
+--- a/vita3k/shader/src/translator/branch_cond.cpp
++++ b/vita3k/shader/src/translator/branch_cond.cpp
+@@ -260,7 +260,8 @@ spv::Id USSETranslatorVisitor::vtst_impl(Instruction inst, ExtPredicate pred, in
+     if (is_signed_integer_data_type(load_data_type)) {
+         index_tb_comp = 1;
+     } else if (is_unsigned_integer_data_type(load_data_type)) {
+-        index_tb_comp = 2;
++        // the sign test of a 32-bit result reads bit 31
++        index_tb_comp = (load_data_type == DataType::UINT32 && !is_sub_opcode(inst.opcode)) ? 1 : 2;
+     }
+ 
+     const spv::Op used_comp_op = tb_comp_ops[index_tb_comp][compare_include_equal][sign_test];
+@@ -481,9 +482,21 @@ bool USSETranslatorVisitor::vtstmsk(
+     spv::Id output_type;
+     spv::Id zeros;
+     spv::Id ones;
++    bool f32_mask_bits = false;
+     switch (load_data_type) {
+     case DataType::F16:
+     case DataType::F32:
++        if (tst_mask_type == 0) {
++            const bool half = load_data_type == DataType::F16;
++            output_type = m_b.makeUintType(32);
++            zeros = m_b.makeUintConstant(0);
++            ones = m_b.makeUintConstant(half ? 0xFFFFu : 0xFFFFFFFFu);
++            if (half)
++                inst.opr.dest.type = DataType::UINT16;
++            else
++                f32_mask_bits = true;
++            break;
++        }
+         output_type = type_f32;
+         if (output_4)
+             output_type = m_b.makeVectorType(output_type, 4);
+@@ -527,6 +540,9 @@ bool USSETranslatorVisitor::vtstmsk(
+     }
+ 
+     pred_result = m_b.createOp(spv::OpSelect, output_type, { pred_result, ones, zeros });
++    // the f32 mask is stored as the float it replaces so the register bookkeeping is unchanged
++    if (f32_mask_bits)
++        pred_result = m_b.createUnaryOp(spv::OpBitcast, type_f32, pred_result);
+ 
+     store(inst.opr.dest, pred_result);
+ 
+diff --git a/vita3k/shader/src/translator/data.cpp b/vita3k/shader/src/translator/data.cpp
+index 9c679a5f..61103a6b 100644
+--- a/vita3k/shader/src/translator/data.cpp
++++ b/vita3k/shader/src/translator/data.cpp
+@@ -25,6 +25,7 @@
+ #include <shader/usse_types.h>
+ #include <util/log.h>
+ 
++#include <algorithm>
+ #include <numeric>
+ 
+ using namespace shader;
+@@ -756,7 +757,8 @@ bool USSETranslatorVisitor::vldst(
+     spv::Id base = m_b.createBinOp(spv::OpIAdd, i32_type, source_0, source_1);
+ 
+     if (m_features.enable_memory_mapping) {
+-        utils::buffer_address_access(m_b, m_spirv_params, m_util_funcs, m_features, to_store, to_store_offset, base, get_data_type_size(type_to_ldst), current_number_to_fetch, -1, is_store);
++        const bool base_is_buffer_handle = inst.opr.src0.bank == RegisterBank::SECATTR && std::find(m_spirv_params.buffer_sa_offsets.begin(), m_spirv_params.buffer_sa_offsets.end(), static_cast<int>(inst.opr.src0.num)) != m_spirv_params.buffer_sa_offsets.end();
++        utils::buffer_address_access(m_b, m_spirv_params, m_util_funcs, m_features, to_store, to_store_offset, base, get_data_type_size(type_to_ldst), current_number_to_fetch, -1, is_store, !base_is_buffer_handle);
+     } else {
+         if (is_store) {
+             LOG_ERROR("Store opcode is not supported without memory mapping");
+diff --git a/vita3k/shader/src/usse_disasm.cpp b/vita3k/shader/src/usse_disasm.cpp
+index 0216921a..6e9f070c 100644
+--- a/vita3k/shader/src/usse_disasm.cpp
++++ b/vita3k/shader/src/usse_disasm.cpp
+@@ -50,6 +50,7 @@ const char *e_predicate_str(ExtPredicate p) {
+     case ExtPredicate::P3: return "p3 ";
+     case ExtPredicate::NEGP0: return "!p0 ";
+     case ExtPredicate::NEGP1: return "!p1 ";
++    case ExtPredicate::NEGP2: return "!p2 ";
+     case ExtPredicate::PN: return "pN ";
+     default: return "invalid";
+     }
+diff --git a/vita3k/shader/src/usse_program_analyzer.cpp b/vita3k/shader/src/usse_program_analyzer.cpp
+index 92835a2d..23559dd3 100644
+--- a/vita3k/shader/src/usse_program_analyzer.cpp
++++ b/vita3k/shader/src/usse_program_analyzer.cpp
+@@ -441,16 +441,23 @@ void analyze(USSEBlockNode &root, USSEOffset end_offset, const AnalyzeReadFuncti
+                     // Some ifs may be trying to jump to parent's merge point. It's also means there's no more content
+                     // further in this block.
+                     if (branch_from_result->second.pred == 0) {
+-                        // Execution changed direction, follow it
++                        // Execution changed direction, follow it. Emit the code before the branch.
+                         current_code->size = baddr - current_code->offset;
+                         request.block_node->add_children(current_code_inst);
+ 
+-                        baddr = branch_from_result->second.dest - 1;
++                        const std::uint32_t follow_dest = branch_from_result->second.dest;
+ 
+-                        std::unique_ptr<USSEBaseNode> current_code_inst = std::make_unique<USSECodeNode>(request.block_node);
+-                        USSECodeNode *current_code = reinterpret_cast<USSECodeNode *>(current_code_inst.get());
++                        if (follow_dest > request.end_offset) {
++                            current_code_inst = nullptr;
++                            break;
++                        }
++
++                        baddr = follow_dest - 1;
++
++                        current_code_inst = std::make_unique<USSECodeNode>(request.block_node);
++                        current_code = reinterpret_cast<USSECodeNode *>(current_code_inst.get());
+ 
+-                        current_code->offset = baddr;
++                        current_code->offset = follow_dest;
+                     } else {
+                         bool else_exist = false;
+                         auto branch_from_else_result = branches_from.find(branch_from_result->second.dest - 1);
+diff --git a/vita3k/shader/src/usse_translator_entry.cpp b/vita3k/shader/src/usse_translator_entry.cpp
+index 3bd7fe06..5d9531ca 100644
+--- a/vita3k/shader/src/usse_translator_entry.cpp
++++ b/vita3k/shader/src/usse_translator_entry.cpp
+@@ -899,7 +899,7 @@ spv::Id USSERecompiler::get_condition_value(const std::uint8_t pred, const bool
+ 
+     if (predicator >= ExtPredicate::P0 && predicator <= ExtPredicate::P3) {
+         pred_opr.num = static_cast<int>(predicator) - static_cast<int>(ExtPredicate::P0);
+-    } else if (predicator >= ExtPredicate::NEGP0 && predicator <= ExtPredicate::NEGP1) {
++    } else if (predicator >= ExtPredicate::NEGP0 && predicator <= ExtPredicate::NEGP2) {
+         pred_opr.num = static_cast<int>(predicator) - static_cast<int>(ExtPredicate::NEGP0);
+         do_neg = !do_neg;
+     }
+diff --git a/vita3k/shader/src/usse_utilities.cpp b/vita3k/shader/src/usse_utilities.cpp
+index 5963090e..cbd73fcb 100644
+--- a/vita3k/shader/src/usse_utilities.cpp
++++ b/vita3k/shader/src/usse_utilities.cpp
+@@ -649,26 +649,46 @@ static spv::Id make_or_get_buffer_ptr(spv::Builder &b, shader::usse::utils::Spir
+     return utils.buffer_address_vec[buffer_utils_idx][is_write];
+ }
+ 
+-void buffer_address_access(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFunctions &utils, const FeatureState &features, Operand dest, int dest_offset, spv::Id addr, uint32_t component_size, uint32_t nb_components, int buffer_idx, bool is_buffer_store) {
++void buffer_address_access(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFunctions &utils, const FeatureState &features, Operand dest, int dest_offset, spv::Id addr, uint32_t component_size, uint32_t nb_components, int buffer_idx, bool is_buffer_store, bool translate_base) {
+     const spv::Id i32 = b.makeIntType(32);
+     const spv::Id zero = b.makeIntConstant(0);
+ 
+-    spv::Id buffer_idx_val;
+-    if (buffer_idx == -1) {
+-        // buffer index is in the upper 4 bits of addr
+-        buffer_idx_val = b.createBinOp(spv::OpShiftRightLogical, i32, addr, b.makeIntConstant(28));
+-        // remove the buffer index bits from the address
+-        addr = b.createBinOp(spv::OpBitwiseAnd, i32, addr, b.makeIntConstant((1 << 28) - 1));
++    spv::Id buffer_address;
++    if (translate_base) {
++        buffer_address = utils::create_access_chain(b, spv::StorageClassUniform, params.render_info_id, { b.makeIntConstant(params.buffer_addresses_id), b.makeIntConstant(0) });
++        buffer_address = b.createLoad(buffer_address, spv::NoPrecision);
+     } else {
+-        buffer_idx_val = b.makeIntConstant(buffer_idx);
+-    }
++        spv::Id buffer_idx_val;
++        if (buffer_idx == -1) {
++            const spv::Id biased = b.createBinOp(spv::OpIAdd, i32, addr, b.makeIntConstant(1 << 27));
++            buffer_idx_val = b.createBinOp(spv::OpShiftRightLogical, i32, biased, b.makeIntConstant(28));
++
++            if (params.buffer_count > 0) {
++                const spv::Id max_idx = b.makeIntConstant(params.buffer_count - 1);
++                spv::Id too_big = b.createBinOp(spv::OpSGreaterThan, b.makeBoolType(), buffer_idx_val, max_idx);
++                buffer_idx_val = b.createTriOp(spv::OpSelect, i32, too_big, max_idx, buffer_idx_val);
++                spv::Id negative = b.createBinOp(spv::OpSLessThan, b.makeBoolType(), buffer_idx_val, zero);
++                buffer_idx_val = b.createTriOp(spv::OpSelect, i32, negative, zero, buffer_idx_val);
++            }
++
++            // signed offset = addr - (index << 28)  (may be negative)
++            const spv::Id idx_hi = b.createBinOp(spv::OpShiftLeftLogical, i32, buffer_idx_val, b.makeIntConstant(28));
++            addr = b.createBinOp(spv::OpISub, i32, addr, idx_hi);
++        } else {
++            buffer_idx_val = b.makeIntConstant(buffer_idx);
++        }
+ 
+-    spv::Id buffer_address = utils::create_access_chain(b, spv::StorageClassUniform, params.render_info_id, { b.makeIntConstant(params.buffer_addresses_id), buffer_idx_val });
+-    buffer_address = b.createLoad(buffer_address, spv::NoPrecision);
+-    // add the offset from the base address
+-    buffer_address = add_uvec2_uint(b, buffer_address, addr);
++        buffer_address = utils::create_access_chain(b, spv::StorageClassUniform, params.render_info_id, { b.makeIntConstant(params.buffer_addresses_id), buffer_idx_val });
++        buffer_address = b.createLoad(buffer_address, spv::NoPrecision);
++        // add the offset from the base address
++        buffer_address = add_uvec2_int(b, buffer_address, addr);
++    }
+ 
+     if (component_size == sizeof(uint32_t)) {
++        spv::Id aligned_low_bits = b.createCompositeExtract(buffer_address, i32, 0);
++        aligned_low_bits = b.createBinOp(spv::OpBitwiseAnd, i32, aligned_low_bits, b.makeIntConstant(~0b11));
++        buffer_address = b.createCompositeInsert(aligned_low_bits, buffer_address, b.getTypeId(buffer_address), 0);
++
+         int buffer_idx_vec4 = 0;
+         if (nb_components >= 4) {
+             // first copy them 4 by 4 (using the fact that we can do 4-byte aligned reads)
+@@ -1300,14 +1320,10 @@ void store(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFuncti
+                 source = b.createOp(spv::OpBitcast, b.makeIntType(32), ops);
+             }
+ 
+-            // if dest is a 8 or 16 bits integer
+-            // Todo: keep the content of the upper bits of idx (not done right now)
+-            if (!is_float_data_type(dest.type) && get_data_type_size(dest.type) < 4) {
+-                spv::Id mask = (get_data_type_size(dest.type) == 1)
+-                    ? b.makeIntConstant(0xFF)
+-                    : b.makeIntConstant(0xFFFF);
+-                source = b.createBinOp(spv::OpBitwiseAnd, b.makeIntType(32), source, mask);
+-            }
++            // index registers are 16 bits wide (a wider write keeps its low half)
++            // Todo: an 8-bit write should keep the upper byte of idx (not done right now)
++            const bool byte_write = !is_float_data_type(dest.type) && get_data_type_size(dest.type) == 1;
++            source = b.createBinOp(spv::OpBitwiseAnd, b.makeIntType(32), source, b.makeIntConstant(byte_write ? 0xFF : 0xFFFF));
+         }
+ 
+         spv::Id var = b.createOp(spv::OpAccessChain, b.makePointer(spv::StorageClassPrivate, b.getContainedTypeId(b.getContainedTypeId(b.getTypeId(bank_base)))), { bank_base, b.makeIntConstant(dest.num) });
+@@ -1634,4 +1650,26 @@ spv::Id add_uvec2_uint(spv::Builder &b, spv::Id vec, spv::Id to_add) {
+     return b.createCompositeConstruct(uvec2, { lower, upper });
+ }
+ 
++spv::Id add_uvec2_int(spv::Builder &b, spv::Id vec, spv::Id to_add_signed) {
++    const spv::Id u32 = b.makeUintType(32);
++    const spv::Id i32 = b.makeIntType(32);
++    const spv::Id uvec2 = b.makeVectorType(u32, 2);
++    const spv::Id add_result_type = b.makeStructResultType(u32, u32);
++
++    // sign = (to_add >> 31) arithmetically -> 0 or 0xFFFFFFFF, i.e. the high 32 bits of the sign-extended 64-bit value.
++    spv::Id to_add_i = b.isUintType(b.getTypeId(to_add_signed)) ? b.createUnaryOp(spv::OpBitcast, i32, to_add_signed) : to_add_signed;
++    spv::Id sign = b.createBinOp(spv::OpShiftRightArithmetic, i32, to_add_i, b.makeIntConstant(31));
++    sign = b.createUnaryOp(spv::OpBitcast, u32, sign);
++    spv::Id to_add = b.createUnaryOp(spv::OpBitcast, u32, to_add_i);
++
++    spv::Id lower = b.createCompositeExtract(vec, u32, 0);
++    spv::Id lower_add = b.createBinOp(spv::OpIAddCarry, add_result_type, lower, to_add);
++    spv::Id carry = b.createCompositeExtract(lower_add, u32, 1);
++    spv::Id upper = b.createCompositeExtract(vec, u32, 1);
++    upper = b.createBinOp(spv::OpIAdd, u32, upper, carry);
++    upper = b.createBinOp(spv::OpIAdd, u32, upper, sign); // sign extension of the offset
++    lower = b.createCompositeExtract(lower_add, u32, 0);
++    return b.createCompositeConstruct(uvec2, { lower, upper });
++}
++
+ } // namespace shader::usse::utils

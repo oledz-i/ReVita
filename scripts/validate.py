@@ -14,7 +14,7 @@ ns = {'m': 'http://schemas.microsoft.com/appx/manifest/foundation/windows10',
 manifest = ET.parse(app / 'Package.appxmanifest')
 identity = manifest.find('m:Identity', ns)
 assert identity.attrib['ProcessorArchitecture'] == 'x64'
-assert identity.attrib['Publisher'] == 'CN=Vita3K-UWP-Development'
+assert identity.attrib['Publisher'] == 'CN=Vita3K-UWP'
 assert re.fullmatch(r'\d+\.\d+\.\d+\.\d+', identity.attrib['Version'])
 assert all(0 <= int(n) <= 65535 for n in identity.attrib['Version'].split('.'))
 application = manifest.find('m:Applications/m:Application', ns)
@@ -27,7 +27,7 @@ for name, expected in [('StoreLogo',(50,50)),('Square44x44Logo',(44,44)),('Squar
 project = ET.parse(app / 'Vita3K.UWP.vcxproj')
 for item in project.findall('.//b:ClCompile', ns) + project.findall('.//b:AppxManifest', ns):
     if 'Include' in item.attrib:
-        assert (app / item.attrib['Include']).is_file()
+        assert (app / item.attrib['Include'].replace('\\', '/')).is_file()
 lock = json.loads((root / 'upstream.lock.json').read_text())
 assert lock['repository'] == 'https://github.com/Vita3K/Vita3K.git'
 assert re.fullmatch(r'[0-9a-f]{40}', lock['commit'])
