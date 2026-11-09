@@ -52,8 +52,19 @@ The core's renderers implement `renderer::State` and `renderer::Context`
    that fails is logged once with its HLSL written to the shader log folder.
    The log prints a running count every 600 frames. Still no drawing.
    `scripts/core-patches/0011-d3d12-renderer-stage-2-shaders.patch`.
-3. Untextured draws, then textures, then render targets: 2D games first
-   (Undertale), then 3D (Persona 4 Golden, Gravity Rush).
+3. **First pass in (revita-next), untested on the console:** drawing.
+   One render target per color surface (RGBA8 with a 32-bit depth buffer),
+   one root signature for every draw (SPIR-V set N is register space N),
+   pipelines from the fragment program's blending and the depth state,
+   textures through the shared texture cache (BC1 to BC5 native), render
+   targets sampled as textures, vertex/index/uniform data through a
+   segmented upload ring. The display buffer is copied on the GPU from the
+   render target drawn at its address; when none was, the picture in guest
+   memory is shown as before. Fragment inputs are rebuilt in the vertex
+   shader's output order so Direct3D links the two stages. Left out for
+   now: stencil, culling, the mask bit, programmable blending, depth-only
+   scenes, surface sync back to guest memory.
+   `scripts/core-patches/0012-d3d12-renderer-stage-3-drawing.patch`.
 4. Surface sync, programmable blending, mask bit.
 5. Shader and pipeline caches on disk.
 

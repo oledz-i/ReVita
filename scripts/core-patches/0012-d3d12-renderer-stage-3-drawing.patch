@@ -1,0 +1,2368 @@
+diff --git a/vita3k/libretro/libretro_vita3k.cpp b/vita3k/libretro/libretro_vita3k.cpp
+index c0e409c..fee2911 100644
+--- a/vita3k/libretro/libretro_vita3k.cpp
++++ b/vita3k/libretro/libretro_vita3k.cpp
+@@ -1324,7 +1324,7 @@ static void context_reset_finalize() {
+                         auto *d3d = dynamic_cast<renderer::d3d12::D3D12State *>(emuenv.renderer.get());
+                         if (d3d && frame.base && frame.image_size.x > 0 && frame.image_size.y > 0
+                             && frame.pitch >= static_cast<uint32_t>(frame.image_size.x))
+-                            d3d->present_from_memory(frame.base.get(emuenv.mem), frame.pitch,
++                            d3d->present_display(frame.base.address(), frame.base.get(emuenv.mem), frame.pitch,
+                                 static_cast<uint32_t>(frame.image_size.x), static_cast<uint32_t>(frame.image_size.y));
+                     }
+                 }
+diff --git a/vita3k/renderer/CMakeLists.txt b/vita3k/renderer/CMakeLists.txt
+index fc4e19d..2c065b7 100644
+--- a/vita3k/renderer/CMakeLists.txt
++++ b/vita3k/renderer/CMakeLists.txt
+@@ -57,9 +57,9 @@ endif()
+ 
+ # Xbox: the native Direct3D 12 renderer (experimental)
+ if(WIN32)
+-	target_sources(renderer PRIVATE src/d3d12/state.cpp src/d3d12/shaders.cpp)
++	target_sources(renderer PRIVATE src/d3d12/state.cpp src/d3d12/shaders.cpp src/d3d12/draw.cpp)
+ 	# SPIR-V to HLSL (SPIRV_CROSS_ENABLE_HLSL is on for Windows in external/)
+-	target_link_libraries(renderer PRIVATE spirv-cross-hlsl)
++	target_link_libraries(renderer PRIVATE spirv-cross-hlsl d3d12)
+ endif()
+ 
+ if(APPLE)
+diff --git a/vita3k/renderer/include/renderer/d3d12/state.h b/vita3k/renderer/include/renderer/d3d12/state.h
+index 45086fc..284fd04 100644
+--- a/vita3k/renderer/include/renderer/d3d12/state.h
++++ b/vita3k/renderer/include/renderer/d3d12/state.h
+@@ -17,14 +17,14 @@
+ 
+ // Xbox (ReVita): the native Direct3D 12 renderer, experimental.
+ //
+-// Stages 1 and 2 of docs/D3D12-RENDERER.md in the ReVita repository: the backend
++// Stages 1 to 3 of docs/D3D12-RENDERER.md in the ReVita repository: the backend
+ // exists, can be picked, keeps every guest command flowing (contexts, render
+ // targets, programs, notifications and sync objects all behave as they do on
+ // the other renderers) and presents the picture the game's display buffer
+ // holds in guest memory through the frontend's own Direct3D 12 device. It
+-// does not draw yet: GXM draws compile the shaders they would use (stage 2)
+-// and are dropped, so a game that draws with the GPU shows black, and one
+-// that writes its screen with the CPU shows it.
++// draws (stage 3, experimental): shaders through SPIRV-Cross and D3DCompile,
++// textures through the shared texture cache, render targets per color
++// surface, and the display buffer copied from the render target drawn there.
+ 
+ #pragma once
+ 
+@@ -32,17 +32,22 @@
+ #include <renderer/texture_cache.h>
+ #include <renderer/types.h>
+ 
++#include <gxm/types.h>
++#include <renderer/gxm_types.h>
++#include <shader/spirv_recompiler.h>
++#include <util/hash.h>
++
+ #include <atomic>
+ #include <cstdint>
+ #include <memory>
+ #include <string>
++#include <vector>
+ 
+ struct ID3D12Device;
+ struct ID3D12CommandQueue;
+ struct ID3D12Resource;
+ struct Config;
+ struct MemState;
+-struct SceGxmTexture;
+ 
+ namespace renderer::d3d12 {
+ 
+@@ -62,28 +67,69 @@ struct Interface {
+ void set_interface(const Interface &iface);
+ const Interface &get_interface();
+ 
+-// No texture work yet: draws are dropped before anything is sampled
++struct Drawer;
++struct ShaderCache;
++
++// Textures (stage 3): the shared texture cache decodes, unswizzles and
++// converts; this side makes the Direct3D 12 textures and copies into them.
+ class D3D12TextureCache final : public TextureCache {
+ public:
+-    void select(size_t index, const SceGxmTexture &texture) override {}
+-    void configure_texture(const SceGxmTexture &texture) override {}
+-    void upload_texture_impl(SceGxmTextureBaseFormat base_format, uint32_t width, uint32_t height, uint32_t mip_index, const void *pixels, int face, uint32_t pixels_per_stride) override {}
++    Drawer *drawer = nullptr;
++    // the cache slot select() picked, read right after cache_and_bind_texture
++    size_t current_slot = 0;
++
++    void select(size_t index, const SceGxmTexture &texture) override;
++    void configure_texture(const SceGxmTexture &texture) override;
++    void upload_texture_impl(SceGxmTextureBaseFormat base_format, uint32_t width, uint32_t height, uint32_t mip_index, const void *pixels, int face, uint32_t pixels_per_stride) override;
++    void upload_done() override;
+     void import_configure_impl(SceGxmTextureBaseFormat base_format, uint32_t width, uint32_t height, bool is_srgb, uint16_t nb_components, uint16_t mipcount, bool swap_rb) override {}
+ };
+ 
+-struct D3D12Context : public renderer::Context {};
++// One texture unit as the next draw will see it
++struct BoundTexture {
++    enum Kind : uint8_t {
++        None,
++        Cached, // a slot of the texture cache
++        Surface, // a render target the game samples (post effects, UI over 3D)
++    } kind = None;
++    uint32_t slot = 0; // cache slot, or the surface's address
++    uint32_t sampler_key = 0;
++};
++
++struct D3D12Context : public renderer::Context {
++    // viewport as GXM gave it (viewport_real), or the whole target (flat)
++    bool viewport_flat = true;
++    float viewport_x = 0, viewport_y = 0, viewport_w = 0, viewport_h = 0;
++    // the y sign the vertex shader must apply so the viewport height stays positive
++    float viewport_y_sign = -1.0f;
++
++    // uniform buffers as the shaders read them (the SSBO in set 0)
++    std::vector<uint8_t> vertex_uniforms;
++    std::vector<uint8_t> fragment_uniforms;
++
++    BoundTexture vertex_textures[SCE_GXM_MAX_TEXTURE_UNITS];
++    BoundTexture fragment_textures[SCE_GXM_MAX_TEXTURE_UNITS];
++
++    // the render target (color surface address) draws go to, 0 when none
++    uint32_t target = 0;
++    bool scene_open = false;
++};
+ 
+-// Shaders (stage 2): GXP to SPIR-V (the Vulkan path's translator), SPIR-V to
+-// HLSL (SPIRV-Cross), HLSL to DXBC (D3DCompile, shader model 5.1), kept in
+-// memory and on disk next to the other renderers' shader caches.
+-struct ShaderCache;
+ struct D3D12RenderTarget : public renderer::RenderTarget {};
+ 
++// What PSO creation needs from a fragment program: its blending
++struct D3D12FragmentProgram : public renderer::FragmentProgram {
++    bool has_blend_info = false;
++    bool native_color = false;
++    SceGxmBlendInfo blend{};
++};
++
+ struct D3D12State : public renderer::State {
+     D3D12State();
+     ~D3D12State() override;
+ 
+     D3D12TextureCache texture_cache;
++    std::shared_ptr<Drawer> drawer;
+ 
+     bool init() override;
+     void late_init(const Config &cfg, const std::string_view game_id, MemState &mem) override;
+@@ -106,23 +152,42 @@ struct D3D12State : public renderer::State {
+     // retro_run: the newest finished frame, if one was made since the last
+     // call (its texture goes to the frontend through set_texture)
+     bool take_frame(uint32_t &width, uint32_t &height);
++    // Render thread: the display buffer at base. A render target the GPU drew
++    // there is copied on the GPU; otherwise the picture in guest memory is used.
++    bool present_display(uint32_t base, const void *pixels, uint32_t pitch, uint32_t width, uint32_t height);
++    // the copy from a drawn render target (src is in src_state before and after)
++    bool present_from_texture(ID3D12Resource *src, uint32_t src_state, uint32_t width, uint32_t height);
+ 
+     struct Impl;
+     std::unique_ptr<Impl> impl;
+     std::shared_ptr<ShaderCache> shaders;
+ };
+ 
+-// Stage 2: a draw compiles the shaders it would need (cached) and draws nothing
+-void draw(D3D12State &state, renderer::Context &context, MemState &mem);
++// Stage 3: drawing
++void draw(D3D12State &state, renderer::Context &context, SceGxmPrimitiveType type, SceGxmIndexFormat format,
++    const void *indices, uint32_t count, uint32_t instance_count, MemState &mem);
++void set_context(D3D12State &state, renderer::Context &context, MemState &mem);
++// the end of a scene: its commands go to the GPU
++void end_scene(D3D12State &state, renderer::Context &context);
++void sync_viewport_real(renderer::Context &context, float x_offset, float y_offset, float x_scale, float y_scale);
++void sync_viewport_flat(renderer::Context &context);
++void set_uniform_buffer(renderer::Context &context, const renderer::ShaderProgram *program, bool is_vertex, int block_num, uint32_t size, const uint8_t *data);
+ std::shared_ptr<ShaderCache> make_shader_cache();
+ std::string shader_cache_summary(const ShaderCache &cache);
+ // a texture binding: the shader translator needs the texture formats
+-void sync_texture(renderer::Context &context, uint32_t index, const SceGxmTexture &texture);
++void sync_texture(D3D12State &state, renderer::Context &context, uint32_t index, const SceGxmTexture &texture, MemState &mem);
++
++// Shaders (shaders.cpp). The DXBC of a vertex shader, or of a fragment shader
++// whose inputs are laid out to match that vertex shader's outputs (Direct3D
++// links stages by register, not by name). Null when it cannot be built.
++const std::vector<uint8_t> *get_vertex_shader(D3D12State &state, const SceGxmProgram &program, const Sha256Hash &hash, const shader::Hints &hints);
++const std::vector<uint8_t> *get_fragment_shader(D3D12State &state, const SceGxmProgram &program, const Sha256Hash &hash,
++    const Sha256Hash &vertex_hash, const shader::Hints &hints, bool maskupdate);
+ 
+ bool create(std::unique_ptr<renderer::State> &state, const Config &config);
+ bool create(std::unique_ptr<renderer::Context> &context);
+ bool create(std::unique_ptr<renderer::RenderTarget> &rt);
+-void create(std::unique_ptr<renderer::FragmentProgram> &fp);
++void create(std::unique_ptr<renderer::FragmentProgram> &fp, const SceGxmProgram &program, const SceGxmBlendInfo *blend);
+ void create(std::unique_ptr<renderer::VertexProgram> &vp);
+ 
+ } // namespace renderer::d3d12
+diff --git a/vita3k/renderer/src/creation.cpp b/vita3k/renderer/src/creation.cpp
+index e4f35d6..0cfb409 100644
+--- a/vita3k/renderer/src/creation.cpp
++++ b/vita3k/renderer/src/creation.cpp
+@@ -201,7 +201,7 @@ bool create(std::unique_ptr<FragmentProgram> &fp, State &state, const SceGxmProg
+         break;
+ 
+     case Backend::D3D12:
+-        d3d12::create(fp);
++        d3d12::create(fp, program, blend);
+         break;
+ 
+     default:
+diff --git a/vita3k/renderer/src/d3d12/draw.cpp b/vita3k/renderer/src/d3d12/draw.cpp
+new file mode 100644
+index 0000000..f725c9d
+--- /dev/null
++++ b/vita3k/renderer/src/d3d12/draw.cpp
+@@ -0,0 +1,1540 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++// Xbox (ReVita): Direct3D 12 renderer, stage 3: drawing (experimental).
++//
++// What is here, and what is left out on purpose for a first picture:
++// - one render target per color surface address (RGBA8), with its own 32-bit
++//   float depth buffer, cleared to the scene's background depth unless the
++//   scene asks to load it. No surface sync to guest memory: the display
++//   buffer is copied from the render target drawn at its address.
++// - shaders from shaders.cpp; one root signature for every draw, laid out
++//   the way SPIRV-Cross numbers the Vulkan translator's bindings (set N is
++//   register space N).
++// - fixed-function blending from the fragment program, depth test and write,
++//   no stencil, no culling (both faces drawn), no mask bit, no programmable
++//   blending (a fragment shader reading the target gets nothing to read).
++// - textures through the shared texture cache, and render targets sampled
++//   as textures when a texture points at one.
++// - vertex, index and uniform data copied each draw into upload memory,
++//   descriptors in shader-visible rings; both reused once the GPU is past them.
++
++#include <renderer/d3d12/state.h>
++
++#include <gxm/functions.h>
++#include <gxm/types.h>
++#include <mem/ptr.h>
++#include <renderer/functions.h>
++#include <renderer/types.h>
++#include <renderer/vulkan/gxm_to_vulkan.h>
++#include <shader/uniform_block.h>
++#include <util/align.h>
++#include <util/log.h>
++
++#include <windows.h>
++
++#include <d3d12.h>
++#include <wrl/client.h>
++
++#define XXH_INLINE_ALL
++#include <xxhash.h>
++
++#include <algorithm>
++#include <cstring>
++#include <unordered_map>
++#include <vector>
++
++using Microsoft::WRL::ComPtr;
++
++namespace renderer::d3d12 {
++
++namespace {
++
++constexpr uint32_t kMaxTargets = 48;
++constexpr uint32_t kUploadSegments = 4;
++constexpr uint64_t kUploadSegmentSize = 24ull << 20;
++constexpr uint32_t kViewSegments = 4;
++constexpr uint32_t kViewSegmentSize = 16384;
++constexpr uint32_t kSamplerSegments = 4;
++constexpr uint32_t kSamplerSegmentSize = 512;
++constexpr uint32_t kLists = 4;
++constexpr uint32_t kUnits = SCE_GXM_MAX_TEXTURE_UNITS;
++
++// Root signature slots
++enum RootParam : UINT {
++    RootVertexInfo, // b0 space0: RenderVertUniformBlock
++    RootFragmentInfo, // b1 space0: RenderFragUniformBlock
++    RootVertexData, // t2 space0: the vertex program's uniform buffers
++    RootFragmentData, // t3 space0: the fragment program's uniform buffers
++    RootVertexTextures, // t0-15 space2
++    RootVertexSamplers, // s0-15 space2
++    RootFragmentTextures, // t0-15 space3
++    RootFragmentSamplers, // s0-15 space3
++    RootCount
++};
++
++DXGI_FORMAT vk_to_dxgi(vk::Format f) {
++    using F = vk::Format;
++    switch (f) {
++    case F::eR8Unorm: return DXGI_FORMAT_R8_UNORM;
++    case F::eR8Snorm: return DXGI_FORMAT_R8_SNORM;
++    case F::eR8Uint: return DXGI_FORMAT_R8_UINT;
++    case F::eR8Sint: return DXGI_FORMAT_R8_SINT;
++    case F::eR8Srgb: return DXGI_FORMAT_R8_UNORM;
++    case F::eR8G8Unorm: return DXGI_FORMAT_R8G8_UNORM;
++    case F::eR8G8Snorm: return DXGI_FORMAT_R8G8_SNORM;
++    case F::eR8G8Uint: return DXGI_FORMAT_R8G8_UINT;
++    case F::eR8G8Sint: return DXGI_FORMAT_R8G8_SINT;
++    case F::eR8G8Srgb: return DXGI_FORMAT_R8G8_UNORM;
++    case F::eR8G8B8A8Unorm: return DXGI_FORMAT_R8G8B8A8_UNORM;
++    case F::eR8G8B8A8Snorm: return DXGI_FORMAT_R8G8B8A8_SNORM;
++    case F::eR8G8B8A8Uint: return DXGI_FORMAT_R8G8B8A8_UINT;
++    case F::eR8G8B8A8Sint: return DXGI_FORMAT_R8G8B8A8_SINT;
++    case F::eR8G8B8A8Srgb: return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
++    case F::eB8G8R8A8Unorm: return DXGI_FORMAT_B8G8R8A8_UNORM;
++    case F::eR16Unorm: return DXGI_FORMAT_R16_UNORM;
++    case F::eR16Snorm: return DXGI_FORMAT_R16_SNORM;
++    case F::eR16Uint: return DXGI_FORMAT_R16_UINT;
++    case F::eR16Sint: return DXGI_FORMAT_R16_SINT;
++    case F::eR16Sfloat: return DXGI_FORMAT_R16_FLOAT;
++    case F::eR16G16Unorm: return DXGI_FORMAT_R16G16_UNORM;
++    case F::eR16G16Snorm: return DXGI_FORMAT_R16G16_SNORM;
++    case F::eR16G16Uint: return DXGI_FORMAT_R16G16_UINT;
++    case F::eR16G16Sint: return DXGI_FORMAT_R16G16_SINT;
++    case F::eR16G16Sfloat: return DXGI_FORMAT_R16G16_FLOAT;
++    case F::eR16G16B16A16Unorm: return DXGI_FORMAT_R16G16B16A16_UNORM;
++    case F::eR16G16B16A16Snorm: return DXGI_FORMAT_R16G16B16A16_SNORM;
++    case F::eR16G16B16A16Uint: return DXGI_FORMAT_R16G16B16A16_UINT;
++    case F::eR16G16B16A16Sint: return DXGI_FORMAT_R16G16B16A16_SINT;
++    case F::eR16G16B16A16Sfloat: return DXGI_FORMAT_R16G16B16A16_FLOAT;
++    case F::eR32Uint: return DXGI_FORMAT_R32_UINT;
++    case F::eR32Sint: return DXGI_FORMAT_R32_SINT;
++    case F::eR32Sfloat: return DXGI_FORMAT_R32_FLOAT;
++    case F::eR32G32Uint: return DXGI_FORMAT_R32G32_UINT;
++    case F::eR32G32Sint: return DXGI_FORMAT_R32G32_SINT;
++    case F::eR32G32Sfloat: return DXGI_FORMAT_R32G32_FLOAT;
++    case F::eR32G32B32Uint: return DXGI_FORMAT_R32G32B32_UINT;
++    case F::eR32G32B32Sint: return DXGI_FORMAT_R32G32B32_SINT;
++    case F::eR32G32B32Sfloat: return DXGI_FORMAT_R32G32B32_FLOAT;
++    case F::eR32G32B32A32Uint: return DXGI_FORMAT_R32G32B32A32_UINT;
++    case F::eR32G32B32A32Sint: return DXGI_FORMAT_R32G32B32A32_SINT;
++    case F::eR32G32B32A32Sfloat: return DXGI_FORMAT_R32G32B32A32_FLOAT;
++    case F::eR5G6B5UnormPack16: return DXGI_FORMAT_B5G6R5_UNORM;
++    case F::eA1R5G5B5UnormPack16: return DXGI_FORMAT_B5G5R5A1_UNORM;
++    case F::eA2B10G10R10UnormPack32: return DXGI_FORMAT_R10G10B10A2_UNORM;
++    case F::eA2B10G10R10UintPack32: return DXGI_FORMAT_R10G10B10A2_UINT;
++    case F::eB10G11R11UfloatPack32: return DXGI_FORMAT_R11G11B10_FLOAT;
++    case F::eE5B9G9R9UfloatPack32: return DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
++    case F::eBc1RgbaUnormBlock: return DXGI_FORMAT_BC1_UNORM;
++    case F::eBc1RgbaSrgbBlock: return DXGI_FORMAT_BC1_UNORM_SRGB;
++    case F::eBc2UnormBlock: return DXGI_FORMAT_BC2_UNORM;
++    case F::eBc2SrgbBlock: return DXGI_FORMAT_BC2_UNORM_SRGB;
++    case F::eBc3UnormBlock: return DXGI_FORMAT_BC3_UNORM;
++    case F::eBc3SrgbBlock: return DXGI_FORMAT_BC3_UNORM_SRGB;
++    case F::eBc4UnormBlock: return DXGI_FORMAT_BC4_UNORM;
++    case F::eBc4SnormBlock: return DXGI_FORMAT_BC4_SNORM;
++    case F::eBc5UnormBlock: return DXGI_FORMAT_BC5_UNORM;
++    case F::eBc5SnormBlock: return DXGI_FORMAT_BC5_SNORM;
++    case F::eD32Sfloat: return DXGI_FORMAT_R32_FLOAT;
++    case F::eD16Unorm: return DXGI_FORMAT_R16_UNORM;
++    default: return DXGI_FORMAT_UNKNOWN;
++    }
++}
++
++bool is_bc(DXGI_FORMAT f) {
++    return (f >= DXGI_FORMAT_BC1_TYPELESS && f <= DXGI_FORMAT_BC5_SNORM);
++}
++
++uint32_t bc_block_bytes(DXGI_FORMAT f) {
++    switch (f) {
++    case DXGI_FORMAT_BC1_UNORM:
++    case DXGI_FORMAT_BC1_UNORM_SRGB:
++    case DXGI_FORMAT_BC4_UNORM:
++    case DXGI_FORMAT_BC4_SNORM:
++        return 8;
++    default:
++        return 16;
++    }
++}
++
++uint32_t texel_bytes(DXGI_FORMAT f) {
++    switch (f) {
++    case DXGI_FORMAT_R8_UNORM:
++    case DXGI_FORMAT_R8_SNORM:
++    case DXGI_FORMAT_R8_UINT:
++    case DXGI_FORMAT_R8_SINT:
++        return 1;
++    case DXGI_FORMAT_R8G8_UNORM:
++    case DXGI_FORMAT_R8G8_SNORM:
++    case DXGI_FORMAT_R8G8_UINT:
++    case DXGI_FORMAT_R8G8_SINT:
++    case DXGI_FORMAT_R16_UNORM:
++    case DXGI_FORMAT_R16_SNORM:
++    case DXGI_FORMAT_R16_UINT:
++    case DXGI_FORMAT_R16_SINT:
++    case DXGI_FORMAT_R16_FLOAT:
++    case DXGI_FORMAT_B5G6R5_UNORM:
++    case DXGI_FORMAT_B5G5R5A1_UNORM:
++        return 2;
++    case DXGI_FORMAT_R16G16B16A16_UNORM:
++    case DXGI_FORMAT_R16G16B16A16_SNORM:
++    case DXGI_FORMAT_R16G16B16A16_UINT:
++    case DXGI_FORMAT_R16G16B16A16_SINT:
++    case DXGI_FORMAT_R16G16B16A16_FLOAT:
++    case DXGI_FORMAT_R32G32_UINT:
++    case DXGI_FORMAT_R32G32_SINT:
++    case DXGI_FORMAT_R32G32_FLOAT:
++        return 8;
++    case DXGI_FORMAT_R32G32B32_UINT:
++    case DXGI_FORMAT_R32G32B32_SINT:
++    case DXGI_FORMAT_R32G32B32_FLOAT:
++        return 12;
++    case DXGI_FORMAT_R32G32B32A32_UINT:
++    case DXGI_FORMAT_R32G32B32A32_SINT:
++    case DXGI_FORMAT_R32G32B32A32_FLOAT:
++        return 16;
++    default:
++        return 4;
++    }
++}
++
++UINT component(vk::ComponentSwizzle s, UINT self) {
++    switch (s) {
++    case vk::ComponentSwizzle::eR: return D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0;
++    case vk::ComponentSwizzle::eG: return D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_1;
++    case vk::ComponentSwizzle::eB: return D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_2;
++    case vk::ComponentSwizzle::eA: return D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_3;
++    case vk::ComponentSwizzle::eZero: return D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0;
++    case vk::ComponentSwizzle::eOne: return D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1;
++    default: return self;
++    }
++}
++
++UINT to_mapping(const vk::ComponentMapping &m) {
++    return D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(component(m.r, 0), component(m.g, 1), component(m.b, 2), component(m.a, 3));
++}
++
++D3D12_BLEND blend_factor(SceGxmBlendFactor f, bool alpha) {
++    switch (f) {
++    case SCE_GXM_BLEND_FACTOR_ZERO: return D3D12_BLEND_ZERO;
++    case SCE_GXM_BLEND_FACTOR_ONE: return D3D12_BLEND_ONE;
++    case SCE_GXM_BLEND_FACTOR_SRC_COLOR: return alpha ? D3D12_BLEND_SRC_ALPHA : D3D12_BLEND_SRC_COLOR;
++    case SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_COLOR: return alpha ? D3D12_BLEND_INV_SRC_ALPHA : D3D12_BLEND_INV_SRC_COLOR;
++    case SCE_GXM_BLEND_FACTOR_SRC_ALPHA: return D3D12_BLEND_SRC_ALPHA;
++    case SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA: return D3D12_BLEND_INV_SRC_ALPHA;
++    case SCE_GXM_BLEND_FACTOR_DST_COLOR: return alpha ? D3D12_BLEND_DEST_ALPHA : D3D12_BLEND_DEST_COLOR;
++    case SCE_GXM_BLEND_FACTOR_ONE_MINUS_DST_COLOR: return alpha ? D3D12_BLEND_INV_DEST_ALPHA : D3D12_BLEND_INV_DEST_COLOR;
++    case SCE_GXM_BLEND_FACTOR_DST_ALPHA: return D3D12_BLEND_DEST_ALPHA;
++    case SCE_GXM_BLEND_FACTOR_ONE_MINUS_DST_ALPHA: return D3D12_BLEND_INV_DEST_ALPHA;
++    case SCE_GXM_BLEND_FACTOR_SRC_ALPHA_SATURATE: return D3D12_BLEND_SRC_ALPHA_SAT;
++    default: return D3D12_BLEND_ONE;
++    }
++}
++
++D3D12_BLEND_OP blend_op(SceGxmBlendFunc f) {
++    switch (f) {
++    case SCE_GXM_BLEND_FUNC_SUBTRACT: return D3D12_BLEND_OP_SUBTRACT;
++    case SCE_GXM_BLEND_FUNC_REVERSE_SUBTRACT: return D3D12_BLEND_OP_REV_SUBTRACT;
++    case SCE_GXM_BLEND_FUNC_MIN: return D3D12_BLEND_OP_MIN;
++    case SCE_GXM_BLEND_FUNC_MAX: return D3D12_BLEND_OP_MAX;
++    default: return D3D12_BLEND_OP_ADD;
++    }
++}
++
++D3D12_COMPARISON_FUNC depth_func(SceGxmDepthFunc f) {
++    switch (f) {
++    case SCE_GXM_DEPTH_FUNC_NEVER: return D3D12_COMPARISON_FUNC_NEVER;
++    case SCE_GXM_DEPTH_FUNC_LESS: return D3D12_COMPARISON_FUNC_LESS;
++    case SCE_GXM_DEPTH_FUNC_EQUAL: return D3D12_COMPARISON_FUNC_EQUAL;
++    case SCE_GXM_DEPTH_FUNC_LESS_EQUAL: return D3D12_COMPARISON_FUNC_LESS_EQUAL;
++    case SCE_GXM_DEPTH_FUNC_GREATER: return D3D12_COMPARISON_FUNC_GREATER;
++    case SCE_GXM_DEPTH_FUNC_NOT_EQUAL: return D3D12_COMPARISON_FUNC_NOT_EQUAL;
++    case SCE_GXM_DEPTH_FUNC_GREATER_EQUAL: return D3D12_COMPARISON_FUNC_GREATER_EQUAL;
++    default: return D3D12_COMPARISON_FUNC_ALWAYS;
++    }
++}
++
++D3D12_TEXTURE_ADDRESS_MODE address_mode(uint32_t mode) {
++    switch (mode) {
++    case SCE_GXM_TEXTURE_ADDR_MIRROR: return D3D12_TEXTURE_ADDRESS_MODE_MIRROR;
++    case SCE_GXM_TEXTURE_ADDR_CLAMP:
++    case SCE_GXM_TEXTURE_ADDR_CLAMP_IGNORE_BORDER:
++    case SCE_GXM_TEXTURE_ADDR_CLAMP_HALF_BORDER:
++        return D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
++    case SCE_GXM_TEXTURE_ADDR_MIRROR_CLAMP: return D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE;
++    case SCE_GXM_TEXTURE_ADDR_CLAMP_FULL_BORDER: return D3D12_TEXTURE_ADDRESS_MODE_BORDER;
++    default: return D3D12_TEXTURE_ADDRESS_MODE_WRAP;
++    }
++}
++
++// a sampler squeezed into 32 bits: u, v (3 bits each), min, mag (1 bit each), mip (1 bit), lod min (4 bits), bias (6 bits)
++uint32_t sampler_key(const SceGxmTexture &t) {
++    const bool linear_strided = t.texture_type() == SCE_GXM_TEXTURE_LINEAR_STRIDED;
++    const uint32_t mag = (t.mag_filter == SCE_GXM_TEXTURE_FILTER_LINEAR) ? 1 : 0;
++    const uint32_t min = linear_strided ? mag : ((t.min_filter == SCE_GXM_TEXTURE_FILTER_LINEAR) ? 1 : 0);
++    const uint32_t mip = t.mip_filter ? 1 : 0;
++    const uint32_t lod_min = std::min<uint32_t>(t.true_lod_min(), 15);
++    return (t.uaddr_mode & 7) | ((t.vaddr_mode & 7) << 3) | (min << 6) | (mag << 7) | (mip << 8) | (lod_min << 9) | ((t.lod_bias & 63u) << 13) | (1u << 31);
++}
++
++D3D12_SAMPLER_DESC sampler_desc(uint32_t key) {
++    D3D12_SAMPLER_DESC d{};
++    if (!key) {
++        d.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
++        d.AddressU = d.AddressV = d.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
++        d.MaxLOD = D3D12_FLOAT32_MAX;
++        return d;
++    }
++    const bool min = (key >> 6) & 1, mag = (key >> 7) & 1, mip = (key >> 8) & 1;
++    d.Filter = static_cast<D3D12_FILTER>((min ? 0x10 : 0) | (mag ? 0x4 : 0) | (mip ? 0x1 : 0));
++    d.AddressU = address_mode(key & 7);
++    d.AddressV = address_mode((key >> 3) & 7);
++    d.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
++    d.MipLODBias = (static_cast<float>((key >> 13) & 63) - 31.f) / 8.f;
++    d.MaxAnisotropy = 1;
++    d.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
++    d.MinLOD = static_cast<float>((key >> 9) & 15);
++    d.MaxLOD = D3D12_FLOAT32_MAX;
++    return d;
++}
++
++} // namespace
++
++struct Drawer {
++    ID3D12Device *device = nullptr;
++    ID3D12CommandQueue *queue = nullptr;
++    ComPtr<ID3D12Fence> fence;
++    HANDLE event = nullptr;
++    uint64_t fence_value = 0; // last value signaled on the queue
++
++    struct ListSlot {
++        ComPtr<ID3D12CommandAllocator> allocator;
++        uint64_t done = 0;
++    };
++    ListSlot lists[kLists];
++    uint32_t list_index = 0;
++    ComPtr<ID3D12GraphicsCommandList> list;
++    bool open = false;
++    bool bound = false; // root signature and heaps set on the open list
++
++    // upload memory, one persistently mapped buffer in segments
++    ComPtr<ID3D12Resource> upload;
++    uint8_t *upload_cpu = nullptr;
++    D3D12_GPU_VIRTUAL_ADDRESS upload_gpu = 0;
++    uint64_t upload_fence[kUploadSegments] = {};
++    uint32_t upload_segment = 0;
++    uint64_t upload_used = 0;
++
++    // shader-visible descriptors
++    ComPtr<ID3D12DescriptorHeap> views;
++    uint32_t view_size = 0;
++    uint64_t view_fence[kViewSegments] = {};
++    uint32_t view_segment = 0;
++    uint32_t view_used = 0;
++
++    ComPtr<ID3D12DescriptorHeap> samplers;
++    uint32_t sampler_size = 0;
++    uint64_t sampler_fence[kSamplerSegments] = {};
++    uint32_t sampler_segment = 0;
++    uint32_t sampler_used = 0;
++    std::unordered_map<uint64_t, uint32_t> sampler_tables; // this segment's tables, by content
++
++    // CPU-only descriptors: texture slots, targets, a null texture
++    ComPtr<ID3D12DescriptorHeap> cpu_views;
++    ComPtr<ID3D12DescriptorHeap> rtvs;
++    ComPtr<ID3D12DescriptorHeap> dsvs;
++    uint32_t rtv_size = 0;
++    uint32_t dsv_size = 0;
++    static constexpr uint32_t kNullView = TextureCacheSize + kMaxTargets;
++    static constexpr uint32_t kNullCubeView = kNullView + 1;
++
++    ComPtr<ID3D12RootSignature> root;
++    std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> pipelines;
++
++    struct TextureSlot {
++        ComPtr<ID3D12Resource> resource;
++        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
++        D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COPY_DEST;
++        uint16_t mips = 1;
++        bool cube = false;
++        bool expand_rgb = false; // 3 bytes a texel in, 4 out
++        bool expand_rgba4 = false; // 16-bit R4G4B4A4 in, RGBA8 out
++        bool skip = false; // format we cannot show: left blank
++        uint32_t width = 0, height = 0;
++    };
++    std::vector<TextureSlot> textures;
++    TextureSlot *current_texture = nullptr;
++
++    struct Target {
++        ComPtr<ID3D12Resource> color;
++        ComPtr<ID3D12Resource> depth;
++        uint32_t width = 0, height = 0;
++        uint32_t index = 0; // its RTV, DSV and SRV slot
++        D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_RENDER_TARGET;
++        uint64_t last_use = 0;
++        uint64_t last_draw = 0; // presents counter at its last draw
++        bool clear_depth = false;
++        float clear_value = 1.0f;
++    };
++    std::unordered_map<uint32_t, Target> targets;
++    std::vector<bool> target_index_used = std::vector<bool>(kMaxTargets, false);
++    uint64_t use_counter = 0;
++    uint64_t presents = 0;
++    uint32_t bound_target = 0; // the address of the target set on the open list
++    uint32_t current_target = 0; // the address the scene draws to
++
++    std::vector<std::pair<uint64_t, ComPtr<IUnknown>>> garbage;
++
++    uint64_t draws = 0;
++    uint64_t dropped = 0;
++
++    ~Drawer() {
++        wait_idle();
++        if (event)
++            CloseHandle(event);
++    }
++
++    void wait(uint64_t value) {
++        if (!fence || value == 0 || fence->GetCompletedValue() >= value)
++            return;
++        if (SUCCEEDED(fence->SetEventOnCompletion(value, event)))
++            WaitForSingleObjectEx(event, 5000, FALSE);
++    }
++
++    void wait_idle() {
++        if (open)
++            submit();
++        wait(fence_value);
++    }
++
++    void retire(ComPtr<IUnknown> object) {
++        if (object)
++            garbage.emplace_back(fence_value + 1, std::move(object));
++    }
++
++    template <typename T>
++    void retire(ComPtr<T> &object) {
++        if (object) {
++            ComPtr<IUnknown> unknown;
++            object.As(&unknown);
++            retire(std::move(unknown));
++            object.Reset();
++        }
++    }
++
++    bool ensure_list() {
++        if (open)
++            return true;
++        ListSlot &slot = lists[list_index];
++        wait(slot.done);
++        if (FAILED(slot.allocator->Reset()))
++            return false;
++        if (!list) {
++            if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, slot.allocator.Get(), nullptr, IID_PPV_ARGS(&list))))
++                return false;
++        } else if (FAILED(list->Reset(slot.allocator.Get(), nullptr))) {
++            return false;
++        }
++        open = true;
++        bound = false;
++        bound_target = 0;
++        return true;
++    }
++
++    void submit() {
++        if (!open)
++            return;
++        open = false;
++        if (FAILED(list->Close())) {
++            LOG_ERROR("Direct3D 12: a command list did not close; its draws are lost");
++            return;
++        }
++        ID3D12CommandList *lists_to_run[] = { list.Get() };
++        queue->ExecuteCommandLists(1, lists_to_run);
++        ++fence_value;
++        queue->Signal(fence.Get(), fence_value);
++        lists[list_index].done = fence_value;
++        list_index = (list_index + 1) % kLists;
++
++        // let go of what the GPU no longer uses
++        const uint64_t completed = fence->GetCompletedValue();
++        garbage.erase(std::remove_if(garbage.begin(), garbage.end(), [&](const auto &g) { return g.first <= completed; }), garbage.end());
++    }
++
++    // Upload memory for this draw; null when the open list already holds every segment
++    uint8_t *allocate(uint64_t size, uint64_t alignment, D3D12_GPU_VIRTUAL_ADDRESS &gpu) {
++        uint64_t offset = align(upload_used, alignment);
++        if (offset + size > kUploadSegmentSize) {
++            if (size > kUploadSegmentSize)
++                return nullptr;
++            const uint32_t next = (upload_segment + 1) % kUploadSegments;
++            if (upload_fence[next] > fence_value)
++                return nullptr; // the open list would overwrite its own data
++            upload_fence[upload_segment] = fence_value + 1;
++            wait(upload_fence[next]);
++            upload_segment = next;
++            offset = 0;
++        }
++        upload_used = offset + size;
++        const uint64_t at = upload_segment * kUploadSegmentSize + offset;
++        gpu = upload_gpu + at;
++        return upload_cpu + at;
++    }
++
++    // count contiguous shader-visible view descriptors; returns the first index or ~0
++    uint32_t allocate_views(uint32_t count) {
++        if (view_used + count > kViewSegmentSize) {
++            const uint32_t next = (view_segment + 1) % kViewSegments;
++            if (view_fence[next] > fence_value)
++                return ~0u;
++            view_fence[view_segment] = fence_value + 1;
++            wait(view_fence[next]);
++            view_segment = next;
++            view_used = 0;
++        }
++        const uint32_t first = view_segment * kViewSegmentSize + view_used;
++        view_used += count;
++        return first;
++    }
++
++    uint32_t sampler_table(const uint32_t (&keys)[kUnits]) {
++        const uint64_t content = XXH3_64bits(keys, sizeof(keys));
++        const auto it = sampler_tables.find(content);
++        if (it != sampler_tables.end())
++            return it->second;
++        if (sampler_used + kUnits > kSamplerSegmentSize) {
++            const uint32_t next = (sampler_segment + 1) % kSamplerSegments;
++            if (sampler_fence[next] > fence_value)
++                return ~0u;
++            sampler_fence[sampler_segment] = fence_value + 1;
++            wait(sampler_fence[next]);
++            sampler_segment = next;
++            sampler_used = 0;
++            sampler_tables.clear();
++        }
++        const uint32_t first = sampler_segment * kSamplerSegmentSize + sampler_used;
++        sampler_used += kUnits;
++        D3D12_CPU_DESCRIPTOR_HANDLE handle = samplers->GetCPUDescriptorHandleForHeapStart();
++        handle.ptr += static_cast<SIZE_T>(first) * sampler_size;
++        for (uint32_t i = 0; i < kUnits; i++) {
++            const D3D12_SAMPLER_DESC desc = sampler_desc(keys[i]);
++            device->CreateSampler(&desc, handle);
++            handle.ptr += sampler_size;
++        }
++        sampler_tables[content] = first;
++        return first;
++    }
++
++    D3D12_CPU_DESCRIPTOR_HANDLE cpu_view(uint32_t index) const {
++        D3D12_CPU_DESCRIPTOR_HANDLE h = cpu_views->GetCPUDescriptorHandleForHeapStart();
++        h.ptr += static_cast<SIZE_T>(index) * view_size;
++        return h;
++    }
++
++    void transition(ID3D12Resource *resource, D3D12_RESOURCE_STATES &state, D3D12_RESOURCE_STATES to) {
++        if (state == to)
++            return;
++        D3D12_RESOURCE_BARRIER barrier{};
++        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++        barrier.Transition.pResource = resource;
++        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++        barrier.Transition.StateBefore = state;
++        barrier.Transition.StateAfter = to;
++        list->ResourceBarrier(1, &barrier);
++        state = to;
++    }
++
++    bool init(ID3D12Device *dev, ID3D12CommandQueue *q);
++    Target *get_target(uint32_t address, uint32_t width, uint32_t height);
++};
++
++bool Drawer::init(ID3D12Device *dev, ID3D12CommandQueue *q) {
++    device = dev;
++    queue = q;
++    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))))
++        return false;
++    event = CreateEventExW(nullptr, nullptr, 0, EVENT_MODIFY_STATE | SYNCHRONIZE);
++    if (!event)
++        return false;
++    for (auto &slot : lists)
++        if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&slot.allocator))))
++            return false;
++
++    D3D12_HEAP_PROPERTIES heap{};
++    heap.Type = D3D12_HEAP_TYPE_UPLOAD;
++    D3D12_RESOURCE_DESC buffer{};
++    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
++    buffer.Width = kUploadSegments * kUploadSegmentSize;
++    buffer.Height = 1;
++    buffer.DepthOrArraySize = 1;
++    buffer.MipLevels = 1;
++    buffer.SampleDesc.Count = 1;
++    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upload))))
++        return false;
++    const D3D12_RANGE nothing{ 0, 0 };
++    void *mapped = nullptr;
++    if (FAILED(upload->Map(0, &nothing, &mapped)))
++        return false;
++    upload_cpu = static_cast<uint8_t *>(mapped);
++    upload_gpu = upload->GetGPUVirtualAddress();
++
++    D3D12_DESCRIPTOR_HEAP_DESC hd{};
++    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
++    hd.NumDescriptors = kViewSegments * kViewSegmentSize;
++    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
++    if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&views))))
++        return false;
++    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
++    hd.NumDescriptors = kSamplerSegments * kSamplerSegmentSize;
++    if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&samplers))))
++        return false;
++    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
++    hd.NumDescriptors = kNullCubeView + 1;
++    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
++    if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&cpu_views))))
++        return false;
++    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
++    hd.NumDescriptors = kMaxTargets;
++    if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvs))))
++        return false;
++    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
++    if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&dsvs))))
++        return false;
++    view_size = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++    sampler_size = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
++    rtv_size = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
++    dsv_size = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
++
++    // null textures for empty units
++    D3D12_SHADER_RESOURCE_VIEW_DESC null_view{};
++    null_view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++    null_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++    null_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++    null_view.Texture2D.MipLevels = 1;
++    for (uint32_t i = 0; i < kNullView; i++)
++        device->CreateShaderResourceView(nullptr, &null_view, cpu_view(i));
++    device->CreateShaderResourceView(nullptr, &null_view, cpu_view(kNullView));
++    null_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
++    null_view.TextureCube.MipLevels = 1;
++    device->CreateShaderResourceView(nullptr, &null_view, cpu_view(kNullCubeView));
++
++    // the root signature every draw uses
++    D3D12_DESCRIPTOR_RANGE ranges[4]{};
++    for (int i = 0; i < 4; i++) {
++        ranges[i].RangeType = (i % 2 == 0) ? D3D12_DESCRIPTOR_RANGE_TYPE_SRV : D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
++        ranges[i].NumDescriptors = kUnits;
++        ranges[i].BaseShaderRegister = 0;
++        ranges[i].RegisterSpace = (i < 2) ? 2 : 3;
++        ranges[i].OffsetInDescriptorsFromTableStart = 0;
++    }
++    D3D12_ROOT_PARAMETER params[RootCount]{};
++    params[RootVertexInfo].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
++    params[RootVertexInfo].Descriptor = { 0, 0 };
++    params[RootFragmentInfo].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
++    params[RootFragmentInfo].Descriptor = { 1, 0 };
++    params[RootVertexData].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
++    params[RootVertexData].Descriptor = { 2, 0 };
++    params[RootFragmentData].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
++    params[RootFragmentData].Descriptor = { 3, 0 };
++    for (int i = 0; i < 4; i++) {
++        D3D12_ROOT_PARAMETER &p = params[RootVertexTextures + i];
++        p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++        p.DescriptorTable.NumDescriptorRanges = 1;
++        p.DescriptorTable.pDescriptorRanges = &ranges[i];
++    }
++    for (auto &p : params)
++        p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
++    D3D12_ROOT_SIGNATURE_DESC desc{};
++    desc.NumParameters = RootCount;
++    desc.pParameters = params;
++    desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
++    ComPtr<ID3DBlob> blob, error;
++    if (FAILED(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error))) {
++        LOG_ERROR("Direct3D 12: root signature: {}", error ? static_cast<const char *>(error->GetBufferPointer()) : "?");
++        return false;
++    }
++    if (FAILED(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root))))
++        return false;
++
++    textures.resize(TextureCacheSize);
++    return true;
++}
++
++Drawer::Target *Drawer::get_target(uint32_t address, uint32_t width, uint32_t height) {
++    if (!address || width == 0 || height == 0 || width > 4096 || height > 4096)
++        return nullptr;
++    auto it = targets.find(address);
++    if (it != targets.end() && (it->second.width != width || it->second.height != height)) {
++        retire(it->second.color);
++        retire(it->second.depth);
++        target_index_used[it->second.index] = false;
++        targets.erase(it);
++        it = targets.end();
++    }
++    if (it != targets.end()) {
++        it->second.last_use = ++use_counter;
++        return &it->second;
++    }
++
++    if (targets.size() >= kMaxTargets) {
++        // let go of the one unused the longest (never the one being drawn to)
++        auto oldest = targets.end();
++        for (auto t = targets.begin(); t != targets.end(); ++t)
++            if (t->first != current_target && (oldest == targets.end() || t->second.last_use < oldest->second.last_use))
++                oldest = t;
++        if (oldest == targets.end())
++            return nullptr;
++        retire(oldest->second.color);
++        retire(oldest->second.depth);
++        target_index_used[oldest->second.index] = false;
++        targets.erase(oldest);
++    }
++
++    Target t;
++    t.width = width;
++    t.height = height;
++    for (uint32_t i = 0; i < kMaxTargets; i++)
++        if (!target_index_used[i]) {
++            t.index = i;
++            break;
++        }
++    target_index_used[t.index] = true;
++
++    D3D12_HEAP_PROPERTIES heap{};
++    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
++    D3D12_RESOURCE_DESC desc{};
++    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++    desc.Width = width;
++    desc.Height = height;
++    desc.DepthOrArraySize = 1;
++    desc.MipLevels = 1;
++    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++    desc.SampleDesc.Count = 1;
++    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
++    D3D12_CLEAR_VALUE clear{};
++    clear.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_RENDER_TARGET, &clear, IID_PPV_ARGS(&t.color)))) {
++        target_index_used[t.index] = false;
++        LOG_ERROR("Direct3D 12: could not make a {}x{} render target", width, height);
++        return nullptr;
++    }
++    desc.Format = DXGI_FORMAT_D32_FLOAT;
++    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
++    clear.Format = DXGI_FORMAT_D32_FLOAT;
++    clear.DepthStencil.Depth = 1.0f;
++    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear, IID_PPV_ARGS(&t.depth)))) {
++        target_index_used[t.index] = false;
++        return nullptr;
++    }
++
++    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvs->GetCPUDescriptorHandleForHeapStart();
++    rtv.ptr += static_cast<SIZE_T>(t.index) * rtv_size;
++    device->CreateRenderTargetView(t.color.Get(), nullptr, rtv);
++    D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsvs->GetCPUDescriptorHandleForHeapStart();
++    dsv.ptr += static_cast<SIZE_T>(t.index) * dsv_size;
++    device->CreateDepthStencilView(t.depth.Get(), nullptr, dsv);
++    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
++    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++    srv.Texture2D.MipLevels = 1;
++    device->CreateShaderResourceView(t.color.Get(), &srv, cpu_view(TextureCacheSize + t.index));
++
++    // a new target starts black, as the GPU would find fresh memory on the console
++    if (ensure_list()) {
++        const float black[4] = { 0, 0, 0, 1 };
++        list->ClearRenderTargetView(rtv, black, 0, nullptr);
++    }
++
++    t.last_use = ++use_counter;
++    LOG_INFO("Direct3D 12: render target 0x{:08X} ({}x{})", address, width, height);
++    return &(targets[address] = std::move(t));
++}
++
++// ---------------------------------------------------------------------------
++// Texture cache
++
++void D3D12TextureCache::select(size_t index, const SceGxmTexture &texture) {
++    current_slot = index;
++    if (drawer && index < drawer->textures.size())
++        drawer->current_texture = &drawer->textures[index];
++}
++
++void D3D12TextureCache::configure_texture(const SceGxmTexture &gxm_texture) {
++    if (!drawer || !drawer->current_texture)
++        return;
++    Drawer &d = *drawer;
++    Drawer::TextureSlot &slot = *d.current_texture;
++    d.retire(slot.resource);
++    slot = {};
++
++    const SceGxmTextureFormat format = gxm::get_format(gxm_texture);
++    const SceGxmTextureBaseFormat base_format = gxm::get_base_format(format);
++    const bool cube = gxm_texture.texture_type() == SCE_GXM_TEXTURE_CUBE || gxm_texture.texture_type() == SCE_GXM_TEXTURE_CUBE_ARBITRARY;
++    uint32_t width = gxm::get_width(gxm_texture);
++    uint32_t height = gxm::get_height(gxm_texture);
++    uint16_t mips = renderer::texture::get_upload_mip(gxm_texture.true_mip_count(), width, height);
++
++    DXGI_FORMAT dxgi = vk_to_dxgi(vulkan::texture::translate_format(base_format));
++    if (base_format == SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8 || base_format == SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8) {
++        slot.expand_rgb = true;
++        dxgi = base_format == SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R8G8B8A8_SNORM;
++    } else if (base_format == SCE_GXM_TEXTURE_BASE_FORMAT_U4U4U4U4) {
++        slot.expand_rgba4 = true;
++        dxgi = DXGI_FORMAT_R8G8B8A8_UNORM;
++    } else if (base_format == SCE_GXM_TEXTURE_BASE_FORMAT_P4 || base_format == SCE_GXM_TEXTURE_BASE_FORMAT_P8
++        || base_format == SCE_GXM_TEXTURE_BASE_FORMAT_YUV420P2 || base_format == SCE_GXM_TEXTURE_BASE_FORMAT_YUV420P3
++        || base_format == SCE_GXM_TEXTURE_BASE_FORMAT_YUV422 || gxm::is_pvrt_format(base_format)
++        || base_format == SCE_GXM_TEXTURE_BASE_FORMAT_U8U3U3U2) {
++        // the shared cache turns these into RGBA8 before they reach us
++        dxgi = DXGI_FORMAT_R8G8B8A8_UNORM;
++    }
++    if (dxgi == DXGI_FORMAT_UNKNOWN) {
++        LOG_WARN_ONCE("Direct3D 12: texture format 0x{:X} not handled yet; drawn blank", static_cast<uint32_t>(base_format));
++        slot.skip = true;
++        dxgi = DXGI_FORMAT_R8G8B8A8_UNORM;
++    }
++    if (gxm_texture.gamma_mode) {
++        if (dxgi == DXGI_FORMAT_R8G8B8A8_UNORM)
++            dxgi = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
++        else if (dxgi == DXGI_FORMAT_BC1_UNORM)
++            dxgi = DXGI_FORMAT_BC1_UNORM_SRGB;
++        else if (dxgi == DXGI_FORMAT_BC2_UNORM)
++            dxgi = DXGI_FORMAT_BC2_UNORM_SRGB;
++        else if (dxgi == DXGI_FORMAT_BC3_UNORM)
++            dxgi = DXGI_FORMAT_BC3_UNORM_SRGB;
++    }
++    if (is_bc(dxgi)) {
++        // block-compressed textures are a whole number of blocks on Direct3D,
++        // and their mips stop at one block
++        width = align(width, 4);
++        height = align(height, 4);
++        uint16_t usable = 1;
++        while (usable < mips && (width >> usable) >= 4 && (height >> usable) >= 4)
++            usable++;
++        mips = usable;
++    }
++    mips = std::max<uint16_t>(mips, 1);
++
++    D3D12_HEAP_PROPERTIES heap{};
++    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
++    D3D12_RESOURCE_DESC desc{};
++    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++    desc.Width = std::max(width, 1u);
++    desc.Height = std::max(height, 1u);
++    desc.DepthOrArraySize = cube ? 6 : 1;
++    desc.MipLevels = mips;
++    desc.Format = dxgi;
++    desc.SampleDesc.Count = 1;
++    if (FAILED(d.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&slot.resource)))) {
++        LOG_ERROR("Direct3D 12: could not make a {}x{} texture (format {})", width, height, static_cast<int>(dxgi));
++        slot.resource.Reset();
++        slot.skip = true;
++        d.device->CopyDescriptorsSimple(1, d.cpu_view(static_cast<uint32_t>(current_slot)), d.cpu_view(cube ? Drawer::kNullCubeView : Drawer::kNullView), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++        return;
++    }
++    slot.format = dxgi;
++    slot.mips = mips;
++    slot.cube = cube;
++    slot.width = width;
++    slot.height = height;
++    slot.state = D3D12_RESOURCE_STATE_COPY_DEST;
++
++    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
++    srv.Format = dxgi;
++    srv.Shader4ComponentMapping = to_mapping(vulkan::texture::translate_swizzle(format));
++    if (cube) {
++        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
++        srv.TextureCube.MipLevels = mips;
++    } else {
++        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++        srv.Texture2D.MipLevels = mips;
++    }
++    d.device->CreateShaderResourceView(slot.resource.Get(), &srv, d.cpu_view(static_cast<uint32_t>(current_slot)));
++}
++
++void D3D12TextureCache::upload_texture_impl(SceGxmTextureBaseFormat base_format, uint32_t width, uint32_t height,
++    uint32_t mip_index, const void *pixels, int face, uint32_t pixels_per_stride) {
++    if (!drawer || !drawer->current_texture)
++        return;
++    Drawer &d = *drawer;
++    Drawer::TextureSlot &slot = *d.current_texture;
++    if (!slot.resource || slot.skip || mip_index >= slot.mips || !pixels)
++        return;
++    if (face > 0)
++        face--;
++    if (pixels_per_stride == 0)
++        pixels_per_stride = width;
++
++    const bool bc = is_bc(slot.format);
++    uint32_t rows, row_bytes, src_pitch, copy_w = width, copy_h = height;
++    if (bc) {
++        const uint32_t block = bc_block_bytes(slot.format);
++        copy_w = align(width, 4);
++        copy_h = align(height, 4);
++        rows = copy_h / 4;
++        row_bytes = (copy_w / 4) * block;
++        src_pitch = (align(pixels_per_stride, 4) / 4) * block;
++        // what the cache gave may be smaller than a whole block row
++        const uint32_t src_rows = (height + 3) / 4;
++        if (src_rows < rows)
++            rows = src_rows;
++    } else {
++        const uint32_t in_bytes = slot.expand_rgb ? 3 : (slot.expand_rgba4 ? 2 : texel_bytes(slot.format));
++        rows = height;
++        row_bytes = width * texel_bytes(slot.format);
++        src_pitch = pixels_per_stride * in_bytes;
++    }
++
++    const uint32_t pitch = align(row_bytes, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
++    D3D12_GPU_VIRTUAL_ADDRESS gpu;
++    uint8_t *dst = d.allocate(static_cast<uint64_t>(pitch) * rows, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, gpu);
++    if (!dst)
++        return;
++    const auto *src = static_cast<const uint8_t *>(pixels);
++    for (uint32_t y = 0; y < rows; y++) {
++        const uint8_t *in = src + static_cast<size_t>(y) * src_pitch;
++        uint8_t *out = dst + static_cast<size_t>(y) * pitch;
++        if (slot.expand_rgb) {
++            for (uint32_t x = 0; x < width; x++) {
++                out[4 * x + 0] = in[3 * x + 0];
++                out[4 * x + 1] = in[3 * x + 1];
++                out[4 * x + 2] = in[3 * x + 2];
++                out[4 * x + 3] = 255;
++            }
++        } else if (slot.expand_rgba4) {
++            const auto *in16 = reinterpret_cast<const uint16_t *>(in);
++            for (uint32_t x = 0; x < width; x++) {
++                const uint16_t v = in16[x];
++                out[4 * x + 0] = static_cast<uint8_t>(((v >> 12) & 0xF) * 17);
++                out[4 * x + 1] = static_cast<uint8_t>(((v >> 8) & 0xF) * 17);
++                out[4 * x + 2] = static_cast<uint8_t>(((v >> 4) & 0xF) * 17);
++                out[4 * x + 3] = static_cast<uint8_t>((v & 0xF) * 17);
++            }
++        } else {
++            std::memcpy(out, in, std::min(row_bytes, src_pitch));
++        }
++    }
++
++    if (!d.ensure_list())
++        return;
++    d.transition(slot.resource.Get(), slot.state, D3D12_RESOURCE_STATE_COPY_DEST);
++    D3D12_TEXTURE_COPY_LOCATION to{};
++    to.pResource = slot.resource.Get();
++    to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++    to.SubresourceIndex = mip_index + static_cast<uint32_t>(face) * slot.mips;
++    D3D12_TEXTURE_COPY_LOCATION from{};
++    from.pResource = d.upload.Get();
++    from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++    from.PlacedFootprint.Offset = gpu - d.upload_gpu;
++    from.PlacedFootprint.Footprint.Format = slot.format;
++    from.PlacedFootprint.Footprint.Width = copy_w;
++    from.PlacedFootprint.Footprint.Height = bc ? rows * 4 : rows;
++    from.PlacedFootprint.Footprint.Depth = 1;
++    from.PlacedFootprint.Footprint.RowPitch = pitch;
++    d.list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
++}
++
++void D3D12TextureCache::upload_done() {
++    if (!drawer || !drawer->current_texture || !drawer->current_texture->resource)
++        return;
++    Drawer &d = *drawer;
++    if (!d.ensure_list())
++        return;
++    d.transition(d.current_texture->resource.Get(), d.current_texture->state,
++        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++}
++
++// ---------------------------------------------------------------------------
++// Commands
++
++void sync_texture(D3D12State &state, renderer::Context &ctx, uint32_t index, const SceGxmTexture &texture, MemState &mem) {
++    D3D12Context &context = static_cast<D3D12Context &>(ctx);
++    const SceGxmTextureFormat format = gxm::get_format(texture);
++    const bool is_vertex = index >= SCE_GXM_MAX_TEXTURE_UNITS;
++    const uint32_t unit = is_vertex ? index - SCE_GXM_MAX_TEXTURE_UNITS : index;
++    if (unit >= kUnits)
++        return;
++    if (is_vertex)
++        context.shader_hints.vertex_textures[unit] = format;
++    else
++        context.shader_hints.fragment_textures[unit] = format;
++
++    BoundTexture &bound = is_vertex ? context.vertex_textures[unit] : context.fragment_textures[unit];
++    bound = {};
++    if (!state.drawer)
++        return;
++    const SceGxmTextureBaseFormat base_format = gxm::get_base_format(format);
++    if (gxm::is_paletted_format(base_format) && texture.palette_addr == 0)
++        return;
++    bound.sampler_key = sampler_key(texture);
++
++    // a render target sampled as a texture
++    const uint32_t address = texture.data_addr << 2;
++    const auto target = state.drawer->targets.find(address);
++    if (target != state.drawer->targets.end()) {
++        bound.kind = BoundTexture::Surface;
++        bound.slot = address;
++        return;
++    }
++
++    state.texture_cache.cache_and_bind_texture(texture, mem);
++    bound.kind = BoundTexture::Cached;
++    bound.slot = static_cast<uint32_t>(state.texture_cache.current_slot);
++}
++
++void set_uniform_buffer(renderer::Context &ctx, const renderer::ShaderProgram *program, bool is_vertex, int block_num, uint32_t size, const uint8_t *data) {
++    if (!program || !data)
++        return;
++    D3D12Context &context = static_cast<D3D12Context &>(ctx);
++    const uint32_t offset = program->uniform_buffer_data_offsets.at(block_num);
++    if (offset == static_cast<uint32_t>(-1))
++        return;
++    const uint32_t bytes = std::min<uint32_t>(size, program->uniform_buffer_sizes.at(block_num) * 4);
++    std::vector<uint8_t> &storage = is_vertex ? context.vertex_uniforms : context.fragment_uniforms;
++    const size_t needed = std::max<size_t>(program->max_total_uniform_buffer_storage * 4, offset * 4 + bytes);
++    if (storage.size() < needed)
++        storage.resize(needed);
++    std::memcpy(storage.data() + offset * 4, data, bytes);
++}
++
++void sync_viewport_real(renderer::Context &ctx, float x_offset, float y_offset, float x_scale, float y_scale) {
++    D3D12Context &context = static_cast<D3D12Context &>(ctx);
++    // GXM: screen = offset + scale * ndc. Direct3D: screen_y = top + h/2 * (1 - ndc_y),
++    // so the height is 2|y scale| and the shader flips y when the scale is positive
++    context.viewport_flat = false;
++    context.viewport_w = std::abs(2.0f * x_scale);
++    context.viewport_x = x_offset - std::abs(x_scale);
++    context.viewport_h = std::abs(2.0f * y_scale);
++    context.viewport_y = y_offset - std::abs(y_scale);
++    context.viewport_y_sign = (y_scale > 0.0f) ? -1.0f : 1.0f;
++}
++
++void sync_viewport_flat(renderer::Context &ctx) {
++    D3D12Context &context = static_cast<D3D12Context &>(ctx);
++    context.viewport_flat = true;
++    context.viewport_y_sign = -1.0f;
++}
++
++void set_context(D3D12State &state, renderer::Context &ctx, MemState &mem) {
++    D3D12Context &context = static_cast<D3D12Context &>(ctx);
++    context.target = 0;
++    context.scene_open = true;
++    if (!state.drawer)
++        return;
++    Drawer &d = *state.drawer;
++    const SceGxmColorSurface &surface = context.record.color_surface;
++    const uint32_t address = surface.data.address();
++    if (!address)
++        return;
++    Drawer::Target *target = d.get_target(address, surface.width, surface.height);
++    if (!target)
++        return;
++    context.target = address;
++    d.current_target = address;
++    const SceGxmDepthStencilSurface &depth = context.record.depth_stencil_surface;
++    target->clear_depth = !depth.force_load;
++    target->clear_value = std::clamp(depth.background_depth, 0.0f, 1.0f);
++}
++
++void end_scene(D3D12State &state, renderer::Context &ctx) {
++    D3D12Context &context = static_cast<D3D12Context &>(ctx);
++    context.scene_open = false;
++    if (state.drawer)
++        state.drawer->submit();
++}
++
++void draw(D3D12State &state, renderer::Context &ctx, SceGxmPrimitiveType type, SceGxmIndexFormat format,
++    const void *indices, uint32_t count, uint32_t instance_count, MemState &mem) {
++    D3D12Context &context = static_cast<D3D12Context &>(ctx);
++    if (!state.drawer || !context.target || !indices || count == 0 || instance_count == 0)
++        return;
++    Drawer &d = *state.drawer;
++    const auto target_it = d.targets.find(context.target);
++    if (target_it == d.targets.end())
++        return;
++    Drawer::Target &target = target_it->second;
++
++    const SceGxmVertexProgram *vertex_program = context.record.vertex_program.get(mem);
++    const SceGxmFragmentProgram *fragment_program = context.record.fragment_program.get(mem);
++    if (!vertex_program || !fragment_program || !vertex_program->renderer_data || !fragment_program->renderer_data)
++        return;
++    if (fragment_program->is_maskupdate)
++        return; // the mask bit is not emulated here yet
++    const SceGxmProgram *vertex_gxp = vertex_program->program.get(mem);
++    const SceGxmProgram *fragment_gxp = fragment_program->program.get(mem);
++    if (!vertex_gxp || !fragment_gxp)
++        return;
++
++    shader::Hints hints = context.shader_hints;
++    hints.attributes = &vertex_program->attributes;
++    hints.color_format = context.record.color_surface.colorFormat;
++    hints.masked_framebuffer_fetch = false;
++
++    const Sha256Hash &vertex_hash = vertex_program->renderer_data->hash;
++    const std::vector<uint8_t> *vs = get_vertex_shader(state, *vertex_gxp, vertex_hash, hints);
++    if (!vs) {
++        d.dropped++;
++        return;
++    }
++    const bool fragment_disabled = context.record.front_side_fragment_program_mode == SCE_GXM_FRAGMENT_PROGRAM_DISABLED
++        || fragment_gxp->has_no_effect();
++    const std::vector<uint8_t> *ps = nullptr;
++    if (!fragment_disabled) {
++        ps = get_fragment_shader(state, *fragment_gxp, fragment_program->renderer_data->hash, vertex_hash, hints, false);
++        if (!ps) {
++            d.dropped++;
++            return;
++        }
++    }
++
++    // triangle fans and edges are triangle lists on Direct3D
++    const uint32_t index_size = format == SCE_GXM_INDEX_FORMAT_U16 ? 2 : 4;
++    thread_local std::vector<uint8_t> fan;
++    if (type == SCE_GXM_PRIMITIVE_TRIANGLE_FAN) {
++        const uint32_t triangles = count > 2 ? count - 2 : 0;
++        fan.resize(std::max<size_t>(static_cast<size_t>(triangles) * 3 * index_size, index_size));
++        const auto *source = static_cast<const uint8_t *>(indices);
++        uint8_t *out = fan.data();
++        for (uint32_t t = 0; t < triangles; ++t) {
++            std::memcpy(out, source + (t + 1) * index_size, index_size);
++            std::memcpy(out + index_size, source + (t + 2) * index_size, index_size);
++            std::memcpy(out + 2 * index_size, source, index_size);
++            out += 3 * index_size;
++        }
++        indices = fan.data();
++        count = triangles * 3;
++        type = SCE_GXM_PRIMITIVE_TRIANGLES;
++        if (count == 0)
++            return;
++    } else if (type == SCE_GXM_PRIMITIVE_TRIANGLE_EDGES) {
++        type = SCE_GXM_PRIMITIVE_TRIANGLES;
++    }
++
++    D3D12_PRIMITIVE_TOPOLOGY_TYPE topology_type = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
++    D3D12_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
++    switch (type) {
++    case SCE_GXM_PRIMITIVE_LINES:
++        topology_type = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
++        topology = D3D_PRIMITIVE_TOPOLOGY_LINELIST;
++        break;
++    case SCE_GXM_PRIMITIVE_POINTS:
++        topology_type = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
++        topology = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
++        break;
++    case SCE_GXM_PRIMITIVE_TRIANGLE_STRIP:
++        topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
++        break;
++    default:
++        break;
++    }
++
++    // vertex input: every attribute as TEXCOORD<location> (see shaders.cpp)
++    std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
++    uint32_t used_streams = 0;
++    const VertexProgram &vp = *vertex_program->renderer_data;
++    for (const SceGxmVertexAttribute &attribute : vertex_program->attributes) {
++        if (!vp.attribute_infos.contains(attribute.regIndex))
++            continue;
++        if (attribute.streamIndex >= SCE_GXM_MAX_VERTEX_STREAMS || attribute.streamIndex >= vertex_program->streams.size())
++            continue;
++        shader::usse::AttributeInformation info = vp.attribute_infos.at(attribute.regIndex);
++        SceGxmAttributeFormat attribute_format = static_cast<SceGxmAttributeFormat>(attribute.format);
++        uint8_t component_count = attribute.componentCount;
++        uint32_t array_size = 1;
++        uint32_t array_element_size = 0;
++        vk::Format vk_format;
++        if (info.regformat) {
++            component_count = info.component_count;
++            switch (info.gxm_type) {
++            case SCE_GXM_PARAMETER_TYPE_U8:
++            case SCE_GXM_PARAMETER_TYPE_S8:
++            case SCE_GXM_PARAMETER_TYPE_C10:
++                attribute_format = SCE_GXM_ATTRIBUTE_FORMAT_U8;
++                break;
++            case SCE_GXM_PARAMETER_TYPE_U16:
++            case SCE_GXM_PARAMETER_TYPE_S16:
++            case SCE_GXM_PARAMETER_TYPE_F16:
++                attribute_format = SCE_GXM_ATTRIBUTE_FORMAT_U16;
++                break;
++            default:
++                attribute_format = SCE_GXM_ATTRIBUTE_FORMAT_UNTYPED;
++                break;
++            }
++            if (info.gxm_type == SCE_GXM_PARAMETER_TYPE_C10)
++                component_count = (component_count * 10 + 7) / 8;
++            if (component_count > 4) {
++                array_size = (component_count + 3) / 4;
++                array_element_size = 4 * gxm::attribute_format_size(attribute_format);
++                component_count = 4;
++            }
++            if (component_count == 3 && gxm::attribute_format_size(attribute_format) < 4)
++                component_count = 4;
++            vk_format = vulkan::translate_attribute_format(attribute_format, component_count, true, false);
++        } else {
++            // scaled attributes are converted in the shader (support_scaled_attribute_formats is off)
++            info.is_integer = true;
++            if (component_count == 3 && gxm::attribute_format_size(attribute_format) < 4)
++                component_count = 4;
++            vk_format = vulkan::translate_attribute_format(attribute_format, component_count, info.is_integer, info.is_signed);
++        }
++        const DXGI_FORMAT dxgi = vk_to_dxgi(vk_format);
++        if (dxgi == DXGI_FORMAT_UNKNOWN) {
++            LOG_WARN_ONCE("Direct3D 12: a vertex attribute format is not handled yet ({})", vk::to_string(vk_format));
++            continue;
++        }
++        used_streams |= 1u << attribute.streamIndex;
++        const SceGxmVertexStream &stream = vertex_program->streams[attribute.streamIndex];
++        const bool instanced = gxm::is_stream_instancing(static_cast<SceGxmIndexSource>(stream.indexSource));
++        for (uint32_t i = 0; i < array_size; i++) {
++            D3D12_INPUT_ELEMENT_DESC e{};
++            e.SemanticName = "TEXCOORD";
++            e.SemanticIndex = info.location + i;
++            e.Format = dxgi;
++            e.InputSlot = attribute.streamIndex;
++            e.AlignedByteOffset = attribute.offset + i * array_element_size;
++            e.InputSlotClass = instanced ? D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA : D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
++            e.InstanceDataStepRate = instanced ? 1 : 0;
++            elements.push_back(e);
++        }
++    }
++
++    // pipeline
++    const auto *fp = static_cast<const D3D12FragmentProgram *>(fragment_program->renderer_data.get());
++    struct Key {
++        const void *vs;
++        const void *ps;
++        uint32_t topology_type;
++        uint32_t depth_func;
++        uint32_t depth_write;
++        uint32_t blend;
++        uint32_t has_blend;
++    } key{ vs, ps, static_cast<uint32_t>(topology_type), static_cast<uint32_t>(context.record.front_depth_func),
++        context.record.front_depth_write_mode == SCE_GXM_DEPTH_WRITE_ENABLED ? 1u : 0u, 0, 0 };
++    if (fp && fp->has_blend_info && !fp->native_color) {
++        std::memcpy(&key.blend, &fp->blend, sizeof(key.blend));
++        key.has_blend = 1;
++    }
++    uint64_t pipeline_key = XXH3_64bits(&key, sizeof(key));
++    for (const auto &e : elements) {
++        const uint32_t packed[] = { e.SemanticIndex, static_cast<uint32_t>(e.Format), e.InputSlot, e.AlignedByteOffset, static_cast<uint32_t>(e.InputSlotClass) };
++        pipeline_key = XXH3_64bits_withSeed(packed, sizeof(packed), pipeline_key);
++    }
++
++    ID3D12PipelineState *pipeline = nullptr;
++    const auto pso_it = d.pipelines.find(pipeline_key);
++    if (pso_it != d.pipelines.end()) {
++        pipeline = pso_it->second.Get();
++    } else {
++        D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
++        desc.pRootSignature = d.root.Get();
++        desc.VS = { vs->data(), vs->size() };
++        if (ps)
++            desc.PS = { ps->data(), ps->size() };
++        D3D12_RENDER_TARGET_BLEND_DESC &rt = desc.BlendState.RenderTarget[0];
++        rt.SrcBlend = rt.SrcBlendAlpha = D3D12_BLEND_ONE;
++        rt.DestBlend = rt.DestBlendAlpha = D3D12_BLEND_ZERO;
++        rt.BlendOp = rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
++        rt.LogicOp = D3D12_LOGIC_OP_NOOP;
++        rt.RenderTargetWriteMask = ps ? D3D12_COLOR_WRITE_ENABLE_ALL : 0;
++        if (key.has_blend && ps) {
++            const SceGxmBlendInfo &b = fp->blend;
++            rt.BlendEnable = (b.colorFunc != SCE_GXM_BLEND_FUNC_NONE) || (b.alphaFunc != SCE_GXM_BLEND_FUNC_NONE);
++            if (b.colorFunc != SCE_GXM_BLEND_FUNC_NONE) {
++                rt.SrcBlend = blend_factor(b.colorSrc, false);
++                rt.DestBlend = blend_factor(b.colorDst, false);
++                rt.BlendOp = blend_op(b.colorFunc);
++            }
++            if (b.alphaFunc != SCE_GXM_BLEND_FUNC_NONE) {
++                rt.SrcBlendAlpha = blend_factor(b.alphaSrc, true);
++                rt.DestBlendAlpha = blend_factor(b.alphaDst, true);
++                rt.BlendOpAlpha = blend_op(b.alphaFunc);
++            }
++            UINT8 mask = 0;
++            if (b.colorMask & SCE_GXM_COLOR_MASK_R)
++                mask |= D3D12_COLOR_WRITE_ENABLE_RED;
++            if (b.colorMask & SCE_GXM_COLOR_MASK_G)
++                mask |= D3D12_COLOR_WRITE_ENABLE_GREEN;
++            if (b.colorMask & SCE_GXM_COLOR_MASK_B)
++                mask |= D3D12_COLOR_WRITE_ENABLE_BLUE;
++            if (b.colorMask & SCE_GXM_COLOR_MASK_A)
++                mask |= D3D12_COLOR_WRITE_ENABLE_ALPHA;
++            rt.RenderTargetWriteMask = mask;
++        }
++        desc.SampleMask = UINT_MAX;
++        desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
++        desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
++        desc.RasterizerState.DepthClipEnable = TRUE;
++        desc.DepthStencilState.DepthEnable = TRUE;
++        desc.DepthStencilState.DepthWriteMask = key.depth_write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
++        desc.DepthStencilState.DepthFunc = depth_func(context.record.front_depth_func);
++        desc.InputLayout = { elements.data(), static_cast<UINT>(elements.size()) };
++        desc.PrimitiveTopologyType = topology_type;
++        desc.NumRenderTargets = 1;
++        desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
++        desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
++        desc.SampleDesc.Count = 1;
++        ComPtr<ID3D12PipelineState> created;
++        if (FAILED(d.device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&created)))) {
++            LOG_ERROR("Direct3D 12: pipeline for vertex {} not made (fragment {}); its draws are skipped",
++                hex_string(vertex_hash).substr(0, 16), hex_string(fragment_program->renderer_data->hash).substr(0, 16));
++            created.Reset();
++        }
++        pipeline = created.Get();
++        d.pipelines[pipeline_key] = std::move(created);
++    }
++    if (!pipeline) {
++        d.dropped++;
++        return;
++    }
++
++    // viewport: see sync_viewport_real for the y sign
++    const bool flat = context.viewport_flat || context.record.viewport_flat;
++    D3D12_VIEWPORT viewport{};
++    if (flat)
++        viewport = { 0.0f, 0.0f, static_cast<float>(target.width), static_cast<float>(target.height), 0.0f, 1.0f };
++    else
++        viewport = { context.viewport_x, context.viewport_y, context.viewport_w, context.viewport_h, 0.0f, 1.0f };
++
++    // per-draw data into upload memory
++    shader::RenderVertUniformBlock vertex_info{};
++    vertex_info.viewport_flip = context.record.viewport_flip;
++    vertex_info.viewport_flip[1] *= flat ? -1.0f : context.viewport_y_sign;
++    vertex_info.viewport_flag = context.record.viewport_flat ? 0.0f : 1.0f;
++    vertex_info.screen_width = static_cast<float>(target.width);
++    vertex_info.screen_height = static_cast<float>(target.height);
++    vertex_info.z_offset = context.record.z_offset;
++    vertex_info.z_scale = context.record.z_scale;
++    shader::RenderFragUniformBlock fragment_info{};
++    fragment_info.front_disabled = context.record.front_side_fragment_program_mode == SCE_GXM_FRAGMENT_PROGRAM_DISABLED ? 1.0f : 0.0f;
++    fragment_info.back_disabled = context.record.back_side_fragment_program_mode == SCE_GXM_FRAGMENT_PROGRAM_DISABLED ? 1.0f : 0.0f;
++    fragment_info.writing_mask = context.record.writing_mask;
++    fragment_info.use_raw_image = 0.0f;
++    fragment_info.res_multiplier = 1.0f;
++
++    D3D12_GPU_VIRTUAL_ADDRESS vertex_info_gpu, fragment_info_gpu, vertex_data_gpu, fragment_data_gpu, index_gpu;
++    uint8_t *p = d.allocate(256, 256, vertex_info_gpu);
++    if (!p)
++        return;
++    std::memcpy(p, &vertex_info, sizeof(vertex_info));
++    p = d.allocate(256, 256, fragment_info_gpu);
++    if (!p)
++        return;
++    std::memcpy(p, &fragment_info, sizeof(fragment_info));
++
++    const auto upload_uniforms = [&](const std::vector<uint8_t> &data, D3D12_GPU_VIRTUAL_ADDRESS &gpu) -> bool {
++        const size_t size = std::max<size_t>(align(data.size(), 16), 16);
++        uint8_t *out = d.allocate(size, 16, gpu);
++        if (!out)
++            return false;
++        std::memset(out, 0, size);
++        if (!data.empty())
++            std::memcpy(out, data.data(), data.size());
++        return true;
++    };
++    if (!upload_uniforms(context.vertex_uniforms, vertex_data_gpu) || !upload_uniforms(context.fragment_uniforms, fragment_data_gpu))
++        return;
++
++    const size_t index_bytes = static_cast<size_t>(count) * index_size;
++    p = d.allocate(align(index_bytes, 4), 4, index_gpu);
++    if (!p)
++        return;
++    std::memcpy(p, indices, index_bytes);
++
++    D3D12_VERTEX_BUFFER_VIEW streams[SCE_GXM_MAX_VERTEX_STREAMS]{};
++    UINT stream_count = 0;
++    for (uint32_t i = 0; i < SCE_GXM_MAX_VERTEX_STREAMS && i < vertex_program->streams.size(); i++) {
++        if (!(used_streams & (1u << i)))
++            continue;
++        stream_count = i + 1;
++        const GXMStreamInfo &info = context.record.vertex_streams[i];
++        const uint32_t stride = vertex_program->streams[i].stride;
++        const uint32_t aligned_stride = align(std::max<uint32_t>(stride, 1), 4);
++        const uint8_t *data = info.data ? info.data.get(mem) : nullptr;
++        if (!data || info.size == 0)
++            continue;
++        const size_t vertices = stride ? (info.size + stride - 1) / stride : 1;
++        const size_t out_size = (stride == aligned_stride) ? info.size : vertices * aligned_stride;
++        D3D12_GPU_VIRTUAL_ADDRESS gpu;
++        // a little slack: a 3-component attribute is read as 4
++        uint8_t *out = d.allocate(out_size + 16, 16, gpu);
++        if (!out)
++            return;
++        if (stride == aligned_stride) {
++            std::memcpy(out, data, info.size);
++        } else {
++            for (size_t v = 0; v < vertices; v++) {
++                const size_t left = info.size - v * stride;
++                std::memcpy(out + v * aligned_stride, data + v * stride, std::min<size_t>(stride, left));
++            }
++        }
++        std::memset(out + out_size, 0, 16);
++        streams[i].BufferLocation = gpu;
++        streams[i].SizeInBytes = static_cast<UINT>(out_size + 16);
++        streams[i].StrideInBytes = (stride == 0) ? 0 : aligned_stride;
++    }
++
++    // texture tables
++    const uint32_t first_view = d.allocate_views(2 * kUnits);
++    if (first_view == ~0u) {
++        d.dropped++;
++        return;
++    }
++    uint32_t vertex_sampler_keys[kUnits]{}, fragment_sampler_keys[kUnits]{};
++    std::vector<Drawer::Target *> sampled;
++    for (uint32_t stage = 0; stage < 2; stage++) {
++        const BoundTexture *units = stage == 0 ? context.vertex_textures : context.fragment_textures;
++        const uint16_t used = stage == 0 ? vertex_program->renderer_data->texture_count : fragment_program->renderer_data->texture_count;
++        uint32_t *keys = stage == 0 ? vertex_sampler_keys : fragment_sampler_keys;
++        for (uint32_t i = 0; i < kUnits; i++) {
++            uint32_t source = Drawer::kNullView;
++            if (i < used) {
++                const BoundTexture &b = units[i];
++                keys[i] = b.sampler_key;
++                if (b.kind == BoundTexture::Cached && b.slot < d.textures.size() && d.textures[b.slot].resource) {
++                    source = b.slot;
++                } else if (b.kind == BoundTexture::Surface && b.slot != context.target) {
++                    const auto t = d.targets.find(b.slot);
++                    if (t != d.targets.end()) {
++                        source = TextureCacheSize + t->second.index;
++                        sampled.push_back(&t->second);
++                    }
++                }
++            }
++            D3D12_CPU_DESCRIPTOR_HANDLE dst = d.views->GetCPUDescriptorHandleForHeapStart();
++            dst.ptr += static_cast<SIZE_T>(first_view + stage * kUnits + i) * d.view_size;
++            d.device->CopyDescriptorsSimple(1, dst, d.cpu_view(source), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++        }
++    }
++    const uint32_t vertex_samplers = d.sampler_table(vertex_sampler_keys);
++    const uint32_t fragment_samplers = d.sampler_table(fragment_sampler_keys);
++    if (vertex_samplers == ~0u || fragment_samplers == ~0u) {
++        d.dropped++;
++        return;
++    }
++
++    // record
++    if (!d.ensure_list())
++        return;
++    ID3D12GraphicsCommandList *list = d.list.Get();
++    if (!d.bound) {
++        ID3D12DescriptorHeap *heaps[] = { d.views.Get(), d.samplers.Get() };
++        list->SetDescriptorHeaps(2, heaps);
++        list->SetGraphicsRootSignature(d.root.Get());
++        d.bound = true;
++        d.bound_target = 0;
++    }
++    for (Drawer::Target *t : sampled)
++        d.transition(t->color.Get(), t->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++    d.transition(target.color.Get(), target.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
++
++    D3D12_CPU_DESCRIPTOR_HANDLE rtv = d.rtvs->GetCPUDescriptorHandleForHeapStart();
++    rtv.ptr += static_cast<SIZE_T>(target.index) * d.rtv_size;
++    D3D12_CPU_DESCRIPTOR_HANDLE dsv = d.dsvs->GetCPUDescriptorHandleForHeapStart();
++    dsv.ptr += static_cast<SIZE_T>(target.index) * d.dsv_size;
++    if (d.bound_target != context.target || !sampled.empty()) {
++        list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
++        d.bound_target = context.target;
++    }
++    if (target.clear_depth) {
++        list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, target.clear_value, 0, 0, nullptr);
++        target.clear_depth = false;
++    }
++
++    list->RSSetViewports(1, &viewport);
++
++    D3D12_RECT scissor{ 0, 0, static_cast<LONG>(target.width), static_cast<LONG>(target.height) };
++    if (context.record.region_clip_mode == SCE_GXM_REGION_CLIP_OUTSIDE) {
++        scissor.left = std::max(context.record.region_clip_min.x, 0);
++        scissor.top = std::max(context.record.region_clip_min.y, 0);
++        scissor.right = std::max<LONG>(context.record.region_clip_max.x + 1, scissor.left);
++        scissor.bottom = std::max<LONG>(context.record.region_clip_max.y + 1, scissor.top);
++    } else if (context.record.region_clip_mode == SCE_GXM_REGION_CLIP_ALL) {
++        scissor = { 0, 0, 0, 0 };
++    }
++    list->RSSetScissorRects(1, &scissor);
++
++    list->SetPipelineState(pipeline);
++    list->IASetPrimitiveTopology(topology);
++    list->SetGraphicsRootConstantBufferView(RootVertexInfo, vertex_info_gpu);
++    list->SetGraphicsRootConstantBufferView(RootFragmentInfo, fragment_info_gpu);
++    list->SetGraphicsRootShaderResourceView(RootVertexData, vertex_data_gpu);
++    list->SetGraphicsRootShaderResourceView(RootFragmentData, fragment_data_gpu);
++    D3D12_GPU_DESCRIPTOR_HANDLE table = d.views->GetGPUDescriptorHandleForHeapStart();
++    table.ptr += static_cast<UINT64>(first_view) * d.view_size;
++    list->SetGraphicsRootDescriptorTable(RootVertexTextures, table);
++    table.ptr += static_cast<UINT64>(kUnits) * d.view_size;
++    list->SetGraphicsRootDescriptorTable(RootFragmentTextures, table);
++    D3D12_GPU_DESCRIPTOR_HANDLE sampler_handle = d.samplers->GetGPUDescriptorHandleForHeapStart();
++    sampler_handle.ptr += static_cast<UINT64>(vertex_samplers) * d.sampler_size;
++    list->SetGraphicsRootDescriptorTable(RootVertexSamplers, sampler_handle);
++    sampler_handle = d.samplers->GetGPUDescriptorHandleForHeapStart();
++    sampler_handle.ptr += static_cast<UINT64>(fragment_samplers) * d.sampler_size;
++    list->SetGraphicsRootDescriptorTable(RootFragmentSamplers, sampler_handle);
++
++    D3D12_INDEX_BUFFER_VIEW ib{ index_gpu, static_cast<UINT>(align(index_bytes, 4)), index_size == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT };
++    list->IASetIndexBuffer(&ib);
++    if (stream_count)
++        list->IASetVertexBuffers(0, stream_count, streams);
++    list->DrawIndexedInstanced(count, instance_count, 0, 0, 0);
++
++    target.last_draw = d.presents;
++    target.last_use = ++d.use_counter;
++    if (++d.draws == 1)
++        LOG_INFO("Direct3D 12: first draw recorded");
++}
++
++// ---------------------------------------------------------------------------
++// Setup and presentation
++
++bool init_drawer(D3D12State &state, ID3D12Device *device, ID3D12CommandQueue *queue) {
++    auto drawer = std::make_shared<Drawer>();
++    if (!drawer->init(device, queue)) {
++        LOG_ERROR("Direct3D 12: the draw path could not start; only the display buffer will be shown");
++        return false;
++    }
++    state.drawer = drawer;
++    state.texture_cache.drawer = drawer.get();
++    return true;
++}
++
++// the target drawn at this address since the last few presents, if any
++bool find_display_target(D3D12State &state, uint32_t address, ID3D12Resource *&color, uint32_t &color_state, uint32_t &width, uint32_t &height) {
++    if (!state.drawer)
++        return false;
++    Drawer &d = *state.drawer;
++    d.submit();
++    d.presents++;
++    const auto it = d.targets.find(address);
++    if (it == d.targets.end() || it->second.last_draw + 3 < d.presents)
++        return false;
++    color = it->second.color.Get();
++    color_state = static_cast<uint32_t>(it->second.state);
++    width = it->second.width;
++    height = it->second.height;
++    return true;
++}
++
++std::string draw_summary(const D3D12State &state) {
++    if (!state.drawer)
++        return "no draw path";
++    const Drawer &d = *state.drawer;
++    return fmt::format("{} draws, {} skipped, {} pipelines, {} targets", d.draws, d.dropped, d.pipelines.size(), d.targets.size());
++}
++
++} // namespace renderer::d3d12
+diff --git a/vita3k/renderer/src/d3d12/shaders.cpp b/vita3k/renderer/src/d3d12/shaders.cpp
+index aec0620..dd3d707 100644
+--- a/vita3k/renderer/src/d3d12/shaders.cpp
++++ b/vita3k/renderer/src/d3d12/shaders.cpp
+@@ -42,7 +42,9 @@
+ 
+ #include <d3dcommon.h>
+ 
++#include <cctype>
+ #include <chrono>
++#include <cstring>
+ #include <fstream>
+ #include <mutex>
+ #include <string>
+@@ -53,7 +55,7 @@ namespace renderer::d3d12 {
+ 
+ namespace {
+ // bump when the HLSL options below change: the DXBC cache key
+-constexpr int kHlslVersion = 1;
++constexpr int kHlslVersion = 3;
+ 
+ // pD3DCompile, spelled out so d3dcompiler.h is not needed
+ typedef HRESULT(WINAPI *CompileFn)(LPCVOID src, SIZE_T size, LPCSTR name, const D3D_SHADER_MACRO *defines,
+@@ -74,6 +76,7 @@ struct Entry {
+ struct ShaderCache {
+     std::mutex mutex;
+     std::unordered_map<std::string, Entry> entries;
++    std::unordered_map<std::string, std::string> hlsl;
+     uint64_t compiled = 0;
+     uint64_t from_disk = 0;
+     uint64_t failed = 0;
+@@ -91,8 +94,9 @@ static std::string translate_to_hlsl(const std::vector<uint32_t> &spirv, bool is
+         hlsl.set_hlsl_options(options);
+ 
+         auto common = hlsl.get_common_options();
+-        // the Vulkan translator writes Vulkan clip space (y down); Direct3D's is y up
+-        common.vertex.flip_vert_y = is_vertex;
++        // no flip here: the draw flips y through the viewport_flip uniform,
++        // so the viewport height stays positive (Direct3D has no negative heights)
++        common.vertex.flip_vert_y = false;
+         common.vertex.fixup_clipspace = false; // both use a 0 to 1 depth range
+         hlsl.set_common_options(common);
+ 
+@@ -135,14 +139,141 @@ static void write_file(const fs::path &path, const void *data, size_t size) {
+         file.write(static_cast<const char *>(data), static_cast<std::streamsize>(size));
+ }
+ 
+-// The DXBC for one program, compiled on first use; null when it cannot be had
+-static const std::vector<uint8_t> *get_shader(D3D12State &state, const SceGxmProgram &program, const Sha256Hash &hash,
++// One line of an HLSL input or output struct: "    float4 name : SEMANTIC;"
++struct StructMember {
++    std::string text; // the whole line, as SPIRV-Cross wrote it
++    std::string semantic; // upper case, e.g. TEXCOORD3 or SV_POSITION
++};
++
++static std::string upper(std::string s) {
++    for (char &c : s)
++        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
++    return s;
++}
++
++// The members of "struct <name> { ... };" in the HLSL, and where it sits
++static bool parse_struct(const std::string &hlsl, const std::string &name, std::vector<StructMember> &members, size_t &begin, size_t &end) {
++    const std::string head = "struct " + name;
++    size_t at = hlsl.find(head + "\n");
++    if (at == std::string::npos)
++        at = hlsl.find(head + "\r\n");
++    if (at == std::string::npos)
++        return false;
++    const size_t open = hlsl.find('{', at);
++    const size_t close = hlsl.find("};", open);
++    if (open == std::string::npos || close == std::string::npos)
++        return false;
++    begin = open + 1;
++    end = close;
++    members.clear();
++    size_t line_start = begin;
++    while (line_start < end) {
++        size_t line_end = hlsl.find('\n', line_start);
++        if (line_end == std::string::npos || line_end > end)
++            line_end = end;
++        std::string line = hlsl.substr(line_start, line_end - line_start);
++        while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
++            line.pop_back();
++        const size_t colon = line.rfind(':');
++        const size_t semi = line.rfind(';');
++        if (colon != std::string::npos && semi != std::string::npos && semi > colon) {
++            std::string semantic = line.substr(colon + 1, semi - colon - 1);
++            semantic.erase(0, semantic.find_first_not_of(' '));
++            semantic.erase(semantic.find_last_not_of(' ') + 1);
++            members.push_back({ line, upper(semantic) });
++        }
++        line_start = line_end + 1;
++    }
++    return true;
++}
++
++// Direct3D links the vertex outputs to the fragment inputs by register: a
++// fragment shader reading TEXCOORD3 must find it in the register the vertex
++// shader wrote it to. SPIRV-Cross packs each stage's own variables in order,
++// so the fragment input struct is rebuilt in the vertex output order, with
++// the vertex outputs it does not read declared and left unused.
++static std::string link_fragment_inputs(const std::string &fragment, const std::string &vertex) {
++    std::vector<StructMember> outputs, inputs;
++    size_t vb, ve, fb, fe;
++    if (!parse_struct(vertex, "SPIRV_Cross_Output", outputs, vb, ve) || !parse_struct(fragment, "SPIRV_Cross_Input", inputs, fb, fe))
++        return fragment;
++
++    std::string rebuilt = "\n";
++    std::vector<bool> used(inputs.size(), false);
++    int unused = 0;
++    for (const StructMember &out : outputs) {
++        bool found = false;
++        for (size_t i = 0; i < inputs.size(); i++) {
++            if (!used[i] && inputs[i].semantic == out.semantic) {
++                rebuilt += inputs[i].text + "\n";
++                used[i] = true;
++                found = true;
++                break;
++            }
++        }
++        if (found)
++            continue;
++        if (out.semantic.rfind("SV_", 0) == 0 && out.semantic != "SV_POSITION")
++            continue; // clip distances and the like need no fragment-side twin
++        // declare it under another name so nothing reads it
++        std::string line = out.text;
++        const size_t colon = line.rfind(':');
++        std::string decl = line.substr(0, colon);
++        while (!decl.empty() && decl.back() == ' ')
++            decl.pop_back();
++        const size_t space = decl.find_last_of(" \t");
++        if (space == std::string::npos)
++            continue;
++        std::string type_part = decl.substr(0, space + 1);
++        // interpolation qualifiers of an unused input do not matter
++        for (const char *qualifier : { "nointerpolation ", "noperspective ", "centroid ", "sample " }) {
++            size_t q;
++            while ((q = type_part.find(qualifier)) != std::string::npos)
++                type_part.erase(q, std::strlen(qualifier));
++        }
++        if (out.semantic == "SV_POSITION")
++            rebuilt += fmt::format("{}revita_unused_{} : SV_Position;\n", type_part, unused++);
++        else
++            rebuilt += fmt::format("{}revita_unused_{} : {};\n", type_part, unused++, line.substr(colon + 1, line.rfind(';') - colon - 1));
++    }
++    // fragment-only inputs (SV_IsFrontFace and the like, or inputs the vertex shader never writes)
++    for (size_t i = 0; i < inputs.size(); i++)
++        if (!used[i])
++            rebuilt += inputs[i].text + "\n";
++
++    return fragment.substr(0, fb) + rebuilt + fragment.substr(fe);
++}
++
++static std::string stage_name(bool is_vertex) {
++    return is_vertex ? "vs" : "ps";
++}
++
++// GXP to HLSL for one program, kept for the session (a fragment shader is
++// compiled once per vertex shader it is drawn with, from this text)
++static const std::string *get_hlsl(D3D12State &state, const SceGxmProgram &program, const std::string &hash_text,
+     bool is_vertex, const shader::Hints &hints, bool maskupdate) {
+     ShaderCache &cache = *state.shaders;
+-    const std::string hash_text = hex_string(hash);
+-    const char *stage = is_vertex ? "vs" : "ps";
+     const std::string key = hash_text + (is_vertex ? ".vs" : (maskupdate ? ".psm" : ".ps"));
++    {
++        std::lock_guard<std::mutex> guard(cache.mutex);
++        const auto it = cache.hlsl.find(key);
++        if (it != cache.hlsl.end())
++            return it->second.empty() ? nullptr : &it->second;
++    }
++    const std::vector<uint32_t> spirv = load_spirv_shader(program, state.features, true, hints, maskupdate,
++        state.shaders_path, state.shaders_log_path, fmt::format("dx{}", shader::CURRENT_VERSION), false);
++    std::string error;
++    std::string hlsl = spirv.empty() ? std::string{} : translate_to_hlsl(spirv, is_vertex, error);
++    if (hlsl.empty())
++        LOG_ERROR("Direct3D 12 shader {} {}: no HLSL ({})", hash_text, stage_name(is_vertex), spirv.empty() ? "GXP to SPIR-V failed" : error);
++    std::lock_guard<std::mutex> guard(cache.mutex);
++    std::string &stored = cache.hlsl[key];
++    stored = std::move(hlsl);
++    return stored.empty() ? nullptr : &stored;
++}
+ 
++static const std::vector<uint8_t> *compile_cached(D3D12State &state, const std::string &key, const std::string &hlsl, bool is_vertex) {
++    ShaderCache &cache = *state.shaders;
+     {
+         std::lock_guard<std::mutex> guard(cache.mutex);
+         const auto it = cache.entries.find(key);
+@@ -152,10 +283,7 @@ static const std::vector<uint8_t> *get_shader(D3D12State &state, const SceGxmPro
+ 
+     Entry entry;
+     const std::string version = fmt::format("dx{}-{}", shader::CURRENT_VERSION, kHlslVersion);
+-    const fs::path disk = state.shaders_path.empty()
+-        ? fs::path{}
+-        : state.shaders_path / fmt::format("{}.{}.dxbc", key, version);
+-
++    const fs::path disk = state.shaders_path.empty() ? fs::path{} : state.shaders_path / fmt::format("{}.{}.dxbc", key, version);
+     if (!disk.empty() && read_file(disk, entry.dxbc)) {
+         entry.status = Status::Ready;
+         std::lock_guard<std::mutex> guard(cache.mutex);
+@@ -175,45 +303,35 @@ static const std::vector<uint8_t> *get_shader(D3D12State &state, const SceGxmPro
+     }
+ 
+     const auto start = std::chrono::steady_clock::now();
+-    const std::vector<uint32_t> spirv = load_spirv_shader(program, state.features, true, hints, maskupdate,
+-        state.shaders_path, state.shaders_log_path, fmt::format("dx{}", shader::CURRENT_VERSION), false);
+-
+     std::string error;
+-    std::string hlsl = spirv.empty() ? std::string{} : translate_to_hlsl(spirv, is_vertex, error);
+-    if (spirv.empty())
+-        error = "GXP to SPIR-V failed";
+-
+-    if (!hlsl.empty()) {
+-        ID3DBlob *code = nullptr;
+-        ID3DBlob *errors = nullptr;
+-        const HRESULT hr = compile(hlsl.data(), hlsl.size(), key.c_str(), nullptr, nullptr, "main",
+-            is_vertex ? "vs_5_1" : "ps_5_1", kOptimize3, 0, &code, &errors);
+-        if (SUCCEEDED(hr) && code) {
+-            const auto *bytes = static_cast<const uint8_t *>(code->GetBufferPointer());
+-            entry.dxbc.assign(bytes, bytes + code->GetBufferSize());
+-            entry.status = Status::Ready;
+-        } else {
+-            error = errors ? std::string(static_cast<const char *>(errors->GetBufferPointer()), errors->GetBufferSize())
+-                           : fmt::format("D3DCompile failed (0x{:08X})", static_cast<uint32_t>(hr));
+-        }
+-        if (code)
+-            code->Release();
+-        if (errors)
+-            errors->Release();
++    ID3DBlob *code = nullptr;
++    ID3DBlob *errors = nullptr;
++    const HRESULT hr = compile(hlsl.data(), hlsl.size(), key.c_str(), nullptr, nullptr, "main",
++        is_vertex ? "vs_5_1" : "ps_5_1", kOptimize3, 0, &code, &errors);
++    if (SUCCEEDED(hr) && code) {
++        const auto *bytes = static_cast<const uint8_t *>(code->GetBufferPointer());
++        entry.dxbc.assign(bytes, bytes + code->GetBufferSize());
++        entry.status = Status::Ready;
++    } else {
++        error = errors ? std::string(static_cast<const char *>(errors->GetBufferPointer()), errors->GetBufferSize())
++                       : fmt::format("D3DCompile failed (0x{:08X})", static_cast<uint32_t>(hr));
+     }
++    if (code)
++        code->Release();
++    if (errors)
++        errors->Release();
+ 
+     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+     if (entry.status == Status::Ready) {
+         if (!disk.empty())
+             write_file(disk, entry.dxbc.data(), entry.dxbc.size());
+-        LOG_INFO("Direct3D 12 shader {} {}: {} bytes in {} ms", hash_text, stage, entry.dxbc.size(), ms);
++        LOG_INFO("Direct3D 12 shader {}: {} bytes in {} ms", key, entry.dxbc.size(), ms);
+     } else {
+-        // the first line or so of the reason, and the whole HLSL for whoever reads the logs
+         const std::string first = error.substr(0, std::min<size_t>(error.find('\n'), 300));
+-        LOG_ERROR("Direct3D 12 shader {} {} not built: {}", hash_text, stage, first);
+-        if (!state.shaders_log_path.empty() && !hlsl.empty()) {
++        LOG_ERROR("Direct3D 12 shader {} not built: {}", key, first);
++        if (!state.shaders_log_path.empty()) {
+             const std::string dump = hlsl + "\n/*\n" + error + "\n*/\n";
+-            write_file(state.shaders_log_path / fmt::format("{}.{}.hlsl", key, stage), dump.data(), dump.size());
++            write_file(state.shaders_log_path / fmt::format("{}.hlsl", key), dump.data(), dump.size());
+         }
+     }
+ 
+@@ -226,41 +344,42 @@ static const std::vector<uint8_t> *get_shader(D3D12State &state, const SceGxmPro
+     return stored.status == Status::Ready ? &stored.dxbc : nullptr;
+ }
+ 
+-void sync_texture(renderer::Context &context, uint32_t index, const SceGxmTexture &texture) {
+-    const SceGxmTextureFormat format = gxm::get_format(texture);
+-    if (index >= SCE_GXM_MAX_TEXTURE_UNITS) {
+-        if (index - SCE_GXM_MAX_TEXTURE_UNITS < SCE_GXM_MAX_TEXTURE_UNITS)
+-            context.shader_hints.vertex_textures[index - SCE_GXM_MAX_TEXTURE_UNITS] = format;
+-    } else {
+-        context.shader_hints.fragment_textures[index] = format;
+-    }
++const std::vector<uint8_t> *get_vertex_shader(D3D12State &state, const SceGxmProgram &program, const Sha256Hash &hash, const shader::Hints &hints) {
++    if (!state.shaders)
++        return nullptr;
++    const std::string hash_text = hex_string(hash);
++    const std::string *hlsl = get_hlsl(state, program, hash_text, true, hints, false);
++    if (!hlsl)
++        return nullptr;
++    return compile_cached(state, hash_text + ".vs", *hlsl, true);
+ }
+ 
+-void draw(D3D12State &state, renderer::Context &context, MemState &mem) {
++const std::vector<uint8_t> *get_fragment_shader(D3D12State &state, const SceGxmProgram &program, const Sha256Hash &hash,
++    const Sha256Hash &vertex_hash, const shader::Hints &hints, bool maskupdate) {
+     if (!state.shaders)
+-        return;
+-    const SceGxmVertexProgram *vertex_program = context.record.vertex_program.get(mem);
+-    const SceGxmFragmentProgram *fragment_program = context.record.fragment_program.get(mem);
+-    if (!vertex_program || !fragment_program || !vertex_program->renderer_data || !fragment_program->renderer_data)
+-        return;
+-
+-    shader::Hints hints = context.shader_hints;
+-    hints.attributes = &vertex_program->attributes;
+-    hints.color_format = context.record.color_surface.colorFormat;
+-    hints.masked_framebuffer_fetch = false;
+-
+-    const SceGxmProgram *vertex_gxp = vertex_program->program.get(mem);
+-    if (vertex_gxp)
+-        get_shader(state, *vertex_gxp, vertex_program->renderer_data->hash, true, hints, false);
+-
+-    const bool maskupdate = fragment_program->is_maskupdate;
+-    const SceGxmProgram *fragment_gxp = fragment_program->program.get(mem);
+-    if (!fragment_gxp)
+-        return;
+-    const bool fragment_disabled = !maskupdate
+-        && (context.record.front_side_fragment_program_mode == SCE_GXM_FRAGMENT_PROGRAM_DISABLED || fragment_gxp->has_no_effect());
+-    if (!fragment_disabled)
+-        get_shader(state, *fragment_gxp, fragment_program->renderer_data->hash, false, hints, maskupdate);
++        return nullptr;
++    const std::string hash_text = hex_string(hash);
++    const std::string vertex_text = hex_string(vertex_hash);
++    const std::string *hlsl = get_hlsl(state, program, hash_text, false, hints, maskupdate);
++    if (!hlsl)
++        return nullptr;
++    const std::string *vertex_hlsl;
++    {
++        std::lock_guard<std::mutex> guard(state.shaders->mutex);
++        const auto it = state.shaders->hlsl.find(vertex_text + ".vs");
++        vertex_hlsl = (it == state.shaders->hlsl.end() || it->second.empty()) ? nullptr : &it->second;
++    }
++    if (!vertex_hlsl)
++        return nullptr;
++    const std::string key = hash_text + (maskupdate ? ".psm." : ".ps.") + vertex_text.substr(0, 16);
++    {
++        std::lock_guard<std::mutex> guard(state.shaders->mutex);
++        const auto it = state.shaders->entries.find(key);
++        if (it != state.shaders->entries.end())
++            return it->second.status == Status::Ready ? &it->second.dxbc : nullptr;
++    }
++    const std::string linked = link_fragment_inputs(*hlsl, *vertex_hlsl);
++    return compile_cached(state, key, linked, false);
+ }
+ 
+ std::shared_ptr<ShaderCache> make_shader_cache() {
+diff --git a/vita3k/renderer/src/d3d12/state.cpp b/vita3k/renderer/src/d3d12/state.cpp
+index 647ee26..6395ae1 100644
+--- a/vita3k/renderer/src/d3d12/state.cpp
++++ b/vita3k/renderer/src/d3d12/state.cpp
+@@ -34,6 +34,10 @@ using Microsoft::WRL::ComPtr;
+ 
+ namespace renderer::d3d12 {
+ 
++bool init_drawer(D3D12State &state, ID3D12Device *device, ID3D12CommandQueue *queue);
++bool find_display_target(D3D12State &state, uint32_t address, ID3D12Resource *&color, uint32_t &color_state, uint32_t &width, uint32_t &height);
++std::string draw_summary(const D3D12State &state);
++
+ namespace {
+ Interface g_interface;
+ }
+@@ -125,21 +129,27 @@ bool D3D12State::init() {
+     // the surface read through a bound texture for programmable blending (the
+     // copy the other renderers use), three-component vertex attributes
+     features.spirv_shader = true;
+-    features.support_texture_barrier = true;
+-    features.support_rgb_attributes = true;
++    // no programmable blending yet: fixed-function blending only
++    features.support_texture_barrier = false;
++    features.support_shader_interlock = false;
++    features.direct_fragcolor = false;
++    // Direct3D has no 3-component 8/16-bit or scaled vertex formats: the shader converts
++    features.support_rgb_attributes = false;
++    features.support_scaled_attribute_formats = false;
+     features.use_mask_bit = false;
++    features.enable_memory_mapping = false;
+     shaders = make_shader_cache();
+-    LOG_INFO("Direct3D 12 renderer (experimental): device ready. Stage 2: shaders are built for every draw, the draws themselves are not drawn yet; the display buffer in memory is shown.");
++    texture_cache.support_dxt = true;
++    init_drawer(*this, d.device, d.queue);
++    LOG_INFO("Direct3D 12 renderer (experimental): device ready. Stage 3 (experimental): draws, textures and render targets.");
+     return true;
+ }
+ 
+ void D3D12State::late_init(const Config &cfg, const std::string_view game_id, MemState &mem) {
++    texture_cache.init(true, texture_folder(), game_id);
+ }
+ 
+ void D3D12State::render_frame(DisplayState &display, const GxmState &gxm, MemState &mem) {
+-    static uint64_t frames_seen = 0;
+-    if (shaders && (++frames_seen % 600) == 0)
+-        LOG_INFO("Direct3D 12 shaders so far: {}", shader_cache_summary(*shaders));
+     DisplayFrameInfo frame;
+     {
+         std::lock_guard<std::mutex> guard(display.display_info_mutex);
+@@ -147,7 +157,7 @@ void D3D12State::render_frame(DisplayState &display, const GxmState &gxm, MemSta
+     }
+     if (!frame.base || frame.image_size.x <= 0 || frame.image_size.y <= 0)
+         return;
+-    present_from_memory(frame.base.get(mem), frame.pitch, static_cast<uint32_t>(frame.image_size.x), static_cast<uint32_t>(frame.image_size.y));
++    present_display(frame.base.address(), frame.base.get(mem), frame.pitch, static_cast<uint32_t>(frame.image_size.x), static_cast<uint32_t>(frame.image_size.y));
+ }
+ 
+ bool D3D12State::present_from_memory(const void *pixels, uint32_t pitch, uint32_t width, uint32_t height) {
+@@ -263,6 +273,119 @@ bool D3D12State::present_from_memory(const void *pixels, uint32_t pitch, uint32_
+     return true;
+ }
+ 
++bool D3D12State::present_display(uint32_t base, const void *pixels, uint32_t pitch, uint32_t width, uint32_t height) {
++    static uint64_t presents_seen = 0;
++    if (shaders && (++presents_seen % 600) == 0)
++        LOG_INFO("Direct3D 12 so far: shaders {}; {}", shader_cache_summary(*shaders), draw_summary(*this));
++    ID3D12Resource *color = nullptr;
++    uint32_t color_state = 0, target_width = 0, target_height = 0;
++    if (find_display_target(*this, base, color, color_state, target_width, target_height))
++        return present_from_texture(color, color_state, std::min(width, target_width), std::min(height, target_height));
++    return present_from_memory(pixels, pitch, width, height);
++}
++
++bool D3D12State::present_from_texture(ID3D12Resource *src, uint32_t src_state, uint32_t width, uint32_t height) {
++    Impl &d = *impl;
++    if (!d.device || !src || width == 0 || height == 0)
++        return false;
++    Impl::Slot &slot = d.slots[d.next];
++    if (slot.done && d.fence->GetCompletedValue() < slot.done) {
++        if (SUCCEEDED(d.fence->SetEventOnCompletion(slot.done, d.event)))
++            WaitForSingleObjectEx(d.event, 2000, FALSE);
++    }
++    if (!slot.texture || slot.width != width || slot.height != height) {
++        D3D12_HEAP_PROPERTIES heap{};
++        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
++        D3D12_RESOURCE_DESC desc{};
++        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++        desc.Width = width;
++        desc.Height = height;
++        desc.DepthOrArraySize = 1;
++        desc.MipLevels = 1;
++        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++        desc.SampleDesc.Count = 1;
++        slot.texture.Reset();
++        if (FAILED(d.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&slot.texture))))
++            return false;
++        slot.width = width;
++        slot.height = height;
++        slot.fresh = true;
++    }
++
++    slot.allocator->Reset();
++    slot.list->Reset(slot.allocator.Get(), nullptr);
++    D3D12_RESOURCE_BARRIER barriers[2]{};
++    UINT count = 0;
++    const auto source_state = static_cast<D3D12_RESOURCE_STATES>(src_state);
++    if (source_state != D3D12_RESOURCE_STATE_COPY_SOURCE) {
++        barriers[count].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++        barriers[count].Transition.pResource = src;
++        barriers[count].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++        barriers[count].Transition.StateBefore = source_state;
++        barriers[count].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
++        count++;
++    }
++    if (!slot.fresh && d.required != D3D12_RESOURCE_STATE_COPY_DEST) {
++        barriers[count].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++        barriers[count].Transition.pResource = slot.texture.Get();
++        barriers[count].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++        barriers[count].Transition.StateBefore = d.required;
++        barriers[count].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
++        count++;
++    }
++    if (count)
++        slot.list->ResourceBarrier(count, barriers);
++
++    D3D12_TEXTURE_COPY_LOCATION to{};
++    to.pResource = slot.texture.Get();
++    to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++    D3D12_TEXTURE_COPY_LOCATION from{};
++    from.pResource = src;
++    from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++    const D3D12_BOX box{ 0, 0, 0, width, height, 1 };
++    slot.list->CopyTextureRegion(&to, 0, 0, 0, &from, &box);
++
++    count = 0;
++    if (source_state != D3D12_RESOURCE_STATE_COPY_SOURCE) {
++        barriers[count].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++        barriers[count].Transition.pResource = src;
++        barriers[count].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++        barriers[count].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
++        barriers[count].Transition.StateAfter = source_state;
++        count++;
++    }
++    if (d.required != D3D12_RESOURCE_STATE_COPY_DEST) {
++        barriers[count].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++        barriers[count].Transition.pResource = slot.texture.Get();
++        barriers[count].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++        barriers[count].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
++        barriers[count].Transition.StateAfter = d.required;
++        count++;
++    }
++    if (count)
++        slot.list->ResourceBarrier(count, barriers);
++    slot.fresh = false;
++    if (FAILED(slot.list->Close()))
++        return false;
++    ID3D12CommandList *lists[] = { slot.list.Get() };
++    d.queue->ExecuteCommandLists(1, lists);
++    slot.done = ++d.fence_value;
++    d.queue->Signal(d.fence.Get(), slot.done);
++    {
++        std::lock_guard<std::mutex> guard(d.published_mutex);
++        d.published = d.next;
++        d.published_width = width;
++        d.published_height = height;
++    }
++    d.next = (d.next + 1) % Impl::kSlots;
++    static bool first = true;
++    if (first) {
++        first = false;
++        LOG_INFO("Direct3D 12: first GPU-drawn frame ({}x{}) on its way to the screen", width, height);
++    }
++    return true;
++}
++
+ bool D3D12State::take_frame(uint32_t &width, uint32_t &height) {
+     Impl &d = *impl;
+     const Interface &iface = get_interface();
+@@ -307,10 +430,17 @@ bool create(std::unique_ptr<renderer::RenderTarget> &rt) {
+     return true;
+ }
+ 
+-void create(std::unique_ptr<renderer::FragmentProgram> &fp) {
+-    fp = std::make_unique<renderer::FragmentProgram>();
++void create(std::unique_ptr<renderer::FragmentProgram> &fp, const SceGxmProgram &program, const SceGxmBlendInfo *blend) {
++    auto d3d = std::make_unique<D3D12FragmentProgram>();
++    d3d->native_color = program.is_native_color();
++    if (blend) {
++        d3d->has_blend_info = true;
++        d3d->blend = *blend;
++    }
++    fp = std::move(d3d);
+ }
+ 
++
+ void create(std::unique_ptr<renderer::VertexProgram> &vp) {
+     vp = std::make_unique<renderer::VertexProgram>();
+ }
+diff --git a/vita3k/renderer/src/scene.cpp b/vita3k/renderer/src/scene.cpp
+index f41efca..d33250b 100644
+--- a/vita3k/renderer/src/scene.cpp
++++ b/vita3k/renderer/src/scene.cpp
+@@ -91,6 +91,7 @@ COMMAND(handle_set_context) {
+         break;
+ 
+     case Backend::D3D12:
++        d3d12::set_context(static_cast<d3d12::D3D12State &>(renderer), *render_context, mem);
+         break;
+ 
+     default:
+@@ -136,6 +137,8 @@ COMMAND(handle_sync_surface_data) {
+         if (context->is_recording)
+             context->stop_recording(vertex_notification, fragment_notification);
+     }
++    if (renderer.current_backend == Backend::D3D12)
++        d3d12::end_scene(static_cast<d3d12::D3D12State &>(renderer), *render_context);
+ 
+     SceGxmColorSurface *surface = &render_context->record.color_surface;
+     if (helper.cmd->status) {
+@@ -247,7 +250,8 @@ COMMAND(handle_draw) {
+         break;
+ 
+     case Backend::D3D12:
+-        d3d12::draw(static_cast<d3d12::D3D12State &>(renderer), *render_context, mem);
++        d3d12::draw(static_cast<d3d12::D3D12State &>(renderer), *render_context, type, format, indices.cast<void>().get(mem),
++            count, instance_count, mem);
+         break;
+ 
+     default:
+diff --git a/vita3k/renderer/src/state_set.cpp b/vita3k/renderer/src/state_set.cpp
+index be6e4b2..0b3b86a 100644
+--- a/vita3k/renderer/src/state_set.cpp
++++ b/vita3k/renderer/src/state_set.cpp
+@@ -136,6 +136,7 @@ COMMAND_SET_STATE(uniform_buffer) {
+         break;
+ 
+     case Backend::D3D12:
++        d3d12::set_uniform_buffer(*render_context, program, is_vertex, block_num, size, data.get(mem));
+         break;
+ 
+     default:
+@@ -196,6 +197,7 @@ COMMAND_SET_STATE(viewport) {
+             break;
+ 
+         case Backend::D3D12:
++            d3d12::sync_viewport_real(*render_context, xOffset, yOffset, xScale, yScale);
+             break;
+ 
+         default:
+@@ -220,6 +222,7 @@ COMMAND_SET_STATE(viewport) {
+             break;
+ 
+         case Backend::D3D12:
++            d3d12::sync_viewport_flat(*render_context);
+             break;
+ 
+         default:
+@@ -478,7 +481,7 @@ COMMAND_SET_STATE(texture) {
+         break;
+ 
+     case Backend::D3D12:
+-        d3d12::sync_texture(*render_context, texture_index, texture);
++        d3d12::sync_texture(static_cast<d3d12::D3D12State &>(renderer), *render_context, texture_index, texture, mem);
+         break;
+ 
+     default:
