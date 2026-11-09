@@ -1,0 +1,13 @@
+diff --git a/vita3k/renderer/src/vulkan/surface_cache.cpp b/vita3k/renderer/src/vulkan/surface_cache.cpp
+index 0b04342..7216876 100644
+--- a/vita3k/renderer/src/vulkan/surface_cache.cpp
++++ b/vita3k/renderer/src/vulkan/surface_cache.cpp
+@@ -1282,7 +1282,7 @@ bool VKSurfaceCache::check_for_surface(MemState &mem, Address source_address, Ca
+             return false;
+         ColorSurfaceCacheInfo &surface = *found->second;
+         VKContext &context = *static_cast<VKContext *>(state.context);
+-        if (surface.last_frame_rendered + MAX_FRAMES_RENDERING <= context.frame_timestamp)
++        if (surface.last_frame_rendered + MAX_FRAMES_RENDERING <= state.frame_timestamp)
+             return false;
+         if (!*surface.need_surface_sync) {
+             *surface.need_surface_sync = true;
