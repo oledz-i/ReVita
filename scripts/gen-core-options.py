@@ -58,7 +58,7 @@ label_overrides = {
     'vita3k_pkg_mode': 'Run mode',
 }
 info_overrides = {
-    'vita3k_backend_renderer': "Two renderers, both built for this console: Vulkan (through Mesa's Dozen) and OpenGL (Mesa on Direct3D 12). Most games run on either; if one misbehaves, try the other. Surface sync works on both. Takes effect when a game starts.",
+    'vita3k_backend_renderer': "Vulkan (through Mesa's Dozen) and OpenGL (Mesa on Direct3D 12) are built for this console: most games run on either; if one misbehaves, try the other. Direct3D 12 is ReVita's own renderer, experimental: it draws games itself, but is untested on the console and leaves out stencil, culling and surface sync. Takes effect when a game starts.",
     'vita3k_cpu_opt': 'On: the Vita\'s ARM code is recompiled to x64 as it runs, which is what makes games playable. Off: far slower; only for telling a JIT problem from a game problem.',
 }
 
