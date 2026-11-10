@@ -71,6 +71,12 @@ The core's renderers implement `renderer::State` and `renderer::Context`
    it (exact up to 128 MB of copies a frame, then refreshed every 8th draw),
    as the Vulkan renderer does on the console
    (`scripts/core-patches/0013-d3d12-programmable-blending.patch`).
+   Corrected after reading the translator (0015): it reads the screen
+   through a storage image in set 1 (the texture-barrier path), not a
+   subpass input, and it leaves the y flip to the Vulkan viewport, which
+   Direct3D cannot do (no negative heights). The image is declared
+   read-only so SPIRV-Cross writes it as a texture at t0 space1, and the
+   vertex shader multiplies y by the render info's viewport_flip.
    Still to do: surface sync, mask bit, stencil, culling.
 5. Shader and pipeline caches on disk.
 

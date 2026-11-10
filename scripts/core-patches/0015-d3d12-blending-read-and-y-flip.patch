@@ -1,0 +1,97 @@
+diff --git a/vita3k/renderer/src/d3d12/draw.cpp b/vita3k/renderer/src/d3d12/draw.cpp
+index 5035a1c..bec8de0 100644
+--- a/vita3k/renderer/src/d3d12/draw.cpp
++++ b/vita3k/renderer/src/d3d12/draw.cpp
+@@ -1339,8 +1339,8 @@ void draw(D3D12State &state, renderer::Context &ctx, SceGxmPrimitiveType type, S
+ 
+     // per-draw data into upload memory
+     shader::RenderVertUniformBlock vertex_info{};
+-    vertex_info.viewport_flip = context.record.viewport_flip;
+-    vertex_info.viewport_flip[1] *= flat ? -1.0f : context.viewport_y_sign;
++    // the Vulkan translator does not flip y itself (its viewport does); ours does, from this
++    vertex_info.viewport_flip = { 1.0f, flat ? -1.0f : context.viewport_y_sign, 1.0f, 1.0f };
+     vertex_info.viewport_flag = context.record.viewport_flat ? 0.0f : 1.0f;
+     vertex_info.screen_width = static_cast<float>(target.width);
+     vertex_info.screen_height = static_cast<float>(target.height);
+diff --git a/vita3k/renderer/src/d3d12/shaders.cpp b/vita3k/renderer/src/d3d12/shaders.cpp
+index e9c9e6e..59408ad 100644
+--- a/vita3k/renderer/src/d3d12/shaders.cpp
++++ b/vita3k/renderer/src/d3d12/shaders.cpp
+@@ -55,7 +55,7 @@ namespace renderer::d3d12 {
+ 
+ namespace {
+ // bump when the HLSL options below change: the DXBC cache key
+-constexpr int kHlslVersion = 4;
++constexpr int kHlslVersion = 6;
+ 
+ // pD3DCompile, spelled out so d3dcompiler.h is not needed
+ typedef HRESULT(WINAPI *CompileFn)(LPCVOID src, SIZE_T size, LPCSTR name, const D3D_SHADER_MACRO *defines,
+@@ -91,7 +91,18 @@ static std::string translate_to_hlsl(const std::vector<uint32_t> &spirv, bool is
+         options.point_size_compat = true;
+         options.point_coord_compat = true;
+         options.flatten_matrix_vertex_input_semantics = true;
++        // programmable blending: the translator reads the screen with an image
++        // load from a storage image in set 1. Declared read-only, SPIRV-Cross
++        // writes it as a plain texture (t0, space1), which is where the draw
++        // binds its copy of the render target.
++        options.nonwritable_uav_texture_as_srv = true;
+         hlsl.set_hlsl_options(options);
++        for (const auto &image : hlsl.get_shader_resources().storage_images) {
++            if (hlsl.get_decoration(image.id, spv::DecorationDescriptorSet) == 1) {
++                hlsl.unset_decoration(image.id, spv::DecorationCoherent);
++                hlsl.set_decoration(image.id, spv::DecorationNonWritable);
++            }
++        }
+ 
+         auto common = hlsl.get_common_options();
+         // no flip here: the draw flips y through the viewport_flip uniform,
+@@ -112,7 +123,27 @@ static std::string translate_to_hlsl(const std::vector<uint32_t> &spirv, bool is
+                 hlsl.add_vertex_attribute_remap(remap);
+             }
+         }
+-        return hlsl.compile();
++        std::string out = hlsl.compile();
++        if (is_vertex) {
++            // The Vulkan translator leaves the y flip to the viewport (a
++            // negative height), which Direct3D does not have. The render info
++            // block still carries the flip, so the shader applies it as the
++            // last step: y * viewport_flip.y.
++            const size_t member = out.find("viewport_flip");
++            const size_t ret = out.rfind("return stage_output;");
++            if (member != std::string::npos && ret != std::string::npos) {
++                size_t begin = member, end = member + 13;
++                while (begin > 0 && (std::isalnum(static_cast<unsigned char>(out[begin - 1])) || out[begin - 1] == '_'))
++                    begin--;
++                while (end < out.size() && (std::isalnum(static_cast<unsigned char>(out[end])) || out[end] == '_'))
++                    end++;
++                const std::string name = out.substr(begin, end - begin);
++                out.insert(ret, "stage_output.gl_Position.y *= " + name + ".y;\n    ");
++            } else {
++                LOG_WARN_ONCE("Direct3D 12: a vertex shader has no viewport_flip to apply; the picture may be upside down");
++            }
++        }
++        return out;
+     } catch (const std::exception &e) {
+         error = e.what();
+         return {};
+diff --git a/vita3k/renderer/src/d3d12/state.cpp b/vita3k/renderer/src/d3d12/state.cpp
+index bd37b0e..4215d93 100644
+--- a/vita3k/renderer/src/d3d12/state.cpp
++++ b/vita3k/renderer/src/d3d12/state.cpp
+@@ -129,11 +129,12 @@ bool D3D12State::init() {
+     // the surface read through a bound texture for programmable blending (the
+     // copy the other renderers use), three-component vertex attributes
+     features.spirv_shader = true;
+-    // programmable blending: the shader reads the target as a subpass input,
+-    // which SPIRV-Cross turns into a texture load; the draw binds a copy
+-    features.support_texture_barrier = false;
++    // programmable blending: the shader reads the target with an image load
++    // (the texture-barrier path), declared read-only so SPIRV-Cross makes it
++    // a texture load; the draw binds a copy of the target there
++    features.support_texture_barrier = true;
+     features.support_shader_interlock = false;
+-    features.direct_fragcolor = true;
++    features.direct_fragcolor = false;
+     // Direct3D has no 3-component 8/16-bit or scaled vertex formats: the shader converts
+     features.support_rgb_attributes = false;
+     features.support_scaled_attribute_formats = false;
