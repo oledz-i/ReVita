@@ -1,0 +1,246 @@
+diff --git a/vita3k/display/src/display.cpp b/vita3k/display/src/display.cpp
+index 5bce53d..ea366db 100644
+--- a/vita3k/display/src/display.cpp
++++ b/vita3k/display/src/display.cpp
+@@ -129,9 +129,10 @@ void libretro_vblank_tick(EmuEnvState &emuenv) {
+         ++display.vblank_count;
+ 
+         if (emuenv.kernel.is_threads_paused() || (emuenv.common_dialog.status == SCE_COMMON_DIALOG_STATUS_RUNNING))
+-            if (display.vblank_count % 2 == 0)
++            if (display.vblank_count % 2 == 0) {
+                 emuenv.renderer->should_display = true;
+                 emuenv.renderer->command_buffer_queue.wake();
++            }
+     }
+ 
+     touch_vsync_update(emuenv);
+diff --git a/vita3k/renderer/include/renderer/vulkan/surface_cache.h b/vita3k/renderer/include/renderer/vulkan/surface_cache.h
+index 67fdc87..59c728d 100644
+--- a/vita3k/renderer/include/renderer/vulkan/surface_cache.h
++++ b/vita3k/renderer/include/renderer/vulkan/surface_cache.h
+@@ -114,9 +114,6 @@ struct ColorSurfaceCacheInfo : public SurfaceCacheInfo {
+     bool need_buffer_sync = false;
+ 
+     std::shared_ptr<bool> dirty = std::make_shared<bool>(false);
+-    // its memory protection was lifted (by any access in the protected region it shares): protect it
+-    // again the next time it is drawn to
+-    std::shared_ptr<bool> unprotected = std::make_shared<bool>(false);
+ 
+     ColorSurfaceCacheInfo() = default;
+     ~ColorSurfaceCacheInfo();
+diff --git a/vita3k/renderer/src/d3d12/draw.cpp b/vita3k/renderer/src/d3d12/draw.cpp
+index bec8de0..752c0a5 100644
+--- a/vita3k/renderer/src/d3d12/draw.cpp
++++ b/vita3k/renderer/src/d3d12/draw.cpp
+@@ -55,6 +55,7 @@
+ #include <xxhash.h>
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstring>
+ #include <unordered_map>
+ #include <vector>
+@@ -63,6 +64,15 @@ using Microsoft::WRL::ComPtr;
+ 
+ namespace renderer::d3d12 {
+ 
++// Breadcrumbs: the first steps of the draw path are logged one by one (with the thread), so a crash
++// inside the driver can be placed at the call that caused it. The console gives no debug layer
++static std::atomic<int> g_steps_left{ 80 };
++#define D3D12_STEP(...)                                                                                       \
++    do {                                                                                                      \
++        if (g_steps_left.load(std::memory_order_relaxed) > 0 && g_steps_left.fetch_sub(1) > 0)                 \
++            LOG_INFO("D3D12 step [thread {}]: {}", GetCurrentThreadId(), fmt::format(__VA_ARGS__));           \
++    } while (0)
++
+ namespace {
+ 
+ constexpr uint32_t kMaxTargets = 48;
+@@ -452,6 +462,7 @@ struct Drawer {
+     bool ensure_list() {
+         if (open)
+             return true;
++        D3D12_STEP("open a command list (allocator {})", list_index);
+         ListSlot &slot = lists[list_index];
+         wait(slot.done);
+         if (FAILED(slot.allocator->Reset()))
+@@ -471,6 +482,7 @@ struct Drawer {
+     void submit() {
+         if (!open)
+             return;
++        D3D12_STEP("submit a command list (fence {})", fence_value + 1);
+         open = false;
+         if (FAILED(list->Close())) {
+             LOG_ERROR("Direct3D 12: a command list did not close; its draws are lost");
+@@ -696,6 +708,7 @@ bool Drawer::init(ID3D12Device *dev, ID3D12CommandQueue *q) {
+ }
+ 
+ Drawer::Target *Drawer::get_target(uint32_t address, uint32_t width, uint32_t height) {
++    D3D12_STEP("render target 0x{:08X} {}x{}", address, width, height);
+     if (!address || width == 0 || height == 0 || width > 4096 || height > 4096)
+         return nullptr;
+     auto it = targets.find(address);
+@@ -802,6 +815,7 @@ void D3D12TextureCache::select(size_t index, const SceGxmTexture &texture) {
+ }
+ 
+ void D3D12TextureCache::configure_texture(const SceGxmTexture &gxm_texture) {
++    D3D12_STEP("configure texture slot {}", current_slot);
+     if (!drawer || !drawer->current_texture)
+         return;
+     Drawer &d = *drawer;
+@@ -928,6 +942,8 @@ void D3D12TextureCache::upload_texture_impl(SceGxmTextureBaseFormat base_format,
+     }
+ 
+     const uint32_t pitch = align(row_bytes, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
++    D3D12_STEP("upload texture slot {} mip {} face {}: {}x{} format {} ({} rows of {} bytes, pitch {})", current_slot, mip_index, face, width, height,
++        static_cast<int>(slot.format), rows, row_bytes, pitch);
+     D3D12_GPU_VIRTUAL_ADDRESS gpu;
+     uint8_t *dst = d.allocate(static_cast<uint64_t>(pitch) * rows, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, gpu);
+     if (!dst)
+@@ -1309,6 +1325,19 @@ void draw(D3D12State &state, renderer::Context &ctx, SceGxmPrimitiveType type, S
+         desc.DepthStencilState.DepthEnable = TRUE;
+         desc.DepthStencilState.DepthWriteMask = key.depth_write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+         desc.DepthStencilState.DepthFunc = depth_func(context.record.front_depth_func);
++        // stencil is off, but its fields still hold valid values: without a debug layer the console's
++        // driver gets the description as is
++        desc.DepthStencilState.StencilEnable = FALSE;
++        desc.DepthStencilState.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
++        desc.DepthStencilState.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
++        for (D3D12_DEPTH_STENCILOP_DESC *face : { &desc.DepthStencilState.FrontFace, &desc.DepthStencilState.BackFace }) {
++            face->StencilFailOp = face->StencilDepthFailOp = face->StencilPassOp = D3D12_STENCIL_OP_KEEP;
++            face->StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
++        }
++        desc.RasterizerState.DepthBias = D3D12_DEFAULT_DEPTH_BIAS;
++        desc.RasterizerState.DepthBiasClamp = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
++        desc.RasterizerState.SlopeScaledDepthBias = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
++        desc.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
+         desc.InputLayout = { elements.data(), static_cast<UINT>(elements.size()) };
+         desc.PrimitiveTopologyType = topology_type;
+         desc.NumRenderTargets = 1;
+@@ -1316,6 +1345,7 @@ void draw(D3D12State &state, renderer::Context &ctx, SceGxmPrimitiveType type, S
+         desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+         desc.SampleDesc.Count = 1;
+         ComPtr<ID3D12PipelineState> created;
++        D3D12_STEP("create pipeline: {} input elements, topology {}, ps {}, blend {}", elements.size(), static_cast<int>(topology_type), ps ? "yes" : "no", key.has_blend);
+         if (FAILED(d.device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&created)))) {
+             LOG_ERROR("Direct3D 12: pipeline for vertex {} not made (fragment {}); its draws are skipped",
+                 hex_string(vertex_hash).substr(0, 16), hex_string(fragment_program->renderer_data->hash).substr(0, 16));
+@@ -1463,6 +1493,7 @@ void draw(D3D12State &state, renderer::Context &ctx, SceGxmPrimitiveType type, S
+     }
+ 
+     // record
++    D3D12_STEP("record draw: {} indices, {} instances, {} streams, views at {}, samplers {}/{}", count, instance_count, stream_count, first_view, vertex_samplers, fragment_samplers);
+     if (!d.ensure_list())
+         return;
+     ID3D12GraphicsCommandList *list = d.list.Get();
+@@ -1546,6 +1577,7 @@ void draw(D3D12State &state, renderer::Context &ctx, SceGxmPrimitiveType type, S
+     if (stream_count)
+         list->IASetVertexBuffers(0, stream_count, streams);
+     list->DrawIndexedInstanced(count, instance_count, 0, 0, 0);
++    D3D12_STEP("draw recorded");
+ 
+     target.last_draw = d.presents;
+     target.fetch_stale = true;
+diff --git a/vita3k/renderer/src/d3d12/state.cpp b/vita3k/renderer/src/d3d12/state.cpp
+index 4215d93..59d505c 100644
+--- a/vita3k/renderer/src/d3d12/state.cpp
++++ b/vita3k/renderer/src/d3d12/state.cpp
+@@ -288,6 +288,11 @@ bool D3D12State::present_display(uint32_t base, const void *pixels, uint32_t pit
+ 
+ bool D3D12State::present_from_texture(ID3D12Resource *src, uint32_t src_state, uint32_t width, uint32_t height) {
+     Impl &d = *impl;
++    static int present_logs = 0;
++    if (present_logs < 4) {
++        present_logs++;
++        LOG_INFO("D3D12 step [thread {}]: present a drawn frame {}x{} from state {}", GetCurrentThreadId(), width, height, src_state);
++    }
+     if (!d.device || !src || width == 0 || height == 0)
+         return false;
+     Impl::Slot &slot = d.slots[d.next];
+diff --git a/vita3k/renderer/src/vulkan/surface_cache.cpp b/vita3k/renderer/src/vulkan/surface_cache.cpp
+index f1b2baa..1c76d94 100644
+--- a/vita3k/renderer/src/vulkan/surface_cache.cpp
++++ b/vita3k/renderer/src/vulkan/surface_cache.cpp
+@@ -153,23 +153,13 @@ static void protect_surface(MemState &mem, ColorSurfaceCacheInfo &info) {
+     std::shared_ptr<bool> need_sync = trap_reads ? info.need_surface_sync : nullptr;
+     // Don't track dirty for small surfaces to avoid false positives from unrelated writes
+     std::shared_ptr<bool> dirty = small_surface ? nullptr : info.dirty;
+-    std::shared_ptr<bool> unprotected = info.unprotected;
+-
+-    // Protected regions sharing a host page (16 KiB on iOS) are merged, and a fault in any of them
+-    // calls every callback of the merged region. Only a write inside this surface means the game
+-    // changed it: counting writes to its neighbours (other surfaces, textures, data around it) marked
+-    // Madden NFL 13's stadium screen as changed all the time, so it was read from memory instead of
+-    // from the GPU and stayed black. Any fault still lifts the protection, so the surface is
+-    // protected again the next time it is drawn to.
+-    const Address surface_begin = info.data.address();
+-    const Address surface_end = surface_begin + info.total_bytes;
++
+     add_protect(mem, addr_start, addr_end - addr_start, perm,
+-        [dirty, need_sync, unprotected, surface_begin, surface_end](Address addr, bool write) {
+-            if (write && dirty && addr >= surface_begin && addr < surface_end)
++        [dirty, need_sync](Address, bool write) {
++            if (write && dirty)
+                 *dirty = true;
+             if (need_sync)
+                 *need_sync = true;
+-            *unprotected = true;
+             return true;
+         });
+ }
+@@ -373,10 +363,9 @@ SurfaceRetrieveResult VKSurfaceCache::retrieve_color_surface_for_framebuffer(Mem
+         } else {
+             color_surface_queue.set_as_mru(&info);
+ 
+-            if (info.data && (*info.dirty || *info.unprotected))
++            if (info.data && *info.dirty)
+                 protect_surface(mem, info);
+             *info.dirty = false;
+-            *info.unprotected = false;
+ 
+             last_written_surface = &info;
+ 
+@@ -471,7 +460,6 @@ SurfaceRetrieveResult VKSurfaceCache::retrieve_color_surface_for_framebuffer(Mem
+     info_added.need_surface_sync.reset();
+     info_added.need_surface_sync = std::make_shared<bool>(false);
+     info_added.dirty = std::make_shared<bool>(false);
+-    info_added.unprotected = std::make_shared<bool>(false);
+ 
+     // we only support surface sync of linear surfaces for now
+     if (!can_mprotect_mapped_memory) {
+@@ -1427,6 +1415,17 @@ ColorSurfaceCacheInfo *VKSurfaceCache::perform_surface_sync() {
+     if (last_written_surface == nullptr || !*last_written_surface->need_surface_sync)
+         return nullptr;
+ 
++    // The game wrote to this surface's memory itself since it was bound: it holds the game's own data
++    // now (memory handed to something else), and copying the picture back would overwrite it. Kept on
++    // Xbox (Hinoki dropped it for Madden's stadium screen): each surface sync makes the CPU wait for
++    // the GPU here, and syncing every such surface took Gravity Rush to about 1 fps
++    if (last_written_surface->dirty && *last_written_surface->dirty) {
++        LOG_INFO_ONCE("Surface sync skipped for a surface the game wrote to itself (its memory holds other data now)");
++        *last_written_surface->need_surface_sync = false;
++        last_written_surface = nullptr;
++        return nullptr;
++    }
++
+     VKContext *context = reinterpret_cast<VKContext *>(state.context);
+     vk::CommandBuffer cmd_buffer = context->render_cmd;
+ 
+diff --git a/vita3k/renderer/src/vulkan/texture.cpp b/vita3k/renderer/src/vulkan/texture.cpp
+index 46671d8..0fd6bdb 100644
+--- a/vita3k/renderer/src/vulkan/texture.cpp
++++ b/vita3k/renderer/src/vulkan/texture.cpp
+@@ -73,9 +73,10 @@ VKTextureCache::VKTextureCache(VKState &state)
+     memory_budget = std::clamp<uint64_t>(ram / 6, 512ull << 20, 1536ull << 20);
+     LOG_INFO("Texture cache: up to {} MiB of graphics memory", memory_budget >> 20);
+ #elif defined(VITA3K_UWP)
+-    // Xbox (ReVita): the app keeps to about 5 GB in all; textures get 1 GiB of it. Games that pack their
+-    // textures compressed on the Vita take many times the room here once decoded
+-    memory_budget = 1024ull << 20;
++    // Xbox (ReVita): the app keeps to about 5 GB in all; textures get 640 MiB of it (Gravity Rush sat
++    // at 3.6 GB). Games that pack their textures compressed on the Vita take many times the room here
++    // once decoded
++    memory_budget = 640ull << 20;
+     LOG_INFO("Texture cache: up to {} MiB of graphics memory", memory_budget >> 20);
+ #endif
+ }
