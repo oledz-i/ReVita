@@ -4895,11 +4895,37 @@ const TitleOverride kTitleOverrides[] = {
     // always gets the pair.
     { L"PCSE00261", "vita3k_backend_renderer", "OpenGL", nullptr, true },
     { L"PCSE00261", "vita3k_surface_sync", "enabled", nullptr, true },
+    // The same for its European release, and for Danganronpa V3: Killing
+    // Harmony (same engine; compatibility#2810: "you cannot select any items
+    // with X", stuck in the prologue). The cursor highlights things, but the
+    // game finds what it points at by reading back a picture it drew, which
+    // needs surface sync. All regions and the demos.
+    { L"PCSB00346", "vita3k_backend_renderer", "OpenGL", nullptr, true },
+    { L"PCSB00346", "vita3k_surface_sync", "enabled", nullptr, true },
+    { L"PCSE01100", "vita3k_backend_renderer", "OpenGL", nullptr, true },
+    { L"PCSE01100", "vita3k_surface_sync", "enabled", nullptr, true },
+    { L"PCSB01127", "vita3k_backend_renderer", "OpenGL", nullptr, true },
+    { L"PCSB01127", "vita3k_surface_sync", "enabled", nullptr, true },
+    { L"PCSG00936", "vita3k_backend_renderer", "OpenGL", nullptr, true },
+    { L"PCSG00936", "vita3k_surface_sync", "enabled", nullptr, true },
+    { L"PCSH10051", "vita3k_backend_renderer", "OpenGL", nullptr, true },
+    { L"PCSH10051", "vita3k_surface_sync", "enabled", nullptr, true },
+    { L"PCSE01105", "vita3k_backend_renderer", "OpenGL", nullptr, true },
+    { L"PCSE01105", "vita3k_surface_sync", "enabled", nullptr, true },
+    { L"PCSB01130", "vita3k_backend_renderer", "OpenGL", nullptr, true },
+    { L"PCSB01130", "vita3k_surface_sync", "enabled", nullptr, true },
+    { L"PCSH10052", "vita3k_backend_renderer", "OpenGL", nullptr, true },
+    { L"PCSH10052", "vita3k_surface_sync", "enabled", nullptr, true },
     // Gravity Rush: its bloom reads the game's own picture back; without
     // surface sync it comes out over-bright (Vita3K/compatibility#177, the
     // fix the iOS build ships). On even with OpenGL, unless the player chose.
     { L"PCSA00011", "vita3k_surface_sync", "enabled", nullptr, false },
     { L"PCSF00024", "vita3k_surface_sync", "enabled", nullptr, false },
+    // Madden NFL 13: the sky, the crowd, the sideline players and the stadium
+    // screens are pictures the game draws and reads back; without surface sync
+    // they come out blue, empty or black (what the iOS build found). Surface
+    // sync here copies through a host buffer, which never writes past a surface.
+    { L"PCSE00084", "vita3k_surface_sync", "enabled", nullptr, false },
     // Minecraft: with surface sync the picture stays black on Vulkan (build
     // 107 log: every presented frame empty while the game ran at 35 fps).
     { L"PCSE00491", "vita3k_surface_sync", "disabled", nullptr, false },

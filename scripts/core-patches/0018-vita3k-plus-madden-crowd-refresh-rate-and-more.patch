@@ -1,0 +1,530 @@
+diff --git a/vita3k/codec/src/atrac9.cpp b/vita3k/codec/src/atrac9.cpp
+index cea885a..8313512 100644
+--- a/vita3k/codec/src/atrac9.cpp
++++ b/vita3k/codec/src/atrac9.cpp
+@@ -91,10 +91,19 @@ bool Atrac9DecoderState::send(const uint8_t *data, uint32_t size) {
+ 
+     int decode_used = 0;
+ 
+-    const int res = Atrac9Decode(decoder_handle, data, reinterpret_cast<short *>(result.data()), &decode_used);
++    int res = Atrac9Decode(decoder_handle, data, reinterpret_cast<short *>(result.data()), &decode_used);
+     if (res != At9Status::ERR_SUCCESS) {
+-        LOG_ERROR("Decode failure with code {}", log_hex(res));
+-        return false;
++        // LibAtrac9 only advances its position inside the superframe on success, so after one bad frame
++        // (seek, skipped data, a movie starting mid-superframe) every later frame fails as well.
++        // Go back to the start of a superframe and try this data once more so the stream can recover.
++        flush();
++        decode_used = 0;
++        res = Atrac9Decode(decoder_handle, data, reinterpret_cast<short *>(result.data()), &decode_used);
++        if (res != At9Status::ERR_SUCCESS) {
++            flush();
++            LOG_WARN_ONCE("ATRAC9 decode failure with code {}: resyncing to the next superframe", log_hex(res));
++            return false;
++        }
+     }
+ 
+     es_size_used = static_cast<uint32_t>(decode_used);
+diff --git a/vita3k/dialog/include/dialog/state.h b/vita3k/dialog/include/dialog/state.h
+index 07bd22d..e96655a 100644
+--- a/vita3k/dialog/include/dialog/state.h
++++ b/vita3k/dialog/include/dialog/state.h
+@@ -94,6 +94,8 @@ struct SavedataState {
+     std::string list_title;
+     uint32_t selected_save = 0;
+     bool draw_info_window = false;
++    bool finishing = false;
++    uint64_t finish_tick = 0;
+ };
+ 
+ struct NetcheckState {
+diff --git a/vita3k/display/src/display.cpp b/vita3k/display/src/display.cpp
+index ab816be..5bce53d 100644
+--- a/vita3k/display/src/display.cpp
++++ b/vita3k/display/src/display.cpp
+@@ -31,8 +31,9 @@
+ 
+ // Code heavily influenced by PPSSSPP's SceDisplay.cpp
+ 
+-static constexpr int TARGET_FPS = 60;
+-static constexpr int64_t TARGET_MICRO_PER_FRAME = 1000000LL / TARGET_FPS;
++// The Vita's real refresh period (59.94 Hz), not 60 Hz: a 60 Hz vblank slowly drifts from games'
++// video timing (Danganronpa videos flashed). From Vita3K-Plus (nckstwrt)
++static constexpr int64_t VBLANK_PERIOD_NS = 16'683'333;
+ // how many cycles do we need to see before we start predicting the next frame
+ static constexpr int predict_threshold = 3;
+ static constexpr int max_expected_swapchain_size = 6;
+@@ -100,9 +101,9 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
+                 return waiter.entry.target_vcount <= display.vblank_count;
+             });
+         }
+-        const auto time_ms = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+-        const auto time_left = TARGET_MICRO_PER_FRAME - (time_ms % TARGET_MICRO_PER_FRAME);
+-        std::this_thread::sleep_for(std::chrono::microseconds(time_left));
++        const auto time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
++        const auto time_left = VBLANK_PERIOD_NS - (time_ns % VBLANK_PERIOD_NS);
++        std::this_thread::sleep_for(std::chrono::nanoseconds(time_left));
+     }
+ }
+ 
+diff --git a/vita3k/gxm/src/textures.cpp b/vita3k/gxm/src/textures.cpp
+index 419c360..1bbecfc 100644
+--- a/vita3k/gxm/src/textures.cpp
++++ b/vita3k/gxm/src/textures.cpp
+@@ -18,6 +18,7 @@
+ #include <gxm/types.h>
+ #include <util/align.h>
+ 
++#include <algorithm>
+ #include <bit>
+ #include <cassert>
+ #include <map>
+diff --git a/vita3k/io/include/io/state.h b/vita3k/io/include/io/state.h
+index 4799028..2c671f8 100644
+--- a/vita3k/io/include/io/state.h
++++ b/vita3k/io/include/io/state.h
+@@ -135,6 +135,7 @@ struct IOState {
+     DirEntries dir_entries;
+ 
+     std::unordered_map<std::string, std::string> cachemap;
++    std::mutex cachemap_mutex;
+     bool case_isens_find_enabled = false;
+ 
+     std::mutex overlay_mutex;
+diff --git a/vita3k/io/src/io.cpp b/vita3k/io/src/io.cpp
+index 8a2c00e..c663dc7 100644
+--- a/vita3k/io/src/io.cpp
++++ b/vita3k/io/src/io.cpp
+@@ -41,6 +41,7 @@
+ #include <iostream>
+ #include <iterator>
+ #include <string>
++#include <vector>
+ 
+ #if defined(__aarch64__) && defined(__APPLE__)
+ #define stat64 stat
+@@ -161,7 +162,10 @@ void io_deinit(IOState &io) {
+     io.title_id.clear();
+     io.app_path.clear();
+ 
+-    io.cachemap.clear();
++    {
++        const std::lock_guard<std::mutex> lock(io.cachemap_mutex);
++        io.cachemap.clear();
++    }
+ 
+     {
+         std::lock_guard<std::mutex> lock(io.overlay_mutex);
+@@ -218,14 +222,20 @@ bool find_case_isens_path(IOState &io, VitaIoDevice &device, const fs::path &tra
+     if (!fs::exists(final_path))
+         return false;
+ 
++    // Collected first, then added under the lock (another thread may be looking a path up)
++    std::vector<std::pair<std::string, std::string>> found;
+     for (const auto &file : fs::recursive_directory_iterator(final_path)) {
+-        io.cachemap.emplace(string_utils::tolower(file.path().string()), file.path().string());
++        found.emplace_back(string_utils::tolower(file.path().string()), file.path().string());
+     }
++    const std::lock_guard<std::mutex> lock(io.cachemap_mutex);
++    for (auto &[lower, original] : found)
++        io.cachemap.emplace(std::move(lower), std::move(original));
+ 
+     return true;
+ }
+ 
+ fs::path find_in_cache(IOState &io, const std::string &system_path) {
++    const std::lock_guard<std::mutex> lock(io.cachemap_mutex);
+     const auto find_path = io.cachemap.find(system_path);
+ 
+     if (find_path != io.cachemap.end()) {
+diff --git a/vita3k/kernel/src/thread.cpp b/vita3k/kernel/src/thread.cpp
+index d6d616f..b795932 100644
+--- a/vita3k/kernel/src/thread.cpp
++++ b/vita3k/kernel/src/thread.cpp
+@@ -87,7 +87,7 @@ ThreadState::ThreadState(SceUID id, KernelState &kernel, MemState &mem, CPUState
+         set_log_mem(*this->cpu, true);
+     }
+ 
+-    memset(stack.get_ptr<void>().get(mem), 0xcc, this->stack_size);
++    memset(stack.get_ptr<void>().get(mem), 0xff, this->stack_size);
+ 
+     const size_t tls_size = KERNEL_TLS_SIZE + kernel.tls_msize;
+     const Ptr<uint8_t> base_tls_ptr = tls.get_ptr<uint8_t>();
+diff --git a/vita3k/modules/SceAppUtil/SceAppUtil.cpp b/vita3k/modules/SceAppUtil/SceAppUtil.cpp
+index 347d643..0d1c4ec 100644
+--- a/vita3k/modules/SceAppUtil/SceAppUtil.cpp
++++ b/vita3k/modules/SceAppUtil/SceAppUtil.cpp
+@@ -253,16 +253,23 @@ EXPORT(int, sceAppUtilSaveDataDataRemove, SceAppUtilSaveDataFileSlot *slot, SceA
+ 
+     if (slot && (slot->id >= SCE_APPUTIL_SAVEDATA_SLOT_MAX))
+         return RET_ERROR(SCE_APPUTIL_ERROR_PARAMETER);
++    if (!files && fileNum)
++        return RET_ERROR(SCE_APPUTIL_ERROR_PARAMETER);
+ 
+     for (unsigned int i = 0; i < fileNum; i++) {
+-        const auto file = fs::path(construct_savedata0_path(files[i].dataPath.get(emuenv.mem)));
++        const char *const data_path = files[i].dataPath.get(emuenv.mem);
++        if (!data_path) {
++            LOG_WARN("{}: file entry {} of {} has no path, skipping it", export_name, i, fileNum);
++            continue;
++        }
++        const auto file = fs::path(construct_savedata0_path(data_path));
+         if (fs::is_regular_file(file)) {
+             remove_file(emuenv.io, file.string().c_str(), emuenv.vita_fs_path, export_name);
+         } else
+             remove_dir(emuenv.io, file.string().c_str(), emuenv.vita_fs_path, export_name);
+     }
+ 
+-    if (slot && files[0].mode == SCE_APPUTIL_SAVEDATA_DATA_REMOVE_MODE_DEFAULT) {
++    if (slot && files && files[0].mode == SCE_APPUTIL_SAVEDATA_DATA_REMOVE_MODE_DEFAULT) {
+         remove_file(emuenv.io, construct_slotparam_path(slot->id).c_str(), emuenv.vita_fs_path, export_name);
+     }
+ 
+diff --git a/vita3k/modules/SceCommonDialog/SceCommonDialog.cpp b/vita3k/modules/SceCommonDialog/SceCommonDialog.cpp
+index fb26732..9d491f0 100644
+--- a/vita3k/modules/SceCommonDialog/SceCommonDialog.cpp
++++ b/vita3k/modules/SceCommonDialog/SceCommonDialog.cpp
+@@ -911,6 +911,18 @@ EXPORT(int, sceRemoteOSKDialogTerm) {
+     return UNIMPLEMENTED();
+ }
+ 
++static constexpr uint64_t SAVEDATA_DIALOG_CLOSE_MS = 150;
++
++// the dialog closes before the status reports FINISHED so a Term straight after Finish fails as on the console
++static void complete_savedata_close(EmuEnvState &emuenv) {
++    std::lock_guard<std::recursive_mutex> lock(emuenv.common_dialog.mutex);
++    auto &savedata = emuenv.common_dialog.savedata;
++    if (savedata.finishing && SDL_GetTicks() >= savedata.finish_tick) {
++        savedata.finishing = false;
++        emuenv.common_dialog.status = SCE_COMMON_DIALOG_STATUS_FINISHED;
++    }
++}
++
+ EXPORT(int, sceSaveDataDialogAbort) {
+     TRACY_FUNC(sceSaveDataDialogAbort);
+     if (emuenv.common_dialog.type != SAVEDATA_DIALOG) {
+@@ -918,6 +930,7 @@ EXPORT(int, sceSaveDataDialogAbort) {
+     }
+ 
+     std::lock_guard<std::recursive_mutex> lock(emuenv.common_dialog.mutex);
++    emuenv.common_dialog.savedata.finishing = false;
+     emuenv.common_dialog.savedata.bar_percent = 0;
+     emuenv.common_dialog.status = SCE_COMMON_DIALOG_STATUS_FINISHED;
+     emuenv.common_dialog.savedata.button_id = SCE_SAVEDATA_DIALOG_BUTTON_ID_INVALID;
+@@ -1289,12 +1302,14 @@ EXPORT(int, sceSaveDataDialogFinish, const SceSaveDataDialogFinishParam *finishP
+     std::lock_guard<std::recursive_mutex> lock(emuenv.common_dialog.mutex);
+     emuenv.common_dialog.savedata.bar_percent = 0;
+     emuenv.common_dialog.substatus = SCE_COMMON_DIALOG_STATUS_RUNNING;
+-    emuenv.common_dialog.status = SCE_COMMON_DIALOG_STATUS_FINISHED;
++    emuenv.common_dialog.savedata.finishing = true;
++    emuenv.common_dialog.savedata.finish_tick = SDL_GetTicks() + SAVEDATA_DIALOG_CLOSE_MS;
+     return 0;
+ }
+ 
+ EXPORT(SceInt32, sceSaveDataDialogGetResult, SceSaveDataDialogResult *result) {
+     TRACY_FUNC(sceSaveDataDialogGetResult, result);
++    complete_savedata_close(emuenv);
+     if (emuenv.common_dialog.type != SAVEDATA_DIALOG)
+         return RET_ERROR(SCE_COMMON_DIALOG_ERROR_NOT_FINISHED);
+ 
+@@ -1333,6 +1348,7 @@ EXPORT(SceInt32, sceSaveDataDialogGetResult, SceSaveDataDialogResult *result) {
+ 
+ EXPORT(int, sceSaveDataDialogGetStatus) {
+     TRACY_FUNC(sceSaveDataDialogGetStatus);
++    complete_savedata_close(emuenv);
+     if ((emuenv.common_dialog.type != SAVEDATA_DIALOG) || ((emuenv.common_dialog.status != SCE_COMMON_DIALOG_STATUS_RUNNING) && (emuenv.common_dialog.substatus != SCE_COMMON_DIALOG_STATUS_RUNNING)))
+         return SCE_COMMON_DIALOG_STATUS_NONE;
+ 
+@@ -1341,6 +1357,7 @@ EXPORT(int, sceSaveDataDialogGetStatus) {
+ 
+ EXPORT(int, sceSaveDataDialogGetSubStatus) {
+     TRACY_FUNC(sceSaveDataDialogGetSubStatus);
++    complete_savedata_close(emuenv);
+     if (emuenv.common_dialog.type != SAVEDATA_DIALOG || emuenv.common_dialog.status != SCE_COMMON_DIALOG_STATUS_RUNNING) {
+         return SCE_COMMON_DIALOG_STATUS_NONE;
+     }
+@@ -1557,6 +1574,7 @@ EXPORT(int, sceSaveDataDialogSubClose) {
+ 
+ EXPORT(int, sceSaveDataDialogTerm) {
+     TRACY_FUNC(sceSaveDataDialogTerm);
++    complete_savedata_close(emuenv);
+     if (emuenv.common_dialog.type != SAVEDATA_DIALOG) {
+         return RET_ERROR(SCE_COMMON_DIALOG_ERROR_NOT_IN_USE);
+     }
+diff --git a/vita3k/modules/SceFiber/SceFiber.cpp b/vita3k/modules/SceFiber/SceFiber.cpp
+index 23d51ef..b2159ce 100644
+--- a/vita3k/modules/SceFiber/SceFiber.cpp
++++ b/vita3k/modules/SceFiber/SceFiber.cpp
+@@ -28,6 +28,7 @@
+ TRACY_MODULE_NAME(SceFiber);
+ 
+ #define SCE_FIBER_CONTEXT_MINIMUM_SIZE 512
++#define SCE_FIBER_CONTEXT_GUARD 0xEEEEEEEE
+ 
+ enum SceFiberErrorCode : uint32_t {
+     SCE_FIBER_OK = 0x00000000, //!< Success
+@@ -145,7 +146,7 @@ static void initialize_fiber(EmuEnvState &emuenv, const ThreadStatePtr &thread,
+     *fiber->cpu = save_context(*thread->cpu);
+ 
+     if (addrContext && sizeContext > 0) {
+-        memset(addrContext.get(emuenv.mem), 0xCC, sizeContext);
++        *addrContext.cast<uint32_t>().get(emuenv.mem) = SCE_FIBER_CONTEXT_GUARD;
+         fiber->cpu->set_sp(addrContext.address() + sizeContext);
+     }
+     fiber->cpu->set_lr(0xDEADBEAF);
+@@ -167,6 +168,7 @@ EXPORT(int, _sceFiberAttachContextAndRun, SceFiber *fiber, Address addrContext,
+     fiber->addrContext = addrContext;
+     fiber->sizeContext = sizeContext;
+     if (addrContext && sizeContext > 0) {
++        *Ptr<uint32_t>(addrContext).get(emuenv.mem) = SCE_FIBER_CONTEXT_GUARD;
+         fiber->cpu->set_sp(addrContext + sizeContext);
+     }
+ 
+@@ -196,6 +198,7 @@ EXPORT(int, _sceFiberAttachContextAndSwitch, SceFiber *fiber, Address addrContex
+     fiber->addrContext = addrContext;
+     fiber->sizeContext = sizeContext;
+     if (addrContext && sizeContext > 0) {
++        *Ptr<uint32_t>(addrContext).get(emuenv.mem) = SCE_FIBER_CONTEXT_GUARD;
+         fiber->cpu->set_sp(addrContext + sizeContext);
+     }
+ 
+diff --git a/vita3k/renderer/src/vulkan/texture.cpp b/vita3k/renderer/src/vulkan/texture.cpp
+index f607a44..46671d8 100644
+--- a/vita3k/renderer/src/vulkan/texture.cpp
++++ b/vita3k/renderer/src/vulkan/texture.cpp
+@@ -135,13 +135,17 @@ void sync_texture(VKContext &context, MemState &mem, std::size_t index, SceGxmTe
+ 
+     TextureViewport texture_viewport{};
+ 
+-    if (renderer::texture::convert_base_texture_format_to_base_color_format(base_format, format_target_of_texture)) {
++    // Surface cache views are always 2D: a cube texture must skip it, or the shader samples a cube sampler
++    // through a 2D view (Dead or Alive 5 Plus). From Vita3K-Plus (nckstwrt)
++    const bool texture_is_cube = texture.texture_type() == SCE_GXM_TEXTURE_CUBE || texture.texture_type() == SCE_GXM_TEXTURE_CUBE_ARBITRARY;
++
++    if (!texture_is_cube && renderer::texture::convert_base_texture_format_to_base_color_format(base_format, format_target_of_texture)) {
+         // try to retrieve it from the color surface cache
+         lookup_result = context.state.surface_cache.retrieve_color_surface_as_texture(texture, format_target_of_texture, &texture_viewport);
+     }
+ 
+     bool is_depth_surface = false;
+-    if (!lookup_result.has_value() && is_depth_stencil_compatible_format(base_format, is_depth_surface)) {
++    if (!lookup_result.has_value() && !texture_is_cube && is_depth_stencil_compatible_format(base_format, is_depth_surface)) {
+         // Try to retrieve depth/stencil cache
+         lookup_result = context.state.surface_cache.retrieve_depth_stencil_as_texture(texture, &texture_viewport);
+     }
+diff --git a/vita3k/shader/include/shader/spirv_recompiler.h b/vita3k/shader/include/shader/spirv_recompiler.h
+index 5b4cbc4..31c9237 100644
+--- a/vita3k/shader/include/shader/spirv_recompiler.h
++++ b/vita3k/shader/include/shader/spirv_recompiler.h
+@@ -36,7 +36,7 @@ static constexpr int COLOR_ATTACHMENT_RAW_TEXTURE_SLOT_IMAGE = 3;
+ // (a sampler2D, texelFetch) instead of an image; the game's use 0-31.
+ static constexpr int UWP_COLOR_ATTACHMENT_TEXTURE_UNIT = 32;
+ #endif
+-static constexpr uint32_t CURRENT_VERSION = 17;
++static constexpr uint32_t CURRENT_VERSION = 18;
+ // fragment shader using the rendering surface as a storage image (because of shader interlock) have a line
+ // layout (constant_id = GAMMA_CORRECTION_SPECIALIZATIO_ID) const bool is_srgb = false;
+ // Setting this constant to true performs gamma correction in the shader
+diff --git a/vita3k/shader/include/shader/usse_disasm.h b/vita3k/shader/include/shader/usse_disasm.h
+index 4af0f1e..6627b64 100644
+--- a/vita3k/shader/include/shader/usse_disasm.h
++++ b/vita3k/shader/include/shader/usse_disasm.h
+@@ -35,7 +35,7 @@ const std::string &opcode_str(const Opcode &e);
+ const char *e_predicate_str(ExtPredicate p);
+ const char *s_predicate_str(ShortPredicate p);
+ const char *data_type_str(DataType p);
+-std::string reg_to_str(RegisterBank bank, uint32_t reg_num);
++std::string reg_to_str(RegisterBank bank, uint32_t reg_num, uint8_t index_scale = 2);
+ std::string operand_to_str(const Operand &op, Imm4 write_mask, int32_t shift = 0);
+ template <std::size_t s>
+ std::string swizzle_to_str(Swizzle<s> swizz, const Imm4 write_mask);
+diff --git a/vita3k/shader/include/shader/usse_translator.h b/vita3k/shader/include/shader/usse_translator.h
+index 705f95e..a56b31a 100644
+--- a/vita3k/shader/include/shader/usse_translator.h
++++ b/vita3k/shader/include/shader/usse_translator.h
+@@ -164,6 +164,9 @@ private:
+         if (repeat_mode == RepeatMode::EXTERNAL) {
+             return repeat_index;
+         }
++        if (repeat_mode == RepeatMode::EXTERNAL) {
++            return repeat_index;
++        }
+         if (repeat_mode == RepeatMode::SLMSI) {
+             auto inc = repeat_increase[op.index][repeat_index];
+ 
+diff --git a/vita3k/shader/include/shader/usse_types.h b/vita3k/shader/include/shader/usse_types.h
+index 0374699..e5c18eb 100644
+--- a/vita3k/shader/include/shader/usse_types.h
++++ b/vita3k/shader/include/shader/usse_types.h
+@@ -314,6 +314,7 @@ struct Operand {
+     RegisterFlags flags{};
+     Swizzle4 swizzle = SWIZZLE_CHANNEL_4_UNDEFINED;
+     DataType type = DataType::F32;
++    uint8_t index_scale = 2;
+ 
+     int index{ 0 };
+ 
+diff --git a/vita3k/shader/src/spirv_recompiler.cpp b/vita3k/shader/src/spirv_recompiler.cpp
+index 370059e..3d3b7eb 100644
+--- a/vita3k/shader/src/spirv_recompiler.cpp
++++ b/vita3k/shader/src/spirv_recompiler.cpp
+@@ -1916,9 +1916,14 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
+                 b.addDecoration(out_var, spv::DecorationBuiltIn, spv::BuiltInPointSize);
+                 b.createStore(o_val, out_var);
+             } else if (vo == SCE_GXM_VERTEX_PROGRAM_OUTPUT_COLOR0 || vo == SCE_GXM_VERTEX_PROGRAM_OUTPUT_COLOR1) {
++                // Stored the way the Vita stores them: clamped (NaN to 0) and rounded to 8 bits per channel
++                // (No Heroes Allowed colours). From Vita3K-Plus (nckstwrt)
+                 const spv::Id zero = utils::make_uniform_vector_from_type(b, out_type, 0.0f);
+                 const spv::Id one = utils::make_uniform_vector_from_type(b, out_type, 1.0f);
+-                o_val = b.createBuiltinCall(out_type, utils.std_builtins, GLSLstd450FClamp, { o_val, zero, one });
++                const spv::Id unorm8_max = utils::make_uniform_vector_from_type(b, out_type, 255.0f);
++                o_val = b.createBuiltinCall(out_type, utils.std_builtins, GLSLstd450NClamp, { o_val, zero, one });
++                o_val = b.createBuiltinCall(out_type, utils.std_builtins, GLSLstd450RoundEven, { b.createBinOp(spv::OpFMul, out_type, o_val, unorm8_max) });
++                o_val = b.createBinOp(spv::OpFDiv, out_type, o_val, unorm8_max);
+                 b.createStore(o_val, out_var);
+             } else {
+                 b.createStore(o_val, out_var);
+diff --git a/vita3k/shader/src/translator/ialu.cpp b/vita3k/shader/src/translator/ialu.cpp
+index 3717a84..6a17c6e 100644
+--- a/vita3k/shader/src/translator/ialu.cpp
++++ b/vita3k/shader/src/translator/ialu.cpp
+@@ -70,6 +70,10 @@ bool USSETranslatorVisitor::vbw(
+     inst.opr.src2.type = type;
+     inst.opr.dest.type = type;
+ 
++    inst.opr.src1.index_scale = 1;
++    inst.opr.src2.index_scale = 1;
++    inst.opr.dest.index_scale = 1;
++
+     set_repeat_multiplier(1, 1, 1, 1);
+ 
+     BEGIN_REPEAT(repeat_count)
+@@ -245,6 +249,13 @@ bool USSETranslatorVisitor::i8mad(
+         LOG_ERROR("Custom modifiers for components not handled!");
+     }
+ 
++    inst.opr.src0.index = 0;
++    inst.opr.src1.index = 1;
++    inst.opr.src2.index = 2;
++    inst.opr.dest.index = 3;
++
++    set_repeat_multiplier(1, 1, 1, 1);
++
+     BEGIN_REPEAT(repeat_count);
+     GET_REPEAT(inst, RepeatMode::SLMSI);
+ 
+@@ -333,6 +344,8 @@ bool USSETranslatorVisitor::i8mad(
+ 
+     END_REPEAT();
+ 
++    reset_repeat_multiplier();
++
+     return true;
+ }
+ 
+@@ -407,29 +420,47 @@ bool USSETranslatorVisitor::i16mad(
+         }
+     }
+ 
++    inst.opr.src0.index = 0;
++    inst.opr.src1.index = 1;
++    inst.opr.src2.index = 2;
++    inst.opr.dest.index = 3;
++
++    set_repeat_multiplier(1, 1, 1, 1);
++
+     BEGIN_REPEAT(repeat_count);
+     GET_REPEAT(inst, RepeatMode::SLMSI);
+ 
+-    LOG_DISASM("{:016x}: {}{} {} {} {} {}", m_instr, disasm::s_predicate_str(pred), "IMAD16", disasm::operand_to_str(inst.opr.dest, 0b1),
+-        disasm::operand_to_str(inst.opr.src0, 0b1), disasm::operand_to_str(inst.opr.src1, mask_src1) + ((src1_format != 0) ? "-8bits" : ""),
+-        disasm::operand_to_str(inst.opr.src2, mask_src2) + ((src2_format != 0) ? "-8bits" : ""));
++    LOG_DISASM("{:016x}: {}{} {} {} {} {} [rpt={}]", m_instr, disasm::s_predicate_str(pred), "IMAD16", disasm::operand_to_str(inst.opr.dest, 0b1, dest_repeat_offset),
++        disasm::operand_to_str(inst.opr.src0, 0b1, src0_repeat_offset), disasm::operand_to_str(inst.opr.src1, mask_src1, src1_repeat_offset) + ((src1_format != 0) ? "-8bits" : ""),
++        std::string(src2_neg ? "-" : "") + disasm::operand_to_str(inst.opr.src2, mask_src2, src2_repeat_offset) + ((src2_format != 0) ? "-8bits" : ""), current_repeat);
+ 
+     inst.opr.src0.swizzle = SWIZZLE_CHANNEL_4_DEFAULT;
+-    spv::Id source0 = load(inst.opr.src0, 0b1, src0_repeat_offset);
+-    spv::Id source1 = load(inst.opr.src1, mask_src1, src1_repeat_offset);
+-    spv::Id source2 = load(inst.opr.src2, mask_src2, src2_repeat_offset);
+-
+-    spv::Id source0_type = m_b.getTypeId(source0);
+-
+-    auto mul_result = m_b.createBinOp(spv::OpIMul, source0_type, source0, source1);
+-    auto add_result = m_b.createBinOp(spv::OpIAdd, source0_type, mul_result, source2);
+-
+-    if (add_result != spv::NoResult) {
+-        store(inst.opr.dest, add_result, 0b1, dest_repeat_offset);
++    const auto lane_source = [&](const Operand &op, const std::uint8_t low_mask, const int repeat_offset, const int lane) {
++        if (lane == 1 && op.bank == RegisterBank::IMMEDIATE)
++            return is_signed_integer_data_type(op.type) ? m_b.makeIntConstant(0) : m_b.makeUintConstant(0);
++        const int lane_shift = (get_data_type_size(op.type) == 1) ? 2 : 1;
++        return load(op, static_cast<std::uint8_t>(low_mask << (lane_shift * lane)), repeat_offset);
++    };
++    const int lane_count = (inst.opr.dest.bank == RegisterBank::INDEX || inst.opr.dest.bank == RegisterBank::FPINTERNAL) ? 1 : 2;
++    std::vector<spv::Id> lanes;
++    for (int lane = 0; lane < lane_count; lane++) {
++        const spv::Id source0 = lane_source(inst.opr.src0, 0b1, src0_repeat_offset, lane);
++        const spv::Id source1 = lane_source(inst.opr.src1, mask_src1, src1_repeat_offset, lane);
++        const spv::Id source2 = lane_source(inst.opr.src2, mask_src2, src2_repeat_offset, lane);
++        const spv::Id source0_type = m_b.getTypeId(source0);
++        const spv::Id mul_result = m_b.createBinOp(spv::OpIMul, source0_type, source0, source1);
++        lanes.push_back(m_b.createBinOp(src2_neg ? spv::OpISub : spv::OpIAdd, source0_type, mul_result, source2));
+     }
+ 
++    if (lanes.size() == 1)
++        store(inst.opr.dest, lanes[0], 0b1, dest_repeat_offset);
++    else
++        store(inst.opr.dest, m_b.createCompositeConstruct(m_b.makeVectorType(m_b.getTypeId(lanes[0]), 2), lanes), 0b11, dest_repeat_offset);
++
+     END_REPEAT();
+ 
++    reset_repeat_multiplier();
++
+     return true;
+ }
+ 
+diff --git a/vita3k/shader/src/usse_disasm.cpp b/vita3k/shader/src/usse_disasm.cpp
+index 6e9f070..2aa3973 100644
+--- a/vita3k/shader/src/usse_disasm.cpp
++++ b/vita3k/shader/src/usse_disasm.cpp
+@@ -80,7 +80,7 @@ const char *data_type_str(DataType p) {
+     }
+ }
+ 
+-std::string reg_to_str(RegisterBank bank, uint32_t reg_num) {
++std::string reg_to_str(RegisterBank bank, uint32_t reg_num, uint8_t index_scale) {
+     std::string opstr;
+ 
+     switch (bank) {
+@@ -153,7 +153,7 @@ std::string reg_to_str(RegisterBank bank, uint32_t reg_num) {
+         }
+         }
+ 
+-        opstr += "idx" + std::to_string(static_cast<int>(bank) - static_cast<int>(RegisterBank::INDEXED1) + 1) + " * 2 + " + std::to_string(add_off) + "]";
++        opstr += "idx" + std::to_string(static_cast<int>(bank) - static_cast<int>(RegisterBank::INDEXED1) + 1) + " * " + std::to_string(index_scale) + " + " + std::to_string(add_off) + "]";
+ 
+         break;
+     }
+@@ -176,7 +176,7 @@ std::string reg_to_str(RegisterBank bank, uint32_t reg_num) {
+ }
+ 
+ std::string operand_to_str(const Operand &op, Imm4 write_mask, int32_t shift) {
+-    std::string opstr = reg_to_str(op.bank, op.num + shift);
++    std::string opstr = reg_to_str(op.bank, op.num + shift, op.index_scale);
+ 
+     if (op.flags & RegisterFlags::Negative) {
+         opstr = "-" + opstr;
+diff --git a/vita3k/shader/src/usse_utilities.cpp b/vita3k/shader/src/usse_utilities.cpp
+index 99b34bd..12caa16 100644
+--- a/vita3k/shader/src/usse_utilities.cpp
++++ b/vita3k/shader/src/usse_utilities.cpp
+@@ -1155,7 +1155,7 @@ spv::Id load(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFunc
+         // Calculate the "at" offset.
+         spv::Id idx_reg_val = b.createLoad(b.createOp(spv::OpAccessChain, b.makePointer(spv::StorageClassPrivate, type_i32), { params.indexes, b.makeIntConstant(idx_off) }), spv::NoPrecision);
+ 
+-        spv::Id real_idx = b.createBinOp(spv::OpIAdd, type_i32, b.createBinOp(spv::OpIMul, type_i32, idx_reg_val, b.makeIntConstant(2)), b.makeIntConstant(add_off));
++        spv::Id real_idx = b.createBinOp(spv::OpIAdd, type_i32, b.createBinOp(spv::OpIMul, type_i32, idx_reg_val, b.makeIntConstant(op.index_scale)), b.makeIntConstant(add_off));
+         finalize_offset = real_idx;
+ 
+         idx_in_arr_1 = b.createBinOp(spv::OpSDiv, type_i32, real_idx, b.makeIntConstant(4));
