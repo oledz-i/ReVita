@@ -40,6 +40,17 @@ def apply(patch, required):
 for patch in sorted(patch_dir.glob('*.patch')):
     apply(patch, True)
 
+# Required patches that change translated shaders raise the shader cache
+# version here rather than in the patch (the number in the source differs from
+# build to build): 0018 (Vita3K-Plus vertex colours and VBW indexing)
+SHADER_TRANSLATION_CHANGES = 1
+_header = source / 'vita3k/shader/include/shader/spirv_recompiler.h'
+_text = _header.read_text()
+_match = re.search(r'(CURRENT_VERSION = )(\d+)', _text)
+if _match and SHADER_TRANSLATION_CHANGES:
+    _header.write_text(_text[:_match.start(2)] + str(int(_match.group(2)) + SHADER_TRANSLATION_CHANGES) + _text[_match.end(2):])
+    print(f'Shader cache version raised to {int(_match.group(2)) + SHADER_TRANSLATION_CHANGES} for the required patches')
+
 # Optional fixes ported from Vita3K-Plus: each is its own patch and one that
 # does not apply is skipped, so a source that moved on never blocks a build.
 applied_optional = 0
