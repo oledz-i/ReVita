@@ -113,6 +113,12 @@ void __cdecl DriverLog(int level, const char* message) {
 
 bool GlHost::Load(std::string& error) {
     if (module_) return true;
+    // Mesa's threaded OpenGL (glthread): the emulator's thousands of GL calls a
+    // frame are queued and run on a driver thread of their own, so the render
+    // thread stops paying for Mesa's work on each one. Read by Mesa when the
+    // driver loads, so set first. A performance guess: if OpenGL breaks, this
+    // is the first thing to turn off.
+    SetEnvironmentVariableW(L"mesa_glthread", L"true");
     module_ = LoadPackagedLibrary(L"onyx_gl.dll", 0);
     if (!module_) {
         error = "onyx_gl.dll (OpenGL on D3D12) is not in this build (error " + std::to_string(GetLastError()) + ")";

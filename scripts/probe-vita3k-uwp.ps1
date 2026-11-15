@@ -86,7 +86,9 @@ $cmdArgs = @(
   "-DCMAKE_TOOLCHAIN_FILE=$vcpkg",
   "-DVCPKG_TARGET_TRIPLET=x64-uwp",
   "-DVCPKG_INSTALL_OPTIONS=--allow-unsupported",
-  "-DUSE_LTO=NEVER",
+  # Link-time optimisation (MSVC /GL + /LTCG): inlining across the core's
+  # libraries (renderer, kernel, HLE modules, Dynarmic). A performance guess.
+  "-DUSE_LTO=RELEASE_ONLY",
   "-DDYNARMIC_ENABLE_NO_EXECUTE_SUPPORT=ON",
   "-DDYNARMIC_WARNINGS_AS_ERRORS=OFF",
   "-DVITA3K_FORCE_SYSTEM_BOOST=ON"

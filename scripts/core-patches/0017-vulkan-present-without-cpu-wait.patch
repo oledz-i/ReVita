@@ -1,0 +1,72 @@
+diff --git a/vita3k/libretro/libretro_vita3k.cpp b/vita3k/libretro/libretro_vita3k.cpp
+index f9f01ee..8ce22ed 100644
+--- a/vita3k/libretro/libretro_vita3k.cpp
++++ b/vita3k/libretro/libretro_vita3k.cpp
+@@ -1472,6 +1472,10 @@ static struct {
+     vk::CommandPool pool;
+     vk::CommandBuffer cmd;
+     vk::Fence fence;
++    // ReVita: the copy's fence is waited for at the next present (or teardown),
++    // not right after submitting it, so the render thread goes back to the
++    // game's next frame while the GPU finishes this one
++    bool fence_pending = false;
+     // a frame in memory goes to the image through this
+     vkutil::Buffer staging;
+     int published = -1; // under rendered_frame_mutex
+@@ -1512,6 +1516,12 @@ static void libretro_copy_frame_for_presentation(renderer::vulkan::VKState &vk_s
+             .level = vk::CommandBufferLevel::ePrimary, .commandBufferCount = 1 })[0];
+         s_present.fence = vk_state.device.createFence({});
+     }
++    // the previous copy: its command buffer is recorded again below
++    if (s_present.fence_pending) {
++        (void)vk_state.device.waitForFences(s_present.fence, VK_TRUE, std::numeric_limits<uint64_t>::max());
++        vk_state.device.resetFences(s_present.fence);
++        s_present.fence_pending = false;
++    }
+ 
+     int target = 0;
+     {
+@@ -1689,15 +1699,29 @@ static void libretro_copy_frame_for_presentation(renderer::vulkan::VKState &vk_s
+         .image = image.image, .subresourceRange = range };
+     cmd.pipelineBarrier(has_overlays ? vk::PipelineStageFlagBits::eColorAttachmentOutput : vk::PipelineStageFlagBits::eTransfer,
+         vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, after);
++    // Nothing waits for this copy on the CPU any more: everything submitted after
++    // it (the game drawing into the same surface again, the frontend's readback)
++    // runs after its reads and writes. A barrier's second scope reaches later
++    // submissions on the queue
++    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer | vk::PipelineStageFlagBits::eColorAttachmentOutput,
++        vk::PipelineStageFlagBits::eAllCommands, {}, {}, {}, {});
+     cmd.end();
+ 
+     vk::SubmitInfo submit{};
+     submit.setCommandBuffers(cmd);
+     vk_state.locked_queue_submit(vk_state.general_queue, submit, s_present.fence);
+-    // the copy is done before the surface may change again, and before the
+-    // command buffer is recorded anew
+-    (void)vk_state.device.waitForFences(s_present.fence, VK_TRUE, std::numeric_limits<uint64_t>::max());
+-    vk_state.device.resetFences(s_present.fence);
++#ifdef VITA3K_UWP
++    // the probe's texels are read right below: only then is the copy waited for here
++    const bool wait_now = probed;
++#else
++    const bool wait_now = true;
++#endif
++    if (wait_now) {
++        (void)vk_state.device.waitForFences(s_present.fence, VK_TRUE, std::numeric_limits<uint64_t>::max());
++        vk_state.device.resetFences(s_present.fence);
++    } else {
++        s_present.fence_pending = true;
++    }
+ #ifdef VITA3K_UWP
+     s_present.presents++;
+     const bool changed = surface_format != s_present.last_format || w != s_present.last_w || h != s_present.last_h;
+@@ -1749,6 +1773,9 @@ static void libretro_free_presentation_images(renderer::vulkan::VKState *vk_stat
+     s_present.staging.destroy();
+     s_present.staging = vkutil::Buffer();
+     if (vk_state && s_present.pool) {
++        if (s_present.fence_pending)
++            (void)vk_state->device.waitForFences(s_present.fence, VK_TRUE, std::numeric_limits<uint64_t>::max());
++        s_present.fence_pending = false;
+         vk_state->device.destroyFence(s_present.fence);
+         vk_state->device.destroyCommandPool(s_present.pool);
+     }

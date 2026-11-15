@@ -1,0 +1,1638 @@
+diff --git a/vita3k/app/src/app.cpp b/vita3k/app/src/app.cpp
+index 37e9b67..3d13216 100644
+--- a/vita3k/app/src/app.cpp
++++ b/vita3k/app/src/app.cpp
+@@ -368,8 +368,10 @@ void request_in_process_launch(EmuEnvState &emuenv, AppLaunchRequest request) {
+         request.app_path = emuenv.io.app_path;
+ 
+     emuenv.post_app_launch_request(std::move(request));
+-    if (emuenv.renderer)
++    if (emuenv.renderer) {
+         emuenv.renderer->should_display = true;
++        emuenv.renderer->command_buffer_queue.wake();
++    }
+ }
+ 
+ } // namespace app
+diff --git a/vita3k/codec/include/codec/state.h b/vita3k/codec/include/codec/state.h
+index 0f551f2..67315a7 100644
+--- a/vita3k/codec/include/codec/state.h
++++ b/vita3k/codec/include/codec/state.h
+@@ -233,13 +233,22 @@ struct AacDecoderState : public DecoderState {
+     SwrContext *swr = nullptr;
+     AVFrame *frame;
+     uint32_t es_size_used;
++    // HE-AAC (SBR): the guest gives the core rate and gets twice that; FFmpeg may or may not detect
++    // the SBR data by itself, so its output is converted to what the guest asked for either way
++    // (Vita3K-Plus). Without this, undetected SBR played voices at double speed
++    uint32_t output_sample_rate = 0;
++    uint32_t output_channels = 0;
++    bool is_sbr = false;
++    int configured_input_sample_rate = 0;
++    int configured_input_channels = 0;
++    int configured_input_format = -1;
+     uint32_t get(DecoderQuery query) override;
+ 
+     bool send(const uint8_t *data, uint32_t size) override;
+     bool receive(uint8_t *data, DecoderSize *size) override;
+     uint32_t get_es_size() override;
+ 
+-    explicit AacDecoderState(uint32_t sample_rate, uint32_t channels);
++    explicit AacDecoderState(uint32_t sample_rate, uint32_t channels, bool is_sbr = false);
+     ~AacDecoderState() override;
+ };
+ 
+diff --git a/vita3k/codec/src/aac.cpp b/vita3k/codec/src/aac.cpp
+index 07dccfb..cce575a 100644
+--- a/vita3k/codec/src/aac.cpp
++++ b/vita3k/codec/src/aac.cpp
+@@ -32,7 +32,14 @@ extern "C" {
+ #include <cstring>
+ #include <limits>
+ 
+-AacDecoderState::AacDecoderState(uint32_t sample_rate, uint32_t channels) {
++#include <algorithm>
++
++AacDecoderState::AacDecoderState(uint32_t sample_rate, uint32_t channels, bool sbr) {
++    // SBR doubles the core rate the guest gives
++    output_sample_rate = sbr ? sample_rate * 2 : sample_rate;
++    output_channels = channels;
++    is_sbr = sbr;
++
+     codec = avcodec_find_decoder(AV_CODEC_ID_AAC);
+     assert(codec);
+ 
+@@ -47,16 +54,6 @@ AacDecoderState::AacDecoderState(uint32_t sample_rate, uint32_t channels) {
+ 
+     int err = avcodec_open2(context, codec, nullptr);
+     assert(err == 0);
+-
+-    swr = nullptr;
+-    int ret = swr_alloc_set_opts2(&swr,
+-        &context->ch_layout, AV_SAMPLE_FMT_S16, sample_rate,
+-        &context->ch_layout, AV_SAMPLE_FMT_FLTP, sample_rate,
+-        0, nullptr);
+-    assert(ret == 0);
+-
+-    ret = swr_init(swr);
+-    assert(ret == 0);
+ }
+ 
+ AacDecoderState::~AacDecoderState() {
+@@ -66,9 +63,9 @@ AacDecoderState::~AacDecoderState() {
+ 
+ uint32_t AacDecoderState::get(DecoderQuery query) {
+     switch (query) {
+-    case DecoderQuery::CHANNELS: return context->ch_layout.nb_channels;
++    case DecoderQuery::CHANNELS: return output_channels;
+     case DecoderQuery::BIT_RATE: return context->bit_rate;
+-    case DecoderQuery::SAMPLE_RATE: return context->sample_rate;
++    case DecoderQuery::SAMPLE_RATE: return output_sample_rate;
+     default:
+         return 0;
+     }
+@@ -110,15 +107,65 @@ bool AacDecoderState::send(const uint8_t *data, uint32_t size) {
+ }
+ 
+ bool AacDecoderState::receive(uint8_t *data, DecoderSize *size) {
+-    assert(frame->format == AV_SAMPLE_FMT_FLTP);
++    if (frame->nb_samples <= 0) {
++        if (size)
++            size->samples = 0;
++        return true;
++    }
++
++    // FFmpeg decodes implicit SBR in mono as stereo the guest gets the layout it asked for
++    const int input_sample_rate = frame->sample_rate > 0 ? frame->sample_rate : context->sample_rate;
++    const int input_channels = frame->ch_layout.nb_channels > 0 ? frame->ch_layout.nb_channels : context->ch_layout.nb_channels;
++    if (input_sample_rate <= 0 || input_channels <= 0) {
++        LOG_WARN("AAC frame has an invalid format: {} Hz, {} channels.", input_sample_rate, input_channels);
++        return false;
++    }
++
++    if (!swr || configured_input_sample_rate != input_sample_rate || configured_input_channels != input_channels
++        || configured_input_format != frame->format) {
++        AVChannelLayout input_layout{};
++        if (frame->ch_layout.nb_channels > 0)
++            av_channel_layout_copy(&input_layout, &frame->ch_layout);
++        else
++            av_channel_layout_default(&input_layout, input_channels);
++        AVChannelLayout output_layout{};
++        av_channel_layout_default(&output_layout, static_cast<int>(output_channels));
++
++        SwrContext *new_swr = nullptr;
++        const int ret = swr_alloc_set_opts2(&new_swr,
++            &output_layout, AV_SAMPLE_FMT_S16, static_cast<int>(output_sample_rate),
++            &input_layout, static_cast<AVSampleFormat>(frame->format), input_sample_rate,
++            0, nullptr);
++        av_channel_layout_uninit(&output_layout);
++        av_channel_layout_uninit(&input_layout);
++        if (ret < 0 || !new_swr || swr_init(new_swr) < 0) {
++            swr_free(&new_swr);
++            LOG_WARN("Failed to configure the AAC converter: {} Hz {} ch -> {} Hz {} ch.", input_sample_rate, input_channels, output_sample_rate, output_channels);
++            return false;
++        }
++
++        swr_free(&swr);
++        swr = new_swr;
++        configured_input_sample_rate = input_sample_rate;
++        configured_input_channels = input_channels;
++        configured_input_format = frame->format;
++    }
+ 
++    const int max_samples = is_sbr ? 2048 : 1024;
++    int converted_samples;
+     if (data) {
+-        int ret = swr_convert(swr, &data, frame->nb_samples, const_cast<const uint8_t **>(frame->extended_data), frame->nb_samples);
+-        assert(ret >= 0);
++        const int capacity = std::min(swr_get_out_samples(swr, frame->nb_samples), max_samples);
++        converted_samples = swr_convert(swr, &data, capacity, const_cast<const uint8_t **>(frame->extended_data), frame->nb_samples);
++        if (converted_samples < 0) {
++            LOG_WARN("AAC conversion failed: {}.", codec_error_name(converted_samples));
++            return false;
++        }
++    } else {
++        converted_samples = std::min(swr_get_out_samples(swr, frame->nb_samples), max_samples);
+     }
+ 
+     if (size) {
+-        size->samples = frame->nb_samples;
++        size->samples = static_cast<uint32_t>(converted_samples);
+     }
+ 
+     return true;
+diff --git a/vita3k/cpu/src/dynarmic_cpu.cpp b/vita3k/cpu/src/dynarmic_cpu.cpp
+index 4d2c074..b7f7491 100644
+--- a/vita3k/cpu/src/dynarmic_cpu.cpp
++++ b/vita3k/cpu/src/dynarmic_cpu.cpp
+@@ -203,6 +203,20 @@ public:
+             LOG_TRACE("Instruction fetch at address 0x{:X}", addr);
+         if (addr < KiB(4))
+             return std::nullopt;
++        MemState &mem = *parent->mem;
++        if (addr >= mem.host_page_size && !is_valid_addr(mem, addr)) {
++            // A thread jumped into memory that holds nothing. Reading zeros there ran "andeq r0, r0, r0"
++            // through megabytes of empty address space (Uncharted: Golden Abyss logged 50,000 invalid
++            // reads and burned a core): stop it at the jump instead, and say once where it came from
++            static std::atomic_flag reported = ATOMIC_FLAG_INIT;
++            if (!reported.test_and_set()) {
++                const uint32_t lr = cpu->get_lr();
++                const uint32_t call = (lr & ~1u) >= 4 ? (lr & ~1u) - ((lr & 1) ? 2 : 4) : 0;
++                LOG_CRITICAL("Thread {} jumped to unmapped address 0x{:08X}; LR 0x{:08X}, the call before it: {}\n{}", parent->thread_id, addr, lr,
++                    is_valid_addr(mem, call) ? disassemble(*parent, call, nullptr) : std::string("(unmapped)"), cpu->save_context().description());
++            }
++            return std::nullopt;
++        }
+         return MemoryRead32(addr);
+     }
+ 
+diff --git a/vita3k/display/src/display.cpp b/vita3k/display/src/display.cpp
+index 937bf3e..ab816be 100644
+--- a/vita3k/display/src/display.cpp
++++ b/vita3k/display/src/display.cpp
+@@ -60,8 +60,24 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
+                     // only display the UI/common dialog at 30 fps
+                     // this is necessary so that the command buffer processing doesn't get starved
+                     // with vsync enabled and a screen with a refresh rate of 60Hz or less
+-                    if (display.vblank_count % 2 == 0)
++                    if (display.vblank_count % 2 == 0) {
++#if defined(VITA3K_PLATFORM_IOS)
++                        // iOS: ask for a frame the way overlays do, not with should_display. Most games
++                        // keep drawing while a system dialog is open (FIFA 15, Soul Sacrifice Delta):
++                        // should_display, set on every other vblank, presented a frame at whatever point
++                        // the game's scene had reached, in between the game's own frames. Metal hung the
++                        // GPU on such a frame within a second of the dialog opening (device lost, game
++                        // closed; never while the screen was being recorded, which changes the timing).
++                        // An async flip is only honoured once the game has stopped drawing and nothing
++                        // of it is queued (overlay_frame_allowed in batch.cpp); until then the dialog is
++                        // drawn on the game's own frames.
++                        emuenv.renderer->async_flip_requested.store(true, std::memory_order_relaxed);
++#else
+                         emuenv.renderer->should_display = true;
++                        emuenv.renderer->command_buffer_queue.wake();
++#endif
++                        emuenv.renderer->command_buffer_queue.wake();
++                    }
+             }
+ 
+             // maybe we should also use a mutex for this part, but it shouldn't be an issue
+@@ -114,6 +130,7 @@ void libretro_vblank_tick(EmuEnvState &emuenv) {
+         if (emuenv.kernel.is_threads_paused() || (emuenv.common_dialog.status == SCE_COMMON_DIALOG_STATUS_RUNNING))
+             if (display.vblank_count % 2 == 0)
+                 emuenv.renderer->should_display = true;
++                emuenv.renderer->command_buffer_queue.wake();
+     }
+ 
+     touch_vsync_update(emuenv);
+@@ -234,6 +251,7 @@ void update_prediction(EmuEnvState &emuenv, DisplayFrameInfo &frame) {
+     if (!display.predicting) {
+         display.next_rendered_frame = frame;
+         emuenv.renderer->should_display = true;
++        emuenv.renderer->command_buffer_queue.wake();
+     }
+ 
+     for (auto &pred_frame : display.predicted_frames) {
+@@ -252,6 +270,7 @@ void update_prediction(EmuEnvState &emuenv, DisplayFrameInfo &frame) {
+         LOG_TRACE("Mispredicted the next swapchain image");
+         display.next_rendered_frame = frame;
+         emuenv.renderer->should_display = true;
++        emuenv.renderer->command_buffer_queue.wake();
+     }
+ 
+     // let predict_next_image reset the cycle if necessary
+diff --git a/vita3k/interface.cpp b/vita3k/interface.cpp
+index 512107c..fc03d19 100644
+--- a/vita3k/interface.cpp
++++ b/vita3k/interface.cpp
+@@ -275,14 +275,10 @@ static std::vector<std::string> get_archive_contents_path(const ZipPtr &zip) {
+             continue;
+ 
+         std::string m_filename = std::string(file_stat.m_filename);
+-        if (m_filename.contains("sce_module/steroid.suprx")) {
+-            LOG_CRITICAL("A Vitamin dump was detected, aborting installation...");
+-#ifdef __ANDROID__
+-            // SDL_ShowAndroidToast("Vitamin dumps are not supported!", 1, -1, 0, 0);
+-#endif
+-            content_path.clear();
+-            break;
+-        }
++        // Vitamin dumps install like any decrypted dump: the game runs without Vitamin's loader
++        // (module_parent.cpp answers steroid.suprx with an empty module). From Hinoki
++        if (m_filename.contains("sce_module/steroid.suprx"))
++            LOG_WARN("Vitamin dump detected: installing it (its steroid.suprx loader won't be used). If the game misbehaves, a NoNpDrm dump of it is more reliable");
+ 
+         const auto is_content = m_filename.contains(sfo_path) || m_filename.contains(theme_path);
+         if (is_content) {
+diff --git a/vita3k/io/include/io/VitaIoDevice.h b/vita3k/io/include/io/VitaIoDevice.h
+index ea701f1..3ad6677 100644
+--- a/vita3k/io/include/io/VitaIoDevice.h
++++ b/vita3k/io/include/io/VitaIoDevice.h
+@@ -29,6 +29,7 @@ enum class VitaIoDevice : int {
+     gro0,
+     grw0,
+     imc0,
++    memory,
+     music0,
+     os0,
+     pd0,
+@@ -60,6 +61,7 @@ BOOST_DESCRIBE_ENUM(VitaIoDevice,
+     host0,
+     grw0,
+     imc0,
++    memory,
+     music0,
+     os0,
+     pd0,
+diff --git a/vita3k/io/src/io.cpp b/vita3k/io/src/io.cpp
+index 675fc9b..8a2c00e 100644
+--- a/vita3k/io/src/io.cpp
++++ b/vita3k/io/src/io.cpp
+@@ -37,6 +37,7 @@
+ #endif
+ 
+ #include <cassert>
++#include <cstring>
+ #include <iostream>
+ #include <iterator>
+ #include <string>
+@@ -104,7 +105,8 @@ static bool is_valid_output_path(const VitaIoDevice device) {
+     return !(device == VitaIoDevice::savedata0 || device == VitaIoDevice::savedata1 || device == VitaIoDevice::app0
+         || device == VitaIoDevice::_INVALID || device == VitaIoDevice::addcont0 || device == VitaIoDevice::cache0 || device == VitaIoDevice::tty0
+         || device == VitaIoDevice::tty1 || device == VitaIoDevice::tty2 || device == VitaIoDevice::tty3
+-        || device == VitaIoDevice::music0 || device == VitaIoDevice::photo0 || device == VitaIoDevice::video0);
++        || device == VitaIoDevice::music0 || device == VitaIoDevice::photo0 || device == VitaIoDevice::video0
++        || device == VitaIoDevice::memory);
+ }
+ 
+ bool init(IOState &io, const fs::path &cache_path, const fs::path &log_path, const fs::path &vita_fs_path, bool redirect_stdio) {
+@@ -119,6 +121,9 @@ bool init(IOState &io, const fs::path &cache_path, const fs::path &log_path, con
+     const fs::path vd0{ vita_fs_path / "vd0" };
+ 
+     fs::create_directories(ux0 / "data");
++    // memory: is the RAM work directory; it starts empty on every boot
++    fs::remove_all(ux0 / "data/memory");
++    fs::create_directories(ux0 / "data/memory");
+     fs::create_directories(ux0 / "app");
+     fs::create_directories(ux0 / "music");
+     fs::create_directories(ux0 / "picture");
+@@ -277,6 +282,11 @@ std::string translate_path(const char *path, VitaIoDevice &device, const IOState
+         device = VitaIoDevice::ux0;
+         break;
+     }
++    case VitaIoDevice::memory: { // Redirect memory: (RAM work directory) to ux0:data/memory
++        relative_path = device::remove_device_from_path(relative_path, device, "data/memory");
++        device = VitaIoDevice::ux0;
++        break;
++    }
+     case VitaIoDevice::video0: { // Redirect video0: to ux0:video
+         relative_path = device::remove_device_from_path(relative_path, device, "video");
+         device = VitaIoDevice::ux0;
+@@ -331,7 +341,27 @@ fs::path expand_path(IOState &io, const char *path, const fs::path &vita_fs_path
+     return device::construct_emulated_path(device, translated_path, vita_fs_path, io.redirect_stdio).string();
+ }
+ 
++// A path without a device ("data_ngp/LocalCacheNGP/...", Killzone Mercenary) is relative to the process's
++// working directory, which is app0: for a game. Without this the open failed with ENOENT and the game went on
++// with what it never got, and crashed
++static const char *with_working_directory(const char *path, std::string &storage) {
++    if (!path || !*path || std::strchr(path, ':') || device::get_device(path) != VitaIoDevice::_INVALID)
++        return path;
++    storage = std::string("app0:") + (path[0] == '/' ? path + 1 : path);
++    LOG_WARN_ONCE("A path without a device was opened ({}): looking for it in app0:, the game's working directory", path);
++    return storage.c_str();
++}
++
++// Calls that open a file only to see whether it is there: a miss is the normal answer, not an error
++// (Madden NFL 13 checks its save slots hundreds of times a session: 775 error lines plus as many
++// warnings in one 1.6-minute log)
++static bool is_existence_probe(const char *export_name) {
++    return export_name && std::strcmp(export_name, "sceAppUtilSaveDataSlotGetParam") == 0;
++}
++
+ SceUID open_file(IOState &io, const char *path, const int flags, const fs::path &vita_fs_path, const char *export_name) {
++    std::string relative_storage;
++    path = with_working_directory(path, relative_storage);
+     auto device = device::get_device(path);
+     auto device_for_icase = device;
+     if (device == VitaIoDevice::_INVALID) {
+@@ -383,11 +413,19 @@ SceUID open_file(IOState &io, const char *path, const int flags, const fs::path
+                     if (!system_path.empty() && path_found) {
+                         LOG_TRACE("Found file on case-sensitive filesystem at {}", system_path);
+                     } else {
++                        if (is_existence_probe(export_name)) {
++                            LOG_DEBUG("Missing file at {} (target path: {})", original_system_path, path);
++                            return SCE_ERROR_ERRNO_ENOENT;
++                        }
+                         LOG_ERROR("Missing file at {} (target path: {})", original_system_path, path);
+                         return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
+                     }
+                 }
+             } else {
++                if (is_existence_probe(export_name)) {
++                    LOG_DEBUG("Missing file at {} (target path: {})", system_path, path);
++                    return SCE_ERROR_ERRNO_ENOENT;
++                }
+                 LOG_ERROR("Missing file at {} (target path: {})", system_path, path);
+                 return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
+             }
+@@ -539,7 +577,9 @@ int stat_file(IOState &io, const char *file, SceIoStat *statp, const fs::path &v
+     memset(statp, '\0', sizeof(SceIoStat));
+ 
+     fs::path file_path = "";
++    std::string relative_storage;
+     if (fd == invalid_fd) {
++        file = with_working_directory(file, relative_storage);
+         auto device = device::get_device(file);
+         auto device_for_icase = device;
+         if (device == VitaIoDevice::_INVALID) {
+@@ -564,13 +604,15 @@ int stat_file(IOState &io, const char *file, SceIoStat *statp, const fs::path &v
+                     if (!file_path.empty() && path_found) {
+                         LOG_TRACE("Found file on case-sensitive filesystem at {}", file_path);
+                     } else {
+-                        LOG_ERROR("Missing file at {} (target path: {})", original_file_path, file);
+-                        return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
++                        // Games check for optional files all the time (one checked 2,556 of them while
++                        // booting): asking is normal, so this is no error worth two log lines each
++                        LOG_DEBUG("Missing file at {} (target path: {})", original_file_path, file);
++                        return SCE_ERROR_ERRNO_ENOENT;
+                     }
+                 }
+             } else {
+-                LOG_ERROR("Missing file at {} (target path: {})", file_path, file);
+-                return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
++                LOG_DEBUG("Missing file at {} (target path: {})", file_path, file);
++                return SCE_ERROR_ERRNO_ENOENT;
+             }
+         }
+         LOG_TRACE_IF(log_file_op && log_file_stat, "{}: Statting file: {} ({})", export_name, file, device::construct_normalized_path(device, translated_path));
+@@ -727,6 +769,8 @@ int rename(IOState &io, const char *old_name, const char *new_name, const fs::pa
+ }
+ 
+ SceUID open_dir(IOState &io, const char *path, const fs::path &vita_fs_path, const char *export_name) {
++    std::string relative_storage;
++    path = with_working_directory(path, relative_storage);
+     auto device = device::get_device(path);
+     auto device_for_icase = device;
+     const auto translated_path = translate_path(path, device, io.device_paths);
+@@ -746,13 +790,14 @@ SceUID open_dir(IOState &io, const char *path, const fs::path &vita_fs_path, con
+                 if (!dir_path.empty() && path_found) {
+                     LOG_TRACE("Found directory on case-sensitive filesystem at {}", dir_path);
+                 } else {
+-                    LOG_ERROR("Directory does not exist at {} (target path: {})", original_dir_path, path);
+-                    return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
++                    // Games list folders that may not be there (Madden: 160 a match); not an error
++                    LOG_DEBUG("Directory does not exist at {} (target path: {})", original_dir_path, path);
++                    return SCE_ERROR_ERRNO_ENOENT;
+                 }
+             }
+         } else {
+-            LOG_ERROR("Directory does not exist at: {} (target path: {})", dir_path, path);
+-            return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
++            LOG_DEBUG("Directory does not exist at: {} (target path: {})", dir_path, path);
++            return SCE_ERROR_ERRNO_ENOENT;
+         }
+     }
+ 
+diff --git a/vita3k/kernel/src/load_self.cpp b/vita3k/kernel/src/load_self.cpp
+index a63ab56..f911d29 100644
+--- a/vita3k/kernel/src/load_self.cpp
++++ b/vita3k/kernel/src/load_self.cpp
+@@ -516,10 +516,6 @@ SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std
+             return -1;
+         }
+ 
+-        if (self_path == "app0:sce_module/steroid.suprx") {
+-            LOG_CRITICAL("You're trying to load a vitamin dump. It is not supported.");
+-            return -1;
+-        }
+     }
+ 
+     const uint8_t *const elf_bytes = is_self ? (image_bytes + self_header.elf_offset) : image_bytes;
+diff --git a/vita3k/kernel/src/thread.cpp b/vita3k/kernel/src/thread.cpp
+index 5d0bad5..d6d616f 100644
+--- a/vita3k/kernel/src/thread.cpp
++++ b/vita3k/kernel/src/thread.cpp
+@@ -671,6 +671,14 @@ SceKernelThreadInfo ThreadState::info() {
+     info.currentPriority = priority;
+     info.initCpuAffinityMask = init_affinity_mask;
+     info.currentCpuAffinityMask = affinity_mask;
++    // filled in like a Vita does (Vita3K-Plus: Dragon Quest Heroes II crashed reading them)
++    info.size = sizeof(info);
++    info.processId = 1;
++    const uint32_t user_cpus = (static_cast<uint32_t>(affinity_mask) >> 16) & 0x7;
++    info.currentCpuId = (user_cpus & 1) ? 0 : (user_cpus & 2) ? 1
++        : (user_cpus & 4)                                     ? 2
++                                                              : 0;
++    info.lastExecutedCpuId = info.currentCpuId;
+     info.entry = SceKernelThreadEntry(entry_point);
+     // A thread whose kernel wait is over is READY until it goes on, and waits on nothing, like on a
+     // Vita, where the waker ends the wait. A host wait, like an audio output, has no target and
+diff --git a/vita3k/libretro/libretro_installer.cpp b/vita3k/libretro/libretro_installer.cpp
+index 317842c..eb533fe 100644
+--- a/vita3k/libretro/libretro_installer.cpp
++++ b/vita3k/libretro/libretro_installer.cpp
+@@ -589,12 +589,10 @@ static std::vector<std::string> find_archive_content_paths(const ZipPtr &zip) {
+ 
+         std::string filename = file_stat.m_filename;
+ 
+-        // Check for Vitamin dumps (unsupported)
+-        if (filename.find("sce_module/steroid.suprx") != std::string::npos) {
+-            lr_log(RETRO_LOG_ERROR, "Vitamin dump detected - these are not supported!\n");
+-            lr_msg("Vitamin dumps are not supported!", 600);
+-            return {};
+-        }
++        // Vitamin dumps install like any decrypted dump (ReVita, from Hinoki): the game runs
++        // without Vitamin's steroid.suprx loader, which the module loader answers with an empty module
++        if (filename.find("sce_module/steroid.suprx") != std::string::npos)
++            lr_log(RETRO_LOG_WARN, "Vitamin dump detected: installing it without its steroid.suprx loader\n");
+ 
+         if (filename.find(sfo_marker) != std::string::npos) {
+             std::string path = filename.substr(0, filename.find(sfo_marker));
+diff --git a/vita3k/libretro/libretro_vita3k.cpp b/vita3k/libretro/libretro_vita3k.cpp
+index fee2911..f9f01ee 100644
+--- a/vita3k/libretro/libretro_vita3k.cpp
++++ b/vita3k/libretro/libretro_vita3k.cpp
+@@ -1822,6 +1822,7 @@ static void request_guest_shutdown(EmuEnvState &emuenv, const char *reason) {
+     // display thread and everything waiting on GXM sync objects
+     if (emuenv.renderer) {
+         emuenv.renderer->should_display = true;
++        emuenv.renderer->command_buffer_queue.wake();
+         gxm::shutdown(emuenv);
+     } else {
+         emuenv.display.abort = true;
+diff --git a/vita3k/modules/SceAudiodec/SceAudiodecUser.cpp b/vita3k/modules/SceAudiodec/SceAudiodecUser.cpp
+index 0789603..17172b8 100644
+--- a/vita3k/modules/SceAudiodec/SceAudiodecUser.cpp
++++ b/vita3k/modules/SceAudiodec/SceAudiodecUser.cpp
+@@ -188,7 +188,7 @@ static int create_decoder(EmuEnvState &emuenv, SceAudiodecCtrl *ctrl, SceAudiode
+     }
+     case SCE_AUDIODEC_TYPE_AAC: {
+         SceAudiodecInfoAac &info = ctrl->info.get(emuenv.mem)->aac;
+-        DecoderPtr decoder = std::make_shared<AacDecoderState>(info.sample_rate, info.channels);
++        DecoderPtr decoder = std::make_shared<AacDecoderState>(info.sample_rate, info.channels, info.is_sbr != 0);
+         state->decoders[handle] = decoder;
+ 
+         ctrl->es_size_max = SCE_AUDIODEC_AAC_MAX_ES_SIZE;
+@@ -198,7 +198,7 @@ static int create_decoder(EmuEnvState &emuenv, SceAudiodecCtrl *ctrl, SceAudiode
+         if (info.is_sbr)
+             ctrl->pcm_size_max *= 2;
+ 
+-        LOG_WARN_IF(info.is_adts || info.is_sbr, "report it to dev, is_adts: {}, is_sbr: {}", info.is_adts, info.is_sbr);
++        LOG_INFO_IF(info.is_adts || info.is_sbr, "AAC decoder: ADTS {}, SBR (HE-AAC) {}", info.is_adts, info.is_sbr);
+ 
+         return 0;
+     }
+diff --git a/vita3k/modules/SceCommonDialog/SceCommonDialog.cpp b/vita3k/modules/SceCommonDialog/SceCommonDialog.cpp
+index 1bdd87a..fb26732 100644
+--- a/vita3k/modules/SceCommonDialog/SceCommonDialog.cpp
++++ b/vita3k/modules/SceCommonDialog/SceCommonDialog.cpp
+@@ -559,15 +559,34 @@ EXPORT(int, sceNetCheckDialogGetPS3ConnectInfo) {
+     return UNIMPLEMENTED();
+ }
+ 
++// Only the modes that need PSN or a PS3 are refused, and only when the player hasn't chosen to
++// appear signed in (Vita3K-Plus: Borderlands 2 no longer waits for PSN)
++static bool netcheck_mode_needs_psn(SceNetCheckDialogMode mode) {
++    switch (mode) {
++    case SCE_NETCHECK_DIALOG_MODE_PSN:
++    case SCE_NETCHECK_DIALOG_MODE_PSN_ONLINE:
++    case SCE_NETCHECK_DIALOG_MODE_PS3_CONNECT:
++        return true;
++    default:
++        return false;
++    }
++}
++
+ EXPORT(int, sceNetCheckDialogGetResult, SceNetCheckDialogResult *result) {
+     TRACY_FUNC(sceNetCheckDialogGetResult, result);
+     if (emuenv.common_dialog.type != NETCHECK_DIALOG)
+         return RET_ERROR(SCE_COMMON_DIALOG_ERROR_NOT_IN_USE);
++    if (!result)
++        return RET_ERROR(SCE_COMMON_DIALOG_ERROR_NULL);
+ 
++    *result = {};
+     result->result = emuenv.common_dialog.result;
+ 
+-    if (emuenv.common_dialog.netcheck.mode != SCE_NETCHECK_DIALOG_MODE_ADHOC_CONN)
+-        STUBBED("result->result = 0");
++    if (netcheck_mode_needs_psn(emuenv.common_dialog.netcheck.mode)) {
++        const bool pretend_signed_in = emuenv.cfg.current_config.psn_signed_in;
++        result->result = pretend_signed_in ? SCE_COMMON_DIALOG_RESULT_OK : SCE_COMMON_DIALOG_RESULT_USER_CANCELED;
++        result->psnModeSucceeded = pretend_signed_in;
++    }
+ 
+     return 0;
+ }
+diff --git a/vita3k/modules/SceGxm/SceGxm.cpp b/vita3k/modules/SceGxm/SceGxm.cpp
+index d1b0df3..fee64d2 100644
+--- a/vita3k/modules/SceGxm/SceGxm.cpp
++++ b/vita3k/modules/SceGxm/SceGxm.cpp
+@@ -1344,6 +1344,7 @@ void shutdown(EmuEnvState &emuenv) {
+     emuenv.renderer->notification_ready.notify_all();
+     emuenv.gxm.display_queue.abort();
+     emuenv.renderer->render_abort = true;
++    emuenv.renderer->command_buffer_queue.wake();
+     invalidate_sync_objects(emuenv.gxm);
+     emuenv.renderer->command_finish_one.notify_all();
+ 
+@@ -1784,7 +1785,14 @@ DECL_EXPORT(int, sceGxmTextureSetGammaMode, SceGxmTexture *texture, SceGxmTextur
+ EXPORT(void, sceGxmColorSurfaceGetClip, const SceGxmColorSurface *surface, uint32_t *xMin, uint32_t *yMin, uint32_t *xMax, uint32_t *yMax) {
+     TRACY_FUNC(sceGxmColorSurfaceGetClip, surface, xMin, yMin, xMax, yMax);
+     assert(surface);
+-    UNIMPLEMENTED();
++    if (xMin)
++        *xMin = surface->clip_x_min;
++    if (yMin)
++        *yMin = surface->clip_y_min;
++    if (xMax)
++        *xMax = surface->clip_x_max;
++    if (yMax)
++        *yMax = surface->clip_y_max;
+ }
+ 
+ EXPORT(Ptr<void>, sceGxmColorSurfaceGetData, const SceGxmColorSurface *surface) {
+@@ -1851,8 +1859,10 @@ EXPORT(int, sceGxmColorSurfaceInit, SceGxmColorSurface *surface, SceGxmColorForm
+     memset(surface, 0, sizeof(SceGxmColorSurface));
+     surface->disabled = 0;
+     surface->downscale = scaleMode == SCE_GXM_COLOR_SURFACE_SCALE_MSAA_DOWNSCALE;
+-    surface->width = width;
+-    surface->height = height;
++    surface->width = static_cast<uint16_t>(width);
++    surface->height = static_cast<uint16_t>(height);
++    surface->clip_x_max = width - 1;
++    surface->clip_y_max = height - 1;
+     surface->strideInPixels = strideInPixels;
+     surface->data = data;
+     surface->colorFormat = colorFormat;
+@@ -1902,7 +1912,10 @@ EXPORT(bool, sceGxmColorSurfaceIsEnabled, const SceGxmColorSurface *surface) {
+ EXPORT(void, sceGxmColorSurfaceSetClip, SceGxmColorSurface *surface, uint32_t xMin, uint32_t yMin, uint32_t xMax, uint32_t yMax) {
+     TRACY_FUNC(sceGxmColorSurfaceSetClip, surface, xMin, yMin, xMax, yMax);
+     assert(surface);
+-    UNIMPLEMENTED();
++    surface->clip_x_min = xMin;
++    surface->clip_y_min = yMin;
++    surface->clip_x_max = xMax;
++    surface->clip_y_max = yMax;
+ }
+ 
+ EXPORT(int, sceGxmColorSurfaceSetData, SceGxmColorSurface *surface, Ptr<void> data) {
+diff --git a/vita3k/modules/SceLibKernel/SceLibKernel.cpp b/vita3k/modules/SceLibKernel/SceLibKernel.cpp
+index 442ab9c..46c7e6c 100644
+--- a/vita3k/modules/SceLibKernel/SceLibKernel.cpp
++++ b/vita3k/modules/SceLibKernel/SceLibKernel.cpp
+@@ -621,14 +621,57 @@ EXPORT(int, sceIoMkdirAsync) {
+     return UNIMPLEMENTED();
+ }
+ 
++// Games with loading bugs that only a Vita's slower file opens hide (from Vita3K-Plus): the delay they need
++// when the File Loading Delay setting is 0 (FIFA: doesn't start without it; Silent Hill: graphics)
++static int title_file_loading_delay(const std::string &title_id) {
++    struct TitleDelay {
++        const char *title_id;
++        int delay_ms;
++    };
++    static constexpr TitleDelay titles[] = {
++        // EA SPORTS FIFA Football (and demos), FIFA 13
++        { "PCSB00051", 20 },
++        { "PCSB00052", 20 },
++        { "PCSG00039", 20 },
++        { "PCSB00082", 20 },
++        { "PCSB00083", 20 },
++        { "PCSB00084", 20 },
++        { "PCSB00085", 20 },
++        { "PCSB00086", 20 },
++        { "PCSE00055", 20 },
++        { "PCSE00059", 20 },
++        { "PCSE00060", 20 },
++        { "PCSG90012", 20 },
++        { "PCSB00170", 20 },
++        { "PCSB00171", 20 },
++        { "PCSB00174", 20 },
++        { "PCSE00093", 20 },
++        { "PCSE00096", 20 },
++        { "PCSG00107", 20 },
++        // Silent Hill: Book of Memories (and demos)
++        { "PCSE00011", 5 },
++        { "PCSB00115", 5 },
++        { "PCSG00049", 5 },
++        { "PCSE00121", 5 },
++        { "PCSB00193", 5 },
++        { "PCSG90036", 5 },
++    };
++    for (const auto &title : titles) {
++        if (title_id == title.title_id)
++            return title.delay_ms;
++    }
++    return 0;
++}
++
+ EXPORT(SceUID, sceIoOpen, const char *file, const int flags, const SceMode mode) {
+     TRACY_FUNC(sceIoOpen, file, flags, mode);
+     if (file == nullptr) {
+         return RET_ERROR(SCE_ERROR_ERRNO_EINVAL);
+     }
+ 
+-    if (emuenv.cfg.current_config.file_loading_delay > 0)
+-        std::this_thread::sleep_for(std::chrono::milliseconds(emuenv.cfg.current_config.file_loading_delay));
++    const int loading_delay = emuenv.cfg.current_config.file_loading_delay > 0 ? emuenv.cfg.current_config.file_loading_delay : title_file_loading_delay(emuenv.io.title_id);
++    if (loading_delay > 0)
++        std::this_thread::sleep_for(std::chrono::milliseconds(loading_delay));
+ 
+     LOG_INFO("Opening file: {}", file);
+     return open_file(emuenv.io, file, flags, emuenv.vita_fs_path, export_name);
+diff --git a/vita3k/modules/SceNet/SceNet.cpp b/vita3k/modules/SceNet/SceNet.cpp
+index 0695e68..c383aba 100644
+--- a/vita3k/modules/SceNet/SceNet.cpp
++++ b/vita3k/modules/SceNet/SceNet.cpp
+@@ -467,8 +467,10 @@ EXPORT(int, sceNetInetPton, int af, const char *src, void *dst) {
+ 
+ EXPORT(int, sceNetInit, SceNetInitParam *param) {
+     TRACY_FUNC(sceNetInit, param);
++    // Games that start networking twice (DBZ, LittleBigPlanet and others did, right at boot) were told
++    // EBUSY and some gave up on their whole network layer; the first init is still valid, so succeed
+     if (emuenv.net.inited)
+-        RET_NET_ERRNO(SCE_NET_ERROR_EBUSY);
++        return 0;
+ 
+     if (!param || !param->memory.address() || param->size < 0x4000 || param->flags != 0)
+         RET_NET_ERRNO(SCE_NET_ERROR_EINVAL);
+diff --git a/vita3k/modules/SceNetCtl/SceNetCtl.cpp b/vita3k/modules/SceNetCtl/SceNetCtl.cpp
+index 46575c5..3153155 100644
+--- a/vita3k/modules/SceNetCtl/SceNetCtl.cpp
++++ b/vita3k/modules/SceNetCtl/SceNetCtl.cpp
+@@ -737,8 +737,9 @@ EXPORT(int, sceNetCtlInetUnregisterCallback, int cid) {
+ 
+ EXPORT(int, sceNetCtlInit) {
+     TRACY_FUNC(sceNetCtlInit);
++    // Same as sceNetInit: a second init from the game's own network layer is not an error worth failing on
+     if (emuenv.netctl.inited) {
+-        return RET_ERROR(SCE_NET_CTL_ERROR_NOT_TERMINATED);
++        return 0;
+     }
+ 
+     const std::lock_guard<std::mutex> lock(emuenv.netctl.mutex);
+diff --git a/vita3k/modules/SceNpManager/SceNpManager.cpp b/vita3k/modules/SceNpManager/SceNpManager.cpp
+index 16b9def..2876780 100644
+--- a/vita3k/modules/SceNpManager/SceNpManager.cpp
++++ b/vita3k/modules/SceNpManager/SceNpManager.cpp
+@@ -75,6 +75,22 @@ EXPORT(int, sceNpCheckCallback) {
+         thread->run_callback(np_callback.pc, { static_cast<uint32_t>(state), 0, np_callback.data });
+     }
+ 
++    // Matching2 context events (sceNpMatching2ContextStart) are delivered here, like other NP callbacks
++    std::vector<SceNpMatching2ContextEvent> events;
++    Address context_cb_pc = 0;
++    Address context_cb_arg = 0;
++    {
++        NpMatching2State &matching2 = emuenv.np.matching2;
++        std::lock_guard<std::mutex> lock(matching2.mutex);
++        if (matching2.context_cb_pc && !matching2.pending.empty()) {
++            events.swap(matching2.pending);
++            context_cb_pc = matching2.context_cb_pc;
++            context_cb_arg = matching2.context_cb_arg;
++        }
++    }
++    for (const SceNpMatching2ContextEvent &event : events)
++        thread->run_callback(context_cb_pc, { event.ctx_id, event.event, event.cause, event.error_code, context_cb_arg });
++
+     return STUBBED("Stub");
+ }
+ 
+diff --git a/vita3k/modules/SceNpMatching2/SceNpMatching2.cpp b/vita3k/modules/SceNpMatching2/SceNpMatching2.cpp
+index 27b958d..66674dc 100644
+--- a/vita3k/modules/SceNpMatching2/SceNpMatching2.cpp
++++ b/vita3k/modules/SceNpMatching2/SceNpMatching2.cpp
+@@ -17,6 +17,19 @@
+ 
+ #include <module/module.h>
+ 
++#include <emuenv/state.h>
++#include <np/state.h>
++#include <util/tracy.h>
++
++TRACY_MODULE_NAME(SceNpMatching2);
++
++// No matching server: a started context reports its start event with a "no server" error through the
++// game's context callback (delivered by sceNpCheckCallback), so games give up instead of waiting for PSN.
++// From Vita3K-Plus (Borderlands 2)
++constexpr uint32_t SCE_NP_MATCHING2_ERROR_CONTEXT_NOT_STARTED = 0x80550C08;
++constexpr uint32_t SCE_NP_MATCHING2_CONTEXT_EVENT_START = 2;
++constexpr uint32_t MATCHING2_NO_SERVER_ERROR = 0x80410123;
++
+ EXPORT(int, sceNpMatching2AbortContextStart) {
+     return UNIMPLEMENTED();
+ }
+@@ -25,16 +38,32 @@ EXPORT(int, sceNpMatching2AbortRequest) {
+     return UNIMPLEMENTED();
+ }
+ 
+-EXPORT(int, sceNpMatching2ContextStart) {
+-    return UNIMPLEMENTED();
++EXPORT(int, sceNpMatching2ContextStart, SceUInt32 ctxId, SceUInt32 pad, SceUInt32 timeout_lo, SceUInt32 timeout_hi) {
++    TRACY_FUNC(sceNpMatching2ContextStart, ctxId, pad, timeout_lo, timeout_hi);
++    NpMatching2State &matching2 = emuenv.np.matching2;
++    std::lock_guard<std::mutex> lock(matching2.mutex);
++    // nobody listening: no way to report the failure later
++    if (!matching2.context_cb_pc)
++        return RET_ERROR(SCE_NP_MATCHING2_ERROR_CONTEXT_NOT_STARTED);
++
++    matching2.pending.push_back({ ctxId, SCE_NP_MATCHING2_CONTEXT_EVENT_START, 0, MATCHING2_NO_SERVER_ERROR });
++    return 0;
+ }
+ 
+-EXPORT(int, sceNpMatching2ContextStop) {
+-    return UNIMPLEMENTED();
++EXPORT(int, sceNpMatching2ContextStop, SceUInt32 ctxId) {
++    TRACY_FUNC(sceNpMatching2ContextStop, ctxId);
++    return RET_ERROR(SCE_NP_MATCHING2_ERROR_CONTEXT_NOT_STARTED);
+ }
+ 
+-EXPORT(int, sceNpMatching2CreateContext) {
+-    return UNIMPLEMENTED();
++EXPORT(int, sceNpMatching2CreateContext, Ptr<void> npId, Ptr<void> commId, Ptr<void> passphrase, SceUInt16 *ctxId) {
++    TRACY_FUNC(sceNpMatching2CreateContext, npId, commId, passphrase, ctxId);
++    if (!ctxId)
++        return UNIMPLEMENTED();
++
++    NpMatching2State &matching2 = emuenv.np.matching2;
++    std::lock_guard<std::mutex> lock(matching2.mutex);
++    *ctxId = static_cast<SceUInt16>(matching2.next_ctx_id++);
++    return 0;
+ }
+ 
+ EXPORT(int, sceNpMatching2CreateJoinRoom) {
+@@ -121,8 +150,13 @@ EXPORT(int, sceNpMatching2LeaveRoom) {
+     return UNIMPLEMENTED();
+ }
+ 
+-EXPORT(int, sceNpMatching2RegisterContextCallback) {
+-    return UNIMPLEMENTED();
++EXPORT(int, sceNpMatching2RegisterContextCallback, Ptr<void> cbFunc, Ptr<void> cbFuncArg) {
++    TRACY_FUNC(sceNpMatching2RegisterContextCallback, cbFunc, cbFuncArg);
++    NpMatching2State &matching2 = emuenv.np.matching2;
++    std::lock_guard<std::mutex> lock(matching2.mutex);
++    matching2.context_cb_pc = cbFunc.address();
++    matching2.context_cb_arg = cbFuncArg.address();
++    return 0;
+ }
+ 
+ EXPORT(int, sceNpMatching2RegisterLobbyEventCallback) {
+@@ -214,5 +248,11 @@ EXPORT(int, sceNpMatching2SignalingGetPingInfo) {
+ }
+ 
+ EXPORT(int, sceNpMatching2Term) {
+-    return UNIMPLEMENTED();
++    TRACY_FUNC(sceNpMatching2Term);
++    NpMatching2State &matching2 = emuenv.np.matching2;
++    std::lock_guard<std::mutex> lock(matching2.mutex);
++    matching2.context_cb_pc = 0;
++    matching2.context_cb_arg = 0;
++    matching2.pending.clear();
++    return 0;
+ }
+diff --git a/vita3k/modules/module_parent.cpp b/vita3k/modules/module_parent.cpp
+index b1ed834..61380f3 100644
+--- a/vita3k/modules/module_parent.cpp
++++ b/vita3k/modules/module_parent.cpp
+@@ -267,11 +267,17 @@ SceUID load_module(EmuEnvState &emuenv, const std::string &module_path) {
+     }
+ 
+     LOG_INFO("Loading module \"{}\"", module_path);
+-    if (module_path.starts_with("vs0:sys/external/")) {
++    // Vitamin dumps carry Vitamin's own loader (steroid.suprx), which patches the system so a dumped game
++    // can run as homebrew on a real Vita. Vita3K runs the decrypted game directly and doesn't need it (its
++    // patches would only get in the way), so it is answered with an empty module like an HLE one.
++    const bool vitamin_loader = string_utils::tolower(module_path).ends_with("sce_module/steroid.suprx");
++    if (vitamin_loader)
++        LOG_WARN("Vitamin dump: not loading Vitamin's steroid.suprx (the game runs without it)");
++    if (vitamin_loader || module_path.starts_with("vs0:sys/external/")) {
+         // check if module is LLEd or not
+         // check only for this path because app modules are always LLEd and os0 modules can be loaded only by developer.
+         const auto module_name = fs::path(module_path).stem().string();
+-        if (!is_lle_module(module_name, emuenv)) {
++        if (vitamin_loader || !is_lle_module(module_name, emuenv)) {
+             LOG_INFO("Module {} is HLE. Skipping load.", module_name);
+             const SceKernelModulePtr kernelModuleInfo = std::make_shared<KernelModule>();
+             memset(kernelModuleInfo.get(), 0, sizeof(KernelModule));
+diff --git a/vita3k/ngs/include/ngs/modules/envelope.h b/vita3k/ngs/include/ngs/modules/envelope.h
+index b78e5fd..b22f704 100644
+--- a/vita3k/ngs/include/ngs/modules/envelope.h
++++ b/vita3k/ngs/include/ngs/modules/envelope.h
+@@ -23,6 +23,10 @@
+ 
+ #define SCE_NGS_ENVELOPE_MAX_POINTS 4
+ 
++#define SCE_NGS_ENVELOPE_NO_LOOP (-1)
++#define SCE_NGS_ENVELOPE_NO_LOOP_TERMINATE (-2)
++#define SCE_NGS_ENVELOPE_NO_LOOP_RELEASE (-3)
++
+ enum SceNgsEnvelopeCurveType : uint32_t {
+     SCE_NGS_ENVELOPE_LINEAR,
+     SCE_NGS_ENVELOPE_CURVED
+@@ -53,10 +57,19 @@ struct SceNgsEnvelopeStates {
+ 
+ namespace ngs {
+ 
++struct EnvelopeLogicalState : public ModuleLogicalState {
++    int32_t current_point = 0;
++    double position_in_segment_ms = 0.0;
++    double total_position_ms = 0.0;
++};
++
+ struct EnvelopeModule : public Module {
+ public:
+     bool process(KernelState &kern, const MemState &mem, const SceUID thread_id, ModuleData &data, std::unique_lock<std::recursive_mutex> &scheduler_lock, std::unique_lock<std::mutex> &voice_lock) override;
+     uint32_t module_id() const override { return 0x5CE3; }
++    uint32_t get_guest_state_size() const override { return sizeof(SceNgsEnvelopeStates); }
++    std::unique_ptr<ModuleLogicalState> create_logical_state() const override { return std::make_unique<EnvelopeLogicalState>(); }
++    void on_state_change(const MemState &mem, ModuleData &data, const VoiceState previous) override;
+ 
+     static constexpr uint32_t get_max_parameter_size() {
+         return sizeof(SceNgsEnvelopeParams);
+diff --git a/vita3k/ngs/src/modules/envelope.cpp b/vita3k/ngs/src/modules/envelope.cpp
+index 2a3bd20..e452877 100644
+--- a/vita3k/ngs/src/modules/envelope.cpp
++++ b/vita3k/ngs/src/modules/envelope.cpp
+@@ -18,16 +18,107 @@
+ #include <ngs/modules/envelope.h>
+ #include <util/log.h>
+ 
++#include <algorithm>
++#include <cmath>
++
+ namespace ngs {
+ 
++// Amplitude envelope (ADSR-style points). Without it, every voice routed through an envelope played at
++// full volume from its first sample: no fade-in, no decay to the sustain level, and lines that a game
++// shapes or quiets with the envelope came out at the wrong level. A keyed-off voice still stops at once
++// (as sceNgsVoiceKeyOff does in this NGS), so the release time is not used.
++
++static float point_amplitude(const SceNgsEnvelopeParams *params, const int32_t count, const int32_t index) {
++    const float amplitude = params->envelopePoints[std::clamp(index, 0, count - 1)].fAmplitude;
++    return std::isfinite(amplitude) ? std::clamp(amplitude, 0.0f, 16.0f) : 1.0f;
++}
++
++void EnvelopeModule::on_state_change(const MemState &mem, ModuleData &data, const VoiceState previous) {
++    if (data.parent->state == VOICE_STATE_ACTIVE && previous == VOICE_STATE_AVAILABLE) {
++        EnvelopeLogicalState *logical = data.get_logical_state<EnvelopeLogicalState>();
++        logical->current_point = 0;
++        logical->position_in_segment_ms = 0.0;
++        logical->total_position_ms = 0.0;
++    }
++}
++
+ bool EnvelopeModule::process(KernelState &kern, const MemState &mem, const SceUID thread_id, ModuleData &data, std::unique_lock<std::recursive_mutex> &scheduler_lock, std::unique_lock<std::mutex> &voice_lock) {
+-    if (!data.is_bypassed) {
+-        const SceNgsParamsDescriptor *desc = data.get_parameters<SceNgsParamsDescriptor>(mem);
+-        if (desc->id == SCE_NGS_ENVELOPE_PARAMS_STRUCT_ID) {
+-            LOG_WARN_ONCE("Game is using unimplemented envelope audio module");
+-        }
++    if (data.is_bypassed)
++        return false;
++    const SceNgsEnvelopeParams *params = data.get_parameters<SceNgsEnvelopeParams>(mem);
++    if (!params || params->desc.id != SCE_NGS_ENVELOPE_PARAMS_STRUCT_ID)
++        return false;
++    const int32_t count = static_cast<int32_t>(std::min<uint32_t>(params->uNumPoints, SCE_NGS_ENVELOPE_MAX_POINTS));
++    if (count <= 0)
++        return false;
++
++    Voice *voice = data.parent;
++    const int32_t granularity = voice->rack->system->granularity;
++    const int32_t sample_rate = voice->rack->system->sample_rate;
++    if (granularity <= 0 || sample_rate <= 0)
++        return false;
++
++    EnvelopeLogicalState *logical = data.get_logical_state<EnvelopeLogicalState>();
++    logical->current_point = std::clamp(logical->current_point, 0, count - 1);
++
++    // A loop between two points; a loop on a single point holds it (the usual sustain)
++    const int32_t loop_start = static_cast<int32_t>(params->uLoopStart);
++    const int32_t loop_end = params->nLoopEnd;
++    const bool looping = loop_end >= 0 && loop_end < count && loop_start >= 0 && loop_start <= loop_end;
++
++    const auto gain_now = [&]() -> float {
++        const int32_t point = logical->current_point;
++        const float from = point_amplitude(params, count, point);
++        if (point >= count - 1 || (looping && loop_start == loop_end && point == loop_end))
++            return from;
++        const float to = point_amplitude(params, count, point + 1);
++        const double length = params->envelopePoints[point].uMsecsToNextPoint;
++        if (length <= 0.0)
++            return to;
++        double t = std::clamp(logical->position_in_segment_ms / length, 0.0, 1.0);
++        if (params->envelopePoints[point].eCurveType == SCE_NGS_ENVELOPE_CURVED)
++            t = t * t * (3.0 - 2.0 * t);
++        return static_cast<float>(from + (to - from) * t);
++    };
++
++    const float start_gain = gain_now();
++    const double tick_ms = static_cast<double>(granularity) * 1000.0 / static_cast<double>(sample_rate);
++    logical->total_position_ms += tick_ms;
++    logical->position_in_segment_ms += tick_ms;
++    // Move through finished segments (a segment of length 0 is passed at once; at most a few per tick)
++    for (int32_t guard = 0; guard < SCE_NGS_ENVELOPE_MAX_POINTS * 2 && logical->current_point < count - 1; guard++) {
++        if (looping && loop_start == loop_end && logical->current_point == loop_end)
++            break;
++        const double length = params->envelopePoints[logical->current_point].uMsecsToNextPoint;
++        if (logical->position_in_segment_ms < length)
++            break;
++        logical->position_in_segment_ms -= length;
++        logical->current_point++;
++        if (looping && loop_start < loop_end && logical->current_point == loop_end)
++            logical->current_point = loop_start;
+     }
++    const float end_gain = gain_now();
+ 
++    if (SceNgsEnvelopeStates *state = data.get_state<SceNgsEnvelopeStates>()) {
++        state->fCurrentHeight = end_gain;
++        state->fPosition = static_cast<float>(logical->total_position_ms);
++        state->fReleaseScale = 1.0f;
++        state->nCurrentPoint = logical->current_point;
++        state->nReleasing = 0;
++    }
++
++    // Applied to the signal the voice carries so far, ramped across the tick (no zipper noise)
++    float *signal = reinterpret_cast<float *>(voice->products[0].data);
++    if (signal && !(start_gain == 1.0f && end_gain == 1.0f)) {
++        const float step = (end_gain - start_gain) / static_cast<float>(granularity);
++        float gain = start_gain;
++        for (int32_t frame = 0; frame < granularity; frame++) {
++            signal[frame * 2 + 0] *= gain;
++            signal[frame * 2 + 1] *= gain;
++            gain += step;
++        }
++    }
+     return false;
+ }
++
+ } // namespace ngs
+diff --git a/vita3k/ngs/src/modules/player.cpp b/vita3k/ngs/src/modules/player.cpp
+index aa569ac..11e533b 100644
+--- a/vita3k/ngs/src/modules/player.cpp
++++ b/vita3k/ngs/src/modules/player.cpp
+@@ -127,17 +127,25 @@ bool PlayerModule::process(KernelState &kern, const MemState &mem, const SceUID
+         if ((state->current_buffer == -1)
+             || !params->buffer_params[state->current_buffer].buffer
+             || (params->buffer_params[state->current_buffer].bytes_count == 0)) {
++            // An empty buffer has no samples: follow the chain to one that has audio instead of ending
++            // (several empty ones in a row too: Shantae's music, from Vita3K-Plus)
+             if (state->current_buffer > -1) {
+-                const int next_buffer_index = params->buffer_params[state->current_buffer].next_buffer_index;
+-                if (next_buffer_index > -1
+-                    && next_buffer_index < SCE_NGS_PLAYER_MAX_BUFFERS
+-                    && params->buffer_params[next_buffer_index].buffer
+-                    && params->buffer_params[next_buffer_index].bytes_count > 0) {
+-                    state->current_buffer = next_buffer_index;
+-                    state->current_byte_position_in_buffer = 0;
+-                    logical->current_loop_count = 0;
+-                    continue;
++                int next_buffer_index = state->current_buffer;
++                bool found = false;
++                for (int hops = 0; hops < SCE_NGS_PLAYER_MAX_BUFFERS; hops++) {
++                    next_buffer_index = params->buffer_params[next_buffer_index].next_buffer_index;
++                    if (next_buffer_index < 0 || next_buffer_index >= SCE_NGS_PLAYER_MAX_BUFFERS || next_buffer_index == state->current_buffer)
++                        break;
++                    if (params->buffer_params[next_buffer_index].buffer && params->buffer_params[next_buffer_index].bytes_count > 0) {
++                        state->current_buffer = next_buffer_index;
++                        state->current_byte_position_in_buffer = 0;
++                        logical->current_loop_count = 0;
++                        found = true;
++                        break;
++                    }
+                 }
++                if (found)
++                    continue;
+             }
+ 
+             // Stop processing if no valid buffer is available or if the buffer is empty
+diff --git a/vita3k/np/include/np/state.h b/vita3k/np/include/np/state.h
+index ee69cf0..9710c2a 100644
+--- a/vita3k/np/include/np/state.h
++++ b/vita3k/np/include/np/state.h
+@@ -85,6 +85,23 @@ struct NpTusState {
+     std::unordered_map<SceUID, NpTusRequest> requests;
+ };
+ 
++// Matching2 contexts (Vita3K-Plus, Borderlands 2): a context start is answered at once with a
++// "no server" event through the game's context callback, so games stop waiting for PSN
++struct SceNpMatching2ContextEvent {
++    uint32_t ctx_id;
++    uint32_t event;
++    uint32_t cause;
++    uint32_t error_code;
++};
++
++struct NpMatching2State {
++    std::mutex mutex;
++    Address context_cb_pc = 0;
++    Address context_cb_arg = 0;
++    uint32_t next_ctx_id = 1;
++    std::vector<SceNpMatching2ContextEvent> pending;
++};
++
+ struct NpState {
+     bool inited = false;
+     np_callbacks cbs;
+@@ -92,5 +109,6 @@ struct NpState {
+ 
+     NpTrophyState trophy_state;
+     NpTusState tus_state;
++    NpMatching2State matching2;
+     np::CommunicationID comm_id;
+ };
+diff --git a/vita3k/renderer/include/renderer/gxm_types.h b/vita3k/renderer/include/renderer/gxm_types.h
+index f7fa517..6282c85 100644
+--- a/vita3k/renderer/include/renderer/gxm_types.h
++++ b/vita3k/renderer/include/renderer/gxm_types.h
+@@ -42,14 +42,20 @@ struct SceGxmColorSurface {
+         uint32_t disabled : 1;
+         uint32_t downscale : 1;
+         uint32_t gamma : 2;
+-        uint32_t : 28;
++        uint32_t clip_x_min : 12;
++        uint32_t clip_y_min : 12;
++        uint32_t : 4;
+     };
+-    uint32_t width;
+-    uint32_t height;
++    uint16_t width;
++    uint16_t height;
+     uint32_t strideInPixels;
+     Ptr<void> data;
+     SceGxmColorFormat colorFormat;
+     SceGxmColorSurfaceType surfaceType;
++    // the clip rectangle the game sets and reads back (Vita3K-Plus: Injustice's projectiles)
++    uint32_t clip_x_max : 12;
++    uint32_t clip_y_max : 12;
++    uint32_t : 8;
+     // opaque end
+     uint32_t outputRegisterSize;
+     SceGxmTexture backgroundTex;
+diff --git a/vita3k/renderer/include/renderer/texture_cache.h b/vita3k/renderer/include/renderer/texture_cache.h
+index 1d32010..1c6846f 100644
+--- a/vita3k/renderer/include/renderer/texture_cache.h
++++ b/vita3k/renderer/include/renderer/texture_cache.h
+@@ -156,6 +156,18 @@ public:
+ 
+     virtual void configure_sampler(size_t index, const SceGxmTexture &texture, bool no_linear) {}
+ 
++    // Graphics memory a cached texture holds (0 when it holds none), and dropping it. Used to keep the
++    // cache within a memory budget on phones: the cache is sized by count (2048 textures), and a game
++    // with big textures filled 2.2 GB of graphics memory with it and was closed by iOS.
++    virtual uint64_t texture_memory(size_t index) const { return 0; }
++    virtual void release_texture(size_t index) {}
++    // Bytes the cached textures may use; 0 means no limit
++    uint64_t memory_budget = 0;
++    uint64_t memory_used = 0;
++    uint32_t textures_held = 0;
++    uint32_t seen_pressure = 0;
++    void keep_within_budget(const TextureCacheInfo *keep);
++
+     void upload_texture(const SceGxmTexture &gxm_texture, MemState &mem);
+     void cache_and_bind_texture(const SceGxmTexture &gxm_texture, MemState &mem);
+ 
+diff --git a/vita3k/renderer/include/renderer/vulkan/surface_cache.h b/vita3k/renderer/include/renderer/vulkan/surface_cache.h
+index 59c728d..67fdc87 100644
+--- a/vita3k/renderer/include/renderer/vulkan/surface_cache.h
++++ b/vita3k/renderer/include/renderer/vulkan/surface_cache.h
+@@ -114,6 +114,9 @@ struct ColorSurfaceCacheInfo : public SurfaceCacheInfo {
+     bool need_buffer_sync = false;
+ 
+     std::shared_ptr<bool> dirty = std::make_shared<bool>(false);
++    // its memory protection was lifted (by any access in the protected region it shares): protect it
++    // again the next time it is drawn to
++    std::shared_ptr<bool> unprotected = std::make_shared<bool>(false);
+ 
+     ColorSurfaceCacheInfo() = default;
+     ~ColorSurfaceCacheInfo();
+diff --git a/vita3k/renderer/include/renderer/vulkan/types.h b/vita3k/renderer/include/renderer/vulkan/types.h
+index 690892e..c3a9714 100644
+--- a/vita3k/renderer/include/renderer/vulkan/types.h
++++ b/vita3k/renderer/include/renderer/vulkan/types.h
+@@ -70,6 +70,8 @@ struct VKTextureCache : public TextureCache {
+     bool is_texture_transfer_ready = false;
+ 
+     VKTextureCache(VKState &state);
++    uint64_t texture_memory(size_t index) const override;
++    void release_texture(size_t index) override;
+     // get an available staging buffer, wait for one if all are busy
+     void prepare_staging_buffer(bool is_configure = false);
+ 
+diff --git a/vita3k/renderer/src/batch.cpp b/vita3k/renderer/src/batch.cpp
+index 87e5a8e..37739b5 100644
+--- a/vita3k/renderer/src/batch.cpp
++++ b/vita3k/renderer/src/batch.cpp
+@@ -131,6 +131,31 @@ static void process_batch(renderer::State &state, const FeatureState &features,
+     } while (true);
+ }
+ 
++// When an overlay (a system dialog: save data, invitations, messages) asks for a frame of its own.
++// It asks about 100 times a second while it is open, and honouring that cut the game's frame short:
++// the frame was presented in the middle of the game's scene, with its commands half recorded. Metal
++// hung the GPU on such frames (the whole device froze for seconds, then the GPU was lost and the
++// game closed: a save dialog in Soul Sacrifice Delta, iPhone 17 Pro, iPad mini A17). While the game
++// is still drawing, the overlay is drawn on the game's own frames; it gets frames of its own only
++// once the game has stopped drawing (it waits for the dialog) and nothing of the game is queued.
++static std::atomic<int64_t> last_game_frame_ms{ 0 };
++
++static int64_t steady_ms() {
++    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++
++static bool overlay_frame_allowed(renderer::State &state) {
++    if (!state.async_flip_requested.load(std::memory_order_relaxed))
++        return false;
++#if defined(VITA3K_PLATFORM_IOS)
++    if (steady_ms() - last_game_frame_ms.load(std::memory_order_relaxed) < 250)
++        return false;
++    if (state.command_buffer_queue.size() != 0)
++        return false;
++#endif
++    return true;
++}
++
+ void process_batches(renderer::State &state, const FeatureState &features, MemState &mem, Config &config, int64_t max_wait_ms) {
+     auto max_time = duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() + max_wait_ms;
+ 
+@@ -139,11 +164,14 @@ void process_batches(renderer::State &state, const FeatureState &features, MemSt
+             return;
+ 
+         // overlay requested an async present
+-        if (state.async_flip_requested.load(std::memory_order_relaxed))
++        if (overlay_frame_allowed(state))
+             return;
+ 
+-        // Try to wait for a batch (about 2 or 3ms, game should be fast for this)
+-        auto cmd_list = state.command_buffer_queue.top(3);
++        // Wait up to 3 ms for a batch. The queue's wait is in microseconds: this was top(3), 3 us, so
++        // while the game had nothing queued the render thread spun on a performance core (hundreds of
++        // thousands of wake-ups a second: heat, and a core taken from the game). New batches, a frame
++        // to show, an overlay frame and shutdown all wake the queue, so the longer wait costs nothing.
++        auto cmd_list = state.command_buffer_queue.top(3000);
+ 
+         if (!cmd_list || !is_cmd_ready(mem, *cmd_list)) {
+             // beginning of the game or homebrew not using gxm
+@@ -161,7 +189,7 @@ void process_batches(renderer::State &state, const FeatureState &features, MemSt
+                 if (wait_result == renderer::SyncWaitResult::Shutdown)
+                     return;
+ 
+-                if (state.async_flip_requested.load(std::memory_order_relaxed))
++                if (overlay_frame_allowed(state))
+                     return;
+ 
+                 auto curr_time = duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+@@ -274,6 +302,8 @@ static void render_loop(renderer::State &state, DisplayState &display, GxmState
+             }
+         }
+ 
++        if (state.should_display)
++            last_game_frame_ms.store(steady_ms(), std::memory_order_relaxed);
+         state.render_frame(display, gxm, mem);
+         state.swap_window();
+         state.async_flip_requested.store(false, std::memory_order_relaxed);
+diff --git a/vita3k/renderer/src/sync.cpp b/vita3k/renderer/src/sync.cpp
+index 2d881be..5756bdc 100644
+--- a/vita3k/renderer/src/sync.cpp
++++ b/vita3k/renderer/src/sync.cpp
+@@ -15,12 +15,14 @@
+ // with this program; if not, write to the Free Software Foundation, Inc.,
+ // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+ 
++#include <atomic>
+ #include <chrono>
+ #include <future>
+ #include <renderer/commands.h>
+ #include <renderer/driver_functions.h>
+ #include <renderer/state.h>
+ #include <renderer/types.h>
++#include <system_error>
+ 
+ #include <display/state.h>
+ #include <renderer/gl/functions.h>
+@@ -30,6 +32,7 @@
+ #include <renderer/vulkan/types.h>
+ 
+ #include <renderer/functions.h>
++#include <util/log.h>
+ #include <util/tracy.h>
+ 
+ namespace renderer {
+@@ -153,16 +156,44 @@ int wait_for_status(State &state, int *status, int signal, bool wake_on_equal) {
+ }
+ 
+ SyncWaitResult wishlist(SceGxmSyncObject *sync_object, const uint32_t timestamp, const int32_t timeout_micros) {
+-    std::unique_lock<std::mutex> lock(sync_object->lock);
++    if (!sync_object)
++        return SyncWaitResult::Ready;
++    std::unique_lock<std::mutex> lock(sync_object->lock, std::defer_lock);
++    // The sync object lives in game memory. A game whose memory got overwritten (it crashed a thread
++    // first) can hand over one whose lock is garbage, and locking that threw out of the render thread
++    // and ended the app (Danganronpa 2). Skip the wait instead: the game is already broken, the app
++    // stays up and can return to the library.
++    try {
++        lock.lock();
++    } catch (const std::system_error &e) {
++        static std::atomic_flag logged = ATOMIC_FLAG_INIT;
++        if (!logged.test_and_set())
++            LOG_ERROR("A GPU sync object in game memory is damaged ({}): not waiting on it", e.what());
++        return SyncWaitResult::Ready;
++    }
+     if (sync_object->timestamp_current < timestamp) {
+         const auto &pred = [&]() {
+             return sync_object->being_deleted || sync_object->timestamp_current >= timestamp;
+         };
+ 
+-        if (timeout_micros == -1) {
+-            sync_object->cond.wait(lock, pred);
+-        } else if (!sync_object->cond.wait_for(lock, std::chrono::microseconds(timeout_micros), pred)) {
+-            return SyncWaitResult::TimedOut;
++        // The condition variable is in game memory too: the same damage can make waiting throw
++        try {
++            if (timeout_micros == -1) {
++                sync_object->cond.wait(lock, pred);
++            } else if (!sync_object->cond.wait_for(lock, std::chrono::microseconds(timeout_micros), pred)) {
++                return SyncWaitResult::TimedOut;
++            }
++        } catch (const std::system_error &e) {
++            static std::atomic_flag logged_wait = ATOMIC_FLAG_INIT;
++            if (!logged_wait.test_and_set())
++                LOG_ERROR("A GPU sync object in game memory is damaged ({}): not waiting on it", e.what());
++            if (lock.owns_lock()) {
++                try {
++                    lock.unlock();
++                } catch (...) {
++                }
++            }
++            return SyncWaitResult::Ready;
+         }
+     }
+     if (sync_object->being_deleted)
+diff --git a/vita3k/renderer/src/texture/cache.cpp b/vita3k/renderer/src/texture/cache.cpp
+index 1414d63..862e211 100644
+--- a/vita3k/renderer/src/texture/cache.cpp
++++ b/vita3k/renderer/src/texture/cache.cpp
+@@ -23,6 +23,7 @@
+ #include <gxm/functions.h>
+ #include <mem/ptr.h>
+ #include <util/align.h>
++#include <util/gpu_memory.h>
+ #include <util/log.h>
+ 
+ #include <algorithm>
+@@ -787,6 +788,7 @@ void TextureCache::cache_and_bind_texture(const SceGxmTexture &gxm_texture, MemS
+     select(index, gxm_texture);
+ 
+     if (configure) {
++        const uint64_t previous_memory = texture_memory(index);
+         bool need_configure = true;
+ 
+         if (importing_texture)
+@@ -797,6 +799,15 @@ void TextureCache::cache_and_bind_texture(const SceGxmTexture &gxm_texture, MemS
+             importing_texture = false;
+             info->is_imported = false;
+         }
++
++        const uint64_t new_memory = texture_memory(index);
++        memory_used = memory_used - std::min(memory_used, previous_memory) + new_memory;
++        if (previous_memory == 0 && new_memory != 0)
++            textures_held++;
++        else if (previous_memory != 0 && new_memory == 0 && textures_held)
++            textures_held--;
++        if (memory_budget)
++            keep_within_budget(info);
+     }
+     if (upload) {
+         if (export_textures && !importing_texture)
+@@ -834,6 +845,50 @@ void TextureCache::cache_and_bind_texture(const SceGxmTexture &gxm_texture, MemS
+         cache_and_bind_sampler(gxm_texture);
+ }
+ 
++void TextureCache::keep_within_budget(const TextureCacheInfo *keep) {
++    // Each low-memory warning from the system lowers the budget by a quarter (to at least 256 MiB)
++    const uint32_t pressure = gpu_memory::pressure().load(std::memory_order_relaxed);
++    if (pressure != seen_pressure) {
++        for (; seen_pressure < pressure; seen_pressure++)
++            memory_budget = std::max<uint64_t>(memory_budget - memory_budget / 4, 256ull * 1024 * 1024);
++        LOG_INFO("Texture cache: memory is low, its budget is now {} MiB ({} MiB in {} textures)", memory_budget >> 20, memory_used >> 20, textures_held);
++    }
++
++    if (memory_used > memory_budget) {
++        // Drop the least recently used textures until the cache fits; they are uploaded again if used
++        uint32_t dropped = 0;
++        const uint64_t before = memory_used;
++        texture_queue.for_each_from_lru([&](TextureCacheInfo *candidate) {
++            if (memory_used <= memory_budget - memory_budget / 8)
++                return false;
++            if (candidate == keep || candidate->texture_size == 0)
++                return true;
++            const uint64_t held = texture_memory(candidate->index);
++            if (held == 0)
++                return true;
++            texture_lookup.erase(std::bit_cast<TextureGxmDataRepr>(candidate->texture));
++            release_texture(candidate->index);
++            candidate->texture_size = 0;
++            candidate->is_imported = false;
++            candidate->dirty = false;
++            memory_used -= std::min(memory_used, held);
++            if (textures_held)
++                textures_held--;
++            dropped++;
++            return true;
++        });
++        static int logged = 0;
++        if (dropped && logged < 8) {
++            logged++;
++            LOG_INFO("Texture cache: over its {} MiB budget, dropped {} unused textures ({} -> {} MiB)", memory_budget >> 20, dropped, before >> 20, memory_used >> 20);
++        }
++    }
++
++    gpu_memory::texture_bytes().store(memory_used, std::memory_order_relaxed);
++    gpu_memory::texture_count().store(textures_held, std::memory_order_relaxed);
++    gpu_memory::texture_budget().store(memory_budget, std::memory_order_relaxed);
++}
++
+ int TextureCache::cache_and_bind_sampler(const SceGxmTexture &gxm_texture, bool is_depth) {
+     uint32_t compact_repr = 0;
+     if (gxm_texture.texture_type() != SCE_GXM_TEXTURE_LINEAR_STRIDED) {
+diff --git a/vita3k/renderer/src/vulkan/surface_cache.cpp b/vita3k/renderer/src/vulkan/surface_cache.cpp
+index 7216876..f1b2baa 100644
+--- a/vita3k/renderer/src/vulkan/surface_cache.cpp
++++ b/vita3k/renderer/src/vulkan/surface_cache.cpp
+@@ -153,13 +153,23 @@ static void protect_surface(MemState &mem, ColorSurfaceCacheInfo &info) {
+     std::shared_ptr<bool> need_sync = trap_reads ? info.need_surface_sync : nullptr;
+     // Don't track dirty for small surfaces to avoid false positives from unrelated writes
+     std::shared_ptr<bool> dirty = small_surface ? nullptr : info.dirty;
+-
++    std::shared_ptr<bool> unprotected = info.unprotected;
++
++    // Protected regions sharing a host page (16 KiB on iOS) are merged, and a fault in any of them
++    // calls every callback of the merged region. Only a write inside this surface means the game
++    // changed it: counting writes to its neighbours (other surfaces, textures, data around it) marked
++    // Madden NFL 13's stadium screen as changed all the time, so it was read from memory instead of
++    // from the GPU and stayed black. Any fault still lifts the protection, so the surface is
++    // protected again the next time it is drawn to.
++    const Address surface_begin = info.data.address();
++    const Address surface_end = surface_begin + info.total_bytes;
+     add_protect(mem, addr_start, addr_end - addr_start, perm,
+-        [dirty, need_sync](Address, bool write) {
+-            if (write && dirty)
++        [dirty, need_sync, unprotected, surface_begin, surface_end](Address addr, bool write) {
++            if (write && dirty && addr >= surface_begin && addr < surface_end)
+                 *dirty = true;
+             if (need_sync)
+                 *need_sync = true;
++            *unprotected = true;
+             return true;
+         });
+ }
+@@ -363,9 +373,10 @@ SurfaceRetrieveResult VKSurfaceCache::retrieve_color_surface_for_framebuffer(Mem
+         } else {
+             color_surface_queue.set_as_mru(&info);
+ 
+-            if (info.data && *info.dirty)
++            if (info.data && (*info.dirty || *info.unprotected))
+                 protect_surface(mem, info);
+             *info.dirty = false;
++            *info.unprotected = false;
+ 
+             last_written_surface = &info;
+ 
+@@ -460,6 +471,7 @@ SurfaceRetrieveResult VKSurfaceCache::retrieve_color_surface_for_framebuffer(Mem
+     info_added.need_surface_sync.reset();
+     info_added.need_surface_sync = std::make_shared<bool>(false);
+     info_added.dirty = std::make_shared<bool>(false);
++    info_added.unprotected = std::make_shared<bool>(false);
+ 
+     // we only support surface sync of linear surfaces for now
+     if (!can_mprotect_mapped_memory) {
+@@ -1479,6 +1491,17 @@ ColorSurfaceCacheInfo *VKSurfaceCache::perform_surface_sync() {
+     if (!state.features.enable_memory_mapping)
+         needs_copy_buffer = true;
+ #endif
++    // Copied straight into game memory, the host image's pixels must be the size of the game's: a 16-bit
++    // surface kept as RGBA8 would write twice its size, over whatever follows it in game memory (Hinoki:
++    // Madden NFL 13 froze loading into a game). Such a surface is not synced instead.
++    if (!needs_copy_buffer && transfer_pixel_size * 8 != gxm::bits_per_pixel(last_written_surface->format)) {
++        LOG_WARN_ONCE("Surface sync skipped for a {}-bit surface kept as {} ({} bits a pixel): it would write past the surface into game memory",
++            gxm::bits_per_pixel(last_written_surface->format), vk::to_string(last_written_surface->texture.format), transfer_pixel_size * 8);
++        last_written_surface->need_buffer_sync = false;
++        last_written_surface->need_post_surface_sync = false;
++        last_written_surface = nullptr;
++        return nullptr;
++    }
+     if (needs_copy_buffer) {
+         if (!last_written_surface->copy_buffer)
+             last_written_surface->copy_buffer = std::make_unique<vkutil::Buffer>();
+diff --git a/vita3k/renderer/src/vulkan/texture.cpp b/vita3k/renderer/src/vulkan/texture.cpp
+index 2795293..f607a44 100644
+--- a/vita3k/renderer/src/vulkan/texture.cpp
++++ b/vita3k/renderer/src/vulkan/texture.cpp
+@@ -27,6 +27,12 @@
+ #include <util/align.h>
+ #include <vkutil/vkutil.h>
+ 
++#include <algorithm>
++
++#if defined(VITA3K_PLATFORM_IOS)
++#include <sys/sysctl.h>
++#endif
++
+ namespace renderer::vulkan {
+ 
+ // return if this format can be used to read a depth stencil buffer
+@@ -55,7 +61,24 @@ static bool is_depth_stencil_compatible_format(SceGxmTextureBaseFormat format, b
+ }
+ 
+ VKTextureCache::VKTextureCache(VKState &state)
+-    : state(state) {}
++    : state(state) {
++#if defined(VITA3K_PLATFORM_IOS)
++    // A sixth of the phone's memory (1 GiB on a 6 GB iPhone), between 512 MiB and 1.5 GiB. Super Robot
++    // Wars V filled 2.2 GB with textures on an iPhone 13 Pro Max and iOS closed it, although the game
++    // itself used 360 MB.
++    uint64_t ram = 0;
++    size_t length = sizeof(ram);
++    if (sysctlbyname("hw.memsize", &ram, &length, nullptr, 0) != 0 || ram == 0)
++        ram = 6ull << 30;
++    memory_budget = std::clamp<uint64_t>(ram / 6, 512ull << 20, 1536ull << 20);
++    LOG_INFO("Texture cache: up to {} MiB of graphics memory", memory_budget >> 20);
++#elif defined(VITA3K_UWP)
++    // Xbox (ReVita): the app keeps to about 5 GB in all; textures get 1 GiB of it. Games that pack their
++    // textures compressed on the Vita take many times the room here once decoded
++    memory_budget = 1024ull << 20;
++    LOG_INFO("Texture cache: up to {} MiB of graphics memory", memory_budget >> 20);
++#endif
++}
+ 
+ void VKTextureCache::cleanup() {
+     for (auto &entry : textures) {
+@@ -244,12 +267,18 @@ void VKTextureCache::prepare_staging_buffer(bool is_configure) {
+         staging_buffer->waiting_fence = current_fence;
+         staging_buffer->used_so_far = 0;
+ 
+-        if (staging_buffer->buffer.size < current_texture->memory_needed) {
+-            // we need to create a bigger buffer
++        // Staging buffers only ever grew: one big texture left its buffer at that size for the rest of the
++        // game, and with 16 of them a game uploading large (decompressed) textures kept hundreds of MiB
++        // of staging memory for nothing (a 6 GB phone ran out of memory loading a map). A buffer bigger
++        // than this is given back once it's free again and the next upload is smaller
++        constexpr uint64_t STAGING_KEEP_MAX = 8ull << 20;
++        const bool oversized = staging_buffer->buffer.size > STAGING_KEEP_MAX && current_texture->memory_needed <= STAGING_KEEP_MAX;
++        if (staging_buffer->buffer.size < current_texture->memory_needed || oversized) {
++            // we need to create a bigger (or a smaller) buffer
+             // destroy the previous one if there is, no need to defer destroy it as we know it is no longer being used
+             staging_buffer->buffer.destroy();
+ 
+-            staging_buffer->buffer.size = current_texture->memory_needed;
++            staging_buffer->buffer.size = std::max<uint64_t>(current_texture->memory_needed, oversized ? (2ull << 20) : 0);
+             staging_buffer->buffer.init_buffer(vk::BufferUsageFlagBits::eTransferSrc, vkutil::vma_mapped_alloc);
+         }
+     }
+@@ -308,6 +337,19 @@ bool VKTextureCache::init(const bool hashless_texture_cache, const fs::path &tex
+     return true;
+ }
+ 
++uint64_t VKTextureCache::texture_memory(size_t index) const {
++    const TextureCacheEntry &entry = textures[index];
++    return entry.texture.image ? entry.memory_needed : 0;
++}
++
++void VKTextureCache::release_texture(size_t index) {
++    TextureCacheEntry &entry = textures[index];
++    // destroyed once the frames that may still sample it have finished
++    if (entry.texture.image)
++        state.frame().destroy_queue.add_image(entry.texture);
++    entry.memory_needed = 0;
++}
++
+ void VKTextureCache::select(size_t index, const SceGxmTexture &texture) {
+     current_texture = &textures[index];
+     is_texture_transfer_ready = false;
+@@ -438,6 +480,13 @@ void VKTextureCache::configure_texture(const SceGxmTexture &gxm_texture) {
+     if (is_cube)
+         memory_needed *= 6;
+     current_texture->memory_needed = align(memory_needed, 16);
++    if (memory_needed >= (24u << 20)) {
++        // Rare and expensive: say which textures they are (a handful per run)
++        static std::atomic<int> logged{ 0 };
++        if (logged.fetch_add(1) < 12)
++            LOG_INFO("Large texture: {}x{} base format {:#x} as {}, {} mips{}, {} MiB to upload", width, height, static_cast<uint32_t>(base_format),
++                vk::to_string(vk_format), mip_count, is_cube ? ", cube" : "", memory_needed >> 20);
++    }
+     vkutil::Image &image = current_texture->texture;
+ 
+     // In case the cache is full, no need to put the previous image in the destroy queue
+diff --git a/vita3k/util/include/util/containers.h b/vita3k/util/include/util/containers.h
+index f257c12..a4c5ccf 100644
+--- a/vita3k/util/include/util/containers.h
++++ b/vita3k/util/include/util/containers.h
+@@ -89,6 +89,16 @@ struct Queue {
+         head = item;
+     }
+ 
++    // visit the elements from the least to the most recently used, until f returns false
++    template <typename F>
++    void for_each_from_lru(F &&f) {
++        Item<T> *item = head->prev;
++        for (size_t i = 0; i < items.size(); i++, item = item->prev) {
++            if (!f(&item->content))
++                return;
++        }
++    }
++
+     // set an element as the least recently used (useful if it is removed)
+     void set_as_lru(T *ptr) {
+         // just set as mru and change the head
+diff --git a/vita3k/util/include/util/gpu_memory.h b/vita3k/util/include/util/gpu_memory.h
+new file mode 100644
+index 0000000..5d292a9
+--- /dev/null
++++ b/vita3k/util/include/util/gpu_memory.h
+@@ -0,0 +1,47 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++
++// Graphics memory the texture cache holds, for the memory log, and how many times the system said
++// memory is low (each one shrinks the texture cache's budget).
++namespace gpu_memory {
++
++inline std::atomic<uint64_t> &texture_bytes() {
++    static std::atomic<uint64_t> value{ 0 };
++    return value;
++}
++
++inline std::atomic<uint32_t> &texture_count() {
++    static std::atomic<uint32_t> value{ 0 };
++    return value;
++}
++
++inline std::atomic<uint64_t> &texture_budget() {
++    static std::atomic<uint64_t> value{ 0 };
++    return value;
++}
++
++inline std::atomic<uint32_t> &pressure() {
++    static std::atomic<uint32_t> value{ 0 };
++    return value;
++}
++
++} // namespace gpu_memory
