@@ -1,9 +1,3 @@
-diff --git a/external/psvpfstools b/external/psvpfstools
---- a/external/psvpfstools
-+++ b/external/psvpfstools
-@@ -1 +1 @@
--Subproject commit e21df9a74852433f48d6593b8ef203dc7c424e05
-+Subproject commit e21df9a74852433f48d6593b8ef203dc7c424e05-dirty
 diff --git a/vita3k/renderer/src/d3d12/draw.cpp b/vita3k/renderer/src/d3d12/draw.cpp
 index 752c0a5..5f3af99 100644
 --- a/vita3k/renderer/src/d3d12/draw.cpp
