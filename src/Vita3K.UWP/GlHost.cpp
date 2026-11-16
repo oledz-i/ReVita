@@ -118,7 +118,7 @@ bool GlHost::Load(std::string& error) {
     // thread stops paying for Mesa's work on each one. Read by Mesa when the
     // driver loads, so set first. A performance guess: if OpenGL breaks, this
     // is the first thing to turn off.
-    SetEnvironmentVariableW(L"mesa_glthread", L"true");
+    SetEnvironmentVariableW(L"mesa_glthread", threaded ? L"true" : L"false");
     module_ = LoadPackagedLibrary(L"onyx_gl.dll", 0);
     if (!module_) {
         error = "onyx_gl.dll (OpenGL on D3D12) is not in this build (error " + std::to_string(GetLastError()) + ")";

@@ -15,7 +15,7 @@ cats = {c[0]: c[1] for c in data['cats']}
 
 # Shown, in this order. Anything else keeps the core default.
 shown = [
-    'vita3k_backend_renderer',
+    'vita3k_backend_renderer', 'revita_gl_threaded',
     'vita3k_resolution_multiplier', 'vita3k_screen_filter', 'vita3k_anisotropic_filtering',
     # V-Sync and Memory Mapping are not shown: the app paces frames itself (the
     # core's V-Sync does nothing here), and the console's Vulkan layer cannot

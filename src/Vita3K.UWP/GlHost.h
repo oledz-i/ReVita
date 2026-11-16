@@ -34,6 +34,8 @@ public:
     GlHost& operator=(const GlHost&) = delete;
 
     bool Load(std::string& error);
+    // Mesa's threaded OpenGL (glthread); read once, when the driver loads
+    bool threaded = true;
     bool Loaded() const { return module_ != nullptr; }
 
     // Emulation thread only.

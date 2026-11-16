@@ -785,6 +785,13 @@ bool __cdecl VitaLibretroHost::Environment(unsigned cmd, void* data) {
         if (callback->context_type == RETRO_HW_CONTEXT_OPENGL_CORE || callback->context_type == RETRO_HW_CONTEXT_OPENGL) {
             std::string error;
             host->gl_.log = [](int level, const std::string& text) { Log(static_cast<unsigned>(level), "%s\n", text.c_str()); };
+            {
+                // Settings > Graphics > Threaded OpenGL (on unless turned off)
+                std::lock_guard<std::mutex> guard(host->optionsMutex_);
+                const auto it = host->options_.find("revita_gl_threaded");
+                host->gl_.threaded = !(it != host->options_.end() && it->second && std::strcmp(it->second, "disabled") == 0);
+            }
+            Log(1, "OpenGL: threaded driver (glthread) %s.\n", host->gl_.threaded ? "on" : "off");
             if (!host->gl_.Load(error)) {
                 // The core then asks for Vulkan.
                 Log(2, "OpenGL renderer unavailable (%s); using Vulkan.\n", error.c_str());
