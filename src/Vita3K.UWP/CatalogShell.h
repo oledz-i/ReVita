@@ -202,7 +202,7 @@ private:
     int CurrentMenuKey() const;
     bool Navigate(int direction);
     bool HandleNavKey(Windows::System::VirtualKey code);
-    bool HandleNavAction(Windows::System::VirtualKey code);
+    bool HandleNavAction(Windows::System::VirtualKey code, bool repeat = false);
     void SwitchSettingsTab(int delta);
     bool forgetFocusOnce_ = false;
     unsigned long long actionTick_[16] = {};
@@ -302,7 +302,8 @@ private:
     void HideXmb();
     void LayoutXmb(int dx, int dy);
     void XmbWaves();
-    bool XmbKey(Windows::System::VirtualKey key);
+    bool XmbKey(Windows::System::VirtualKey key, bool repeat = false);
+    unsigned long long xmbStepTick_ = 0;
     void SaveLayout(bool xmb);
     int xmbTheme_ = 0;
     void ApplyXmbSky();

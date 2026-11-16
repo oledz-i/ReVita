@@ -1,0 +1,448 @@
+diff --git a/external/psvpfstools b/external/psvpfstools
+--- a/external/psvpfstools
++++ b/external/psvpfstools
+@@ -1 +1 @@
+-Subproject commit e21df9a74852433f48d6593b8ef203dc7c424e05
++Subproject commit e21df9a74852433f48d6593b8ef203dc7c424e05-dirty
+diff --git a/vita3k/renderer/src/d3d12/draw.cpp b/vita3k/renderer/src/d3d12/draw.cpp
+index 752c0a5..5f3af99 100644
+--- a/vita3k/renderer/src/d3d12/draw.cpp
++++ b/vita3k/renderer/src/d3d12/draw.cpp
+@@ -327,6 +327,85 @@ D3D12_SAMPLER_DESC sampler_desc(uint32_t key) {
+     return d;
+ }
+ 
++
++// The vertex shader's input signature, read from its DXBC (ISGN chunk). The
++// input layout is checked against it before a pipeline is made: a semantic the
++// shader reads but the layout lacks, or a duplicate, is a description the
++// console's driver takes as is and may fault on.
++struct ShaderInput {
++    uint32_t index; // TEXCOORD<index>
++    uint32_t type; // 1 uint, 2 sint, 3 float
++};
++
++std::vector<ShaderInput> read_vertex_inputs(const std::vector<uint8_t> &dxbc) {
++    std::vector<ShaderInput> inputs;
++    const auto u32 = [&](size_t at) -> uint32_t {
++        if (at + 4 > dxbc.size())
++            return 0;
++        uint32_t v;
++        std::memcpy(&v, dxbc.data() + at, 4);
++        return v;
++    };
++    if (dxbc.size() < 32 || std::memcmp(dxbc.data(), "DXBC", 4) != 0)
++        return inputs;
++    const uint32_t chunks = u32(28);
++    for (uint32_t c = 0; c < chunks && c < 64; c++) {
++        const uint32_t offset = u32(32 + c * 4);
++        if (offset + 8 > dxbc.size())
++            break;
++        if (std::memcmp(dxbc.data() + offset, "ISGN", 4) != 0)
++            continue;
++        const size_t data = offset + 8;
++        const uint32_t count = u32(data);
++        for (uint32_t i = 0; i < count && i < 64; i++) {
++            const size_t entry = data + 8 + i * 24;
++            if (entry + 24 > dxbc.size())
++                break;
++            const uint32_t name = u32(entry);
++            const uint32_t system_value = u32(entry + 8);
++            if (system_value != 0) // SV_VertexID and the like come from the GPU
++                continue;
++            if (data + name >= dxbc.size())
++                continue;
++            const char *text = reinterpret_cast<const char *>(dxbc.data() + data + name);
++            const size_t left = dxbc.size() - (data + name);
++            if (strnlen(text, left) == left)
++                continue;
++            if (strcmp(text, "TEXCOORD") != 0)
++                continue;
++            inputs.push_back({ u32(entry + 4), u32(entry + 12) });
++        }
++        break;
++    }
++    return inputs;
++}
++
++const std::vector<ShaderInput> &vertex_inputs(const std::vector<uint8_t> *vs) {
++    static std::unordered_map<const void *, std::vector<ShaderInput>> cache;
++    const auto it = cache.find(vs);
++    if (it != cache.end())
++        return it->second;
++    return cache.emplace(vs, read_vertex_inputs(*vs)).first->second;
++}
++
++uint32_t dxgi_component_bytes(DXGI_FORMAT format) {
++    switch (format) {
++    case DXGI_FORMAT_R8_UINT: case DXGI_FORMAT_R8_SINT: case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8_SNORM:
++    case DXGI_FORMAT_R8G8_UINT: case DXGI_FORMAT_R8G8_SINT: case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R8G8_SNORM:
++    case DXGI_FORMAT_R8G8B8A8_UINT: case DXGI_FORMAT_R8G8B8A8_SINT: case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_SNORM:
++        return 1;
++    case DXGI_FORMAT_R16_UINT: case DXGI_FORMAT_R16_SINT: case DXGI_FORMAT_R16_UNORM: case DXGI_FORMAT_R16_SNORM: case DXGI_FORMAT_R16_FLOAT:
++    case DXGI_FORMAT_R16G16_UINT: case DXGI_FORMAT_R16G16_SINT: case DXGI_FORMAT_R16G16_UNORM: case DXGI_FORMAT_R16G16_SNORM: case DXGI_FORMAT_R16G16_FLOAT:
++    case DXGI_FORMAT_R16G16B16A16_UINT: case DXGI_FORMAT_R16G16B16A16_SINT: case DXGI_FORMAT_R16G16B16A16_UNORM: case DXGI_FORMAT_R16G16B16A16_SNORM: case DXGI_FORMAT_R16G16B16A16_FLOAT:
++        return 2;
++    default:
++        return 4;
++    }
++}
++
++// slot for inputs no guest stream feeds: 16 zero bytes, read by every vertex
++constexpr UINT kZeroSlot = SCE_GXM_MAX_VERTEX_STREAMS;
++
+ } // namespace
+ 
+ struct Drawer {
+@@ -1005,7 +1084,7 @@ void D3D12TextureCache::upload_done() {
+ // ---------------------------------------------------------------------------
+ // Commands
+ 
+-void sync_texture(D3D12State &state, renderer::Context &ctx, uint32_t index, const SceGxmTexture &texture, MemState &mem) {
++static void sync_texture_impl(D3D12State &state, renderer::Context &ctx, uint32_t index, const SceGxmTexture &texture, MemState &mem) {
+     D3D12Context &context = static_cast<D3D12Context &>(ctx);
+     const SceGxmTextureFormat format = gxm::get_format(texture);
+     const bool is_vertex = index >= SCE_GXM_MAX_TEXTURE_UNITS;
+@@ -1073,7 +1152,7 @@ void sync_viewport_flat(renderer::Context &ctx) {
+     context.viewport_y_sign = -1.0f;
+ }
+ 
+-void set_context(D3D12State &state, renderer::Context &ctx, MemState &mem) {
++static void set_context_impl(D3D12State &state, renderer::Context &ctx, MemState &mem) {
+     D3D12Context &context = static_cast<D3D12Context &>(ctx);
+     context.target = 0;
+     context.scene_open = true;
+@@ -1094,14 +1173,14 @@ void set_context(D3D12State &state, renderer::Context &ctx, MemState &mem) {
+     target->clear_value = std::clamp(depth.background_depth, 0.0f, 1.0f);
+ }
+ 
+-void end_scene(D3D12State &state, renderer::Context &ctx) {
++static void end_scene_impl(D3D12State &state, renderer::Context &ctx) {
+     D3D12Context &context = static_cast<D3D12Context &>(ctx);
+     context.scene_open = false;
+     if (state.drawer)
+         state.drawer->submit();
+ }
+ 
+-void draw(D3D12State &state, renderer::Context &ctx, SceGxmPrimitiveType type, SceGxmIndexFormat format,
++static void draw_impl(D3D12State &state, renderer::Context &ctx, SceGxmPrimitiveType type, SceGxmIndexFormat format,
+     const void *indices, uint32_t count, uint32_t instance_count, MemState &mem) {
+     D3D12Context &context = static_cast<D3D12Context &>(ctx);
+     if (!state.drawer || !context.target || !indices || count == 0 || instance_count == 0)
+@@ -1256,6 +1335,48 @@ void draw(D3D12State &state, renderer::Context &ctx, SceGxmPrimitiveType type, S
+         }
+     }
+ 
++    // match the layout to what the shader reads: drop duplicates, misaligned
++    // offsets and semantics the shader doesn't declare, and feed every input
++    // no stream covers from the zero slot
++    bool zero_slot = false;
++    {
++        const std::vector<ShaderInput> &inputs = vertex_inputs(vs);
++        std::vector<D3D12_INPUT_ELEMENT_DESC> kept;
++        kept.reserve(elements.size());
++        uint64_t seen = 0;
++        for (const auto &e : elements) {
++            if (e.SemanticIndex >= 64 || (seen & (1ull << e.SemanticIndex)))
++                continue;
++            if (e.AlignedByteOffset % dxgi_component_bytes(e.Format) != 0 || e.AlignedByteOffset > 2047) {
++                LOG_WARN_ONCE("Direct3D 12: a vertex attribute at a misaligned offset ({}) reads as zero", e.AlignedByteOffset);
++                continue;
++            }
++            if (!inputs.empty() && std::none_of(inputs.begin(), inputs.end(), [&](const ShaderInput &in) { return in.index == e.SemanticIndex; }))
++                continue;
++            seen |= 1ull << e.SemanticIndex;
++            kept.push_back(e);
++        }
++        for (const ShaderInput &in : inputs) {
++            if (in.index < 64 && (seen & (1ull << in.index)))
++                continue;
++            D3D12_INPUT_ELEMENT_DESC e{};
++            e.SemanticName = "TEXCOORD";
++            e.SemanticIndex = in.index;
++            e.Format = in.type == 1 ? DXGI_FORMAT_R32G32B32A32_UINT : in.type == 2 ? DXGI_FORMAT_R32G32B32A32_SINT : DXGI_FORMAT_R32G32B32A32_FLOAT;
++            e.InputSlot = kZeroSlot;
++            e.AlignedByteOffset = 0;
++            e.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA;
++            e.InstanceDataStepRate = 0;
++            kept.push_back(e);
++            zero_slot = true;
++            if (in.index < 64)
++                seen |= 1ull << in.index;
++        }
++        if (kept.size() > 32u)
++            kept.resize(32u);
++        elements = std::move(kept);
++    }
++
+     // pipeline
+     const auto *fp = static_cast<const D3D12FragmentProgram *>(fragment_program->renderer_data.get());
+     struct Key {
+@@ -1412,8 +1533,17 @@ void draw(D3D12State &state, renderer::Context &ctx, SceGxmPrimitiveType type, S
+         return;
+     std::memcpy(p, indices, index_bytes);
+ 
+-    D3D12_VERTEX_BUFFER_VIEW streams[SCE_GXM_MAX_VERTEX_STREAMS]{};
++    D3D12_VERTEX_BUFFER_VIEW streams[SCE_GXM_MAX_VERTEX_STREAMS + 1]{};
+     UINT stream_count = 0;
++    // a stream with no guest data still gets a real (zero) buffer: a view at
++    // address 0 is a GPU page fault, not a zero read
++    D3D12_GPU_VIRTUAL_ADDRESS zero_gpu = 0;
++    {
++        uint8_t *zero = d.allocate(64, 16, zero_gpu);
++        if (!zero)
++            return;
++        std::memset(zero, 0, 64);
++    }
+     for (uint32_t i = 0; i < SCE_GXM_MAX_VERTEX_STREAMS && i < vertex_program->streams.size(); i++) {
+         if (!(used_streams & (1u << i)))
+             continue;
+@@ -1422,8 +1552,12 @@ void draw(D3D12State &state, renderer::Context &ctx, SceGxmPrimitiveType type, S
+         const uint32_t stride = vertex_program->streams[i].stride;
+         const uint32_t aligned_stride = align(std::max<uint32_t>(stride, 1), 4);
+         const uint8_t *data = info.data ? info.data.get(mem) : nullptr;
+-        if (!data || info.size == 0)
++        if (!data || info.size == 0) {
++            streams[i].BufferLocation = zero_gpu;
++            streams[i].SizeInBytes = 64;
++            streams[i].StrideInBytes = 0;
+             continue;
++        }
+         const size_t vertices = stride ? (info.size + stride - 1) / stride : 1;
+         const size_t out_size = (stride == aligned_stride) ? info.size : vertices * aligned_stride;
+         D3D12_GPU_VIRTUAL_ADDRESS gpu;
+@@ -1574,6 +1708,18 @@ void draw(D3D12State &state, renderer::Context &ctx, SceGxmPrimitiveType type, S
+ 
+     D3D12_INDEX_BUFFER_VIEW ib{ index_gpu, static_cast<UINT>(align(index_bytes, 4)), index_size == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT };
+     list->IASetIndexBuffer(&ib);
++    if (zero_slot) {
++        for (UINT i = 0; i < kZeroSlot; i++) {
++            if (!streams[i].BufferLocation) {
++                streams[i].BufferLocation = zero_gpu;
++                streams[i].SizeInBytes = 64;
++            }
++        }
++        streams[kZeroSlot].BufferLocation = zero_gpu;
++        streams[kZeroSlot].SizeInBytes = 64;
++        streams[kZeroSlot].StrideInBytes = 0;
++        stream_count = kZeroSlot + 1;
++    }
+     if (stream_count)
+         list->IASetVertexBuffers(0, stream_count, streams);
+     list->DrawIndexedInstanced(count, instance_count, 0, 0, 0);
+@@ -1601,7 +1747,7 @@ bool init_drawer(D3D12State &state, ID3D12Device *device, ID3D12CommandQueue *qu
+ }
+ 
+ // the target drawn at this address since the last few presents, if any
+-bool find_display_target(D3D12State &state, uint32_t address, ID3D12Resource *&color, uint32_t &color_state, uint32_t &width, uint32_t &height) {
++static bool find_display_target_impl(D3D12State &state, uint32_t address, ID3D12Resource *&color, uint32_t &color_state, uint32_t &width, uint32_t &height) {
+     if (!state.drawer)
+         return false;
+     Drawer &d = *state.drawer;
+@@ -1618,6 +1764,152 @@ bool find_display_target(D3D12State &state, uint32_t address, ID3D12Resource *&c
+     return true;
+ }
+ 
++
++// ---------------------------------------------------------------------------
++// Fault guard. Without a debug layer the console's driver does not reject a
++// bad call, it faults inside it. Every entry point runs under SEH: a fault
++// drops that one draw (or upload, or submit), names the step in the log and
++// the game keeps running. After kMaxFaults the draw path turns itself off and
++// the screen comes from guest memory, as the other renderers' fallback does.
++
++namespace {
++std::atomic<int> g_faults{ 0 };
++constexpr int kMaxFaults = 32;
++
++bool draw_path_off() {
++    return g_faults.load(std::memory_order_relaxed) >= kMaxFaults;
++}
++
++} // namespace
++
++#ifdef _MSC_VER
++// No C++ objects in here: SEH and unwinding don't mix in one function
++bool run_guarded(void (*fn)(void *), void *context, unsigned long *code) {
++    __try {
++        fn(context);
++        return true;
++    } __except (*code = GetExceptionCode(), (*code == EXCEPTION_ACCESS_VIOLATION || *code == EXCEPTION_ILLEGAL_INSTRUCTION || *code == EXCEPTION_INT_DIVIDE_BY_ZERO || *code == EXCEPTION_STACK_OVERFLOW) ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
++        return false;
++    }
++}
++#else
++bool run_guarded(void (*fn)(void *), void *context, unsigned long *) {
++    fn(context);
++    return true;
++}
++#endif
++
++namespace {
++
++void note_fault(D3D12State &state, const char *what, unsigned long code) {
++    const int faults = g_faults.fetch_add(1) + 1;
++    LOG_ERROR("Direct3D 12: the driver faulted (0x{:08X}) in {}; that step is skipped ({} of {})", code, what, faults, kMaxFaults);
++    if (state.drawer) {
++        // the open command list may be half written: throw it away
++        Drawer &d = *state.drawer;
++        if (d.open) {
++            d.open = false;
++            unsigned long ignored = 0;
++            run_guarded([](void *p) { static_cast<Drawer *>(p)->list->Close(); }, &d, &ignored);
++        }
++        d.bound = false;
++        d.bound_target = 0;
++    }
++    if (faults == kMaxFaults)
++        LOG_ERROR("Direct3D 12: too many driver faults; drawing is off for this game and the screen comes from memory");
++}
++} // namespace
++
++void sync_texture(D3D12State &state, renderer::Context &ctx, uint32_t index, const SceGxmTexture &texture, MemState &mem) {
++    if (draw_path_off())
++        return;
++    struct Args {
++        D3D12State &state;
++        renderer::Context &ctx;
++        uint32_t index;
++        const SceGxmTexture &texture;
++        MemState &mem;
++    } args{ state, ctx, index, texture, mem };
++    unsigned long code = 0;
++    if (!run_guarded([](void *p) { auto &a = *static_cast<Args *>(p); sync_texture_impl(a.state, a.ctx, a.index, a.texture, a.mem); }, &args, &code))
++        note_fault(state, "a texture upload", code);
++}
++
++void set_context(D3D12State &state, renderer::Context &ctx, MemState &mem) {
++    if (draw_path_off()) {
++        static_cast<D3D12Context &>(ctx).target = 0;
++        return;
++    }
++    struct Args {
++        D3D12State &state;
++        renderer::Context &ctx;
++        MemState &mem;
++    } args{ state, ctx, mem };
++    unsigned long code = 0;
++    if (!run_guarded([](void *p) { auto &a = *static_cast<Args *>(p); set_context_impl(a.state, a.ctx, a.mem); }, &args, &code)) {
++        static_cast<D3D12Context &>(ctx).target = 0;
++        note_fault(state, "starting a scene", code);
++    }
++}
++
++void end_scene(D3D12State &state, renderer::Context &ctx) {
++    struct Args {
++        D3D12State &state;
++        renderer::Context &ctx;
++    } args{ state, ctx };
++    unsigned long code = 0;
++    if (!run_guarded([](void *p) { auto &a = *static_cast<Args *>(p); end_scene_impl(a.state, a.ctx); }, &args, &code))
++        note_fault(state, "submitting a scene", code);
++}
++
++void draw(D3D12State &state, renderer::Context &ctx, SceGxmPrimitiveType type, SceGxmIndexFormat format,
++    const void *indices, uint32_t count, uint32_t instance_count, MemState &mem) {
++    if (draw_path_off())
++        return;
++    struct Args {
++        D3D12State &state;
++        renderer::Context &ctx;
++        SceGxmPrimitiveType type;
++        SceGxmIndexFormat format;
++        const void *indices;
++        uint32_t count;
++        uint32_t instance_count;
++        MemState &mem;
++    } args{ state, ctx, type, format, indices, count, instance_count, mem };
++    unsigned long code = 0;
++    if (!run_guarded([](void *p) { auto &a = *static_cast<Args *>(p); draw_impl(a.state, a.ctx, a.type, a.format, a.indices, a.count, a.instance_count, a.mem); }, &args, &code))
++        note_fault(state, "a draw", code);
++}
++
++bool find_display_target(D3D12State &state, uint32_t address, ID3D12Resource *&color, uint32_t &color_state, uint32_t &width, uint32_t &height) {
++    if (draw_path_off())
++        return false;
++    struct Args {
++        D3D12State &state;
++        uint32_t address;
++        ID3D12Resource *&color;
++        uint32_t &color_state;
++        uint32_t &width;
++        uint32_t &height;
++        bool found;
++    } args{ state, address, color, color_state, width, height, false };
++    unsigned long code = 0;
++    if (!run_guarded([](void *p) { auto &a = *static_cast<Args *>(p); a.found = find_display_target_impl(a.state, a.address, a.color, a.color_state, a.width, a.height); }, &args, &code)) {
++        note_fault(state, "submitting the frame's draws", code);
++        return false;
++    }
++    return args.found;
++}
++
++bool draw_faulted_off() {
++    return draw_path_off();
++}
++
++void note_present_fault(unsigned long code) {
++    const int faults = g_faults.fetch_add(1) + 1;
++    LOG_ERROR("Direct3D 12: the driver faulted (0x{:08X}) presenting a drawn frame; showing the frame from memory ({} of {})", code, faults, kMaxFaults);
++}
++
+ std::string draw_summary(const D3D12State &state) {
+     if (!state.drawer)
+         return "no draw path";
+diff --git a/vita3k/renderer/src/d3d12/state.cpp b/vita3k/renderer/src/d3d12/state.cpp
+index 59d505c..f0c56c6 100644
+--- a/vita3k/renderer/src/d3d12/state.cpp
++++ b/vita3k/renderer/src/d3d12/state.cpp
+@@ -36,6 +36,8 @@ namespace renderer::d3d12 {
+ 
+ bool init_drawer(D3D12State &state, ID3D12Device *device, ID3D12CommandQueue *queue);
+ bool find_display_target(D3D12State &state, uint32_t address, ID3D12Resource *&color, uint32_t &color_state, uint32_t &width, uint32_t &height);
++bool run_guarded(void (*fn)(void *), void *context, unsigned long *code);
++void note_present_fault(unsigned long code);
+ std::string draw_summary(const D3D12State &state);
+ 
+ namespace {
+@@ -281,9 +283,37 @@ bool D3D12State::present_display(uint32_t base, const void *pixels, uint32_t pit
+         LOG_INFO("Direct3D 12 so far: shaders {}; {}", shader_cache_summary(*shaders), draw_summary(*this));
+     ID3D12Resource *color = nullptr;
+     uint32_t color_state = 0, target_width = 0, target_height = 0;
+-    if (find_display_target(*this, base, color, color_state, target_width, target_height))
+-        return present_from_texture(color, color_state, std::min(width, target_width), std::min(height, target_height));
+-    return present_from_memory(pixels, pitch, width, height);
++    if (find_display_target(*this, base, color, color_state, target_width, target_height)) {
++        struct Args {
++            D3D12State *self;
++            ID3D12Resource *color;
++            uint32_t color_state, width, height;
++            bool shown;
++        } args{ this, color, color_state, std::min(width, target_width), std::min(height, target_height), false };
++        unsigned long code = 0;
++        if (run_guarded([](void *p) { auto &a = *static_cast<Args *>(p); a.shown = a.self->present_from_texture(a.color, a.color_state, a.width, a.height); }, &args, &code)) {
++            if (args.shown)
++                return true;
++        } else {
++            note_present_fault(code);
++            // the slot's list may be half recorded: close it so the next Reset works
++            Impl::Slot &slot = impl->slots[impl->next];
++            unsigned long ignored = 0;
++            run_guarded([](void *p) { static_cast<ID3D12GraphicsCommandList *>(p)->Close(); }, slot.list.Get(), &ignored);
++        }
++    }
++    struct MemArgs {
++        D3D12State *self;
++        const void *pixels;
++        uint32_t pitch, width, height;
++        bool shown;
++    } margs{ this, pixels, pitch, width, height, false };
++    unsigned long code = 0;
++    if (!run_guarded([](void *p) { auto &a = *static_cast<MemArgs *>(p); a.shown = a.self->present_from_memory(a.pixels, a.pitch, a.width, a.height); }, &margs, &code)) {
++        note_present_fault(code);
++        return false;
++    }
++    return margs.shown;
+ }
+ 
+ bool D3D12State::present_from_texture(ID3D12Resource *src, uint32_t src_state, uint32_t width, uint32_t height) {

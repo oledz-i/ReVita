@@ -683,7 +683,7 @@ CatalogShell::CatalogShell() {
             if (e->Handled || inGame_ || libretro_.Running() || artPicker_ != nullptr) return;
             if (page_ == 0 && xmb_ != nullptr && xmb_->Visibility == Windows::UI::Xaml::Visibility::Visible) return;
             if (Windows::UI::Xaml::Media::VisualTreeHelper::GetOpenPopups(Window::Current)->Size > 0) return;
-            if (HandleNavAction(e->Key)) e->Handled = true;
+            if (HandleNavAction(e->Key, e->KeyStatus.WasKeyDown)) e->Handled = true;
         });
     Window::Current->CoreWindow->KeyDown +=
         ref new TypedEventHandler<Windows::UI::Core::CoreWindow^, Windows::UI::Core::KeyEventArgs^>(
@@ -737,12 +737,12 @@ CatalogShell::CatalogShell() {
                     return;
                 }
                 if (page_ == 0 && xmb_ != nullptr && xmb_->Visibility == Windows::UI::Xaml::Visibility::Visible) {
-                    if (XmbKey(e->VirtualKey)) e->Handled = true;
+                    if (XmbKey(e->VirtualKey, e->KeyStatus.WasKeyDown)) e->Handled = true;
                     return;
                 }
                 // A dialog, a drop-down or a flyout is open: it owns the controller.
                 if (Windows::UI::Xaml::Media::VisualTreeHelper::GetOpenPopups(Window::Current)->Size > 0) return;
-                if (HandleNavAction(e->VirtualKey)) e->Handled = true;
+                if (HandleNavAction(e->VirtualKey, e->KeyStatus.WasKeyDown)) e->Handled = true;
             });
     // B on Xbox also raises a system back request; one left unhandled closes
     // the app (B at Home, or B in a game, dropped you to the dashboard). The
@@ -1334,7 +1334,7 @@ bool CatalogShell::Navigate(int dir) {
         std::to_string(considered) + " controls considered)");
     return true;
 }
-bool CatalogShell::HandleNavAction(Windows::System::VirtualKey code) {
+bool CatalogShell::HandleNavAction(Windows::System::VirtualKey code, bool repeat) {
     using Windows::System::VirtualKey;
     int action = -1;
     switch (code) {
@@ -1354,9 +1354,20 @@ bool CatalogShell::HandleNavAction(Windows::System::VirtualKey code) {
     // second copy is swallowed so one press is one step.
     const unsigned long long now = GetTickCount64();
     if (action != 9 && now - actionTick_[action] < 45) return true;
+    // Bumpers and triggers step once per press. An analog trigger sends a
+    // stream of repeats while it is held (and both routes deliver each one),
+    // which skipped past dock tabs and whole pages.
+    if (action >= 4 && action <= 7) {
+        if (repeat || now - actionTick_[action] < 220) return true;
+    }
     bool handled;
+    const bool onDock = MenuKeyOf(Windows::UI::Xaml::Input::FocusManager::GetFocusedElement()) >= 0;
     if (action == 4 || action == 5) {
         SwitchTab(action == 4 ? -1 : 1);
+        handled = true;
+    } else if ((action == 6 || action == 7) && onDock && page_ != 2) {
+        // on the dock the triggers move one tab, like the bumpers
+        SwitchTab(action == 6 ? -1 : 1);
         handled = true;
     } else if ((action == 6 || action == 7) && page_ == 2) {
         SwitchSettingsTab(action == 6 ? -1 : 1);
@@ -7780,9 +7791,19 @@ void CatalogShell::LayoutXmb(int dx, int dy) {
     }
 }
 
-bool CatalogShell::XmbKey(Windows::System::VirtualKey key) {
+bool CatalogShell::XmbKey(Windows::System::VirtualKey key, bool repeat) {
     using Windows::System::VirtualKey;
     switch (key) {
+    case VirtualKey::GamepadLeftShoulder: case VirtualKey::GamepadLeftTrigger:
+    case VirtualKey::GamepadRightShoulder: case VirtualKey::GamepadRightTrigger: {
+        // one column per press; a held trigger's repeats are ignored
+        const unsigned long long now = GetTickCount64();
+        if (repeat || now - xmbStepTick_ < 220) return true;
+        xmbStepTick_ = now;
+        const bool left = key == VirtualKey::GamepadLeftShoulder || key == VirtualKey::GamepadLeftTrigger;
+        LayoutXmb(left ? -1 : 1, 0);
+        return true;
+    }
     case VirtualKey::GamepadDPadLeft: case VirtualKey::GamepadLeftThumbstickLeft: case VirtualKey::Left:
         LayoutXmb(-1, 0);
         return true;
